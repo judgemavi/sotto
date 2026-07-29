@@ -1,6 +1,6 @@
 # T002 — Spike A: dual-stream macOS audio capture + low-rate screen frames
 
-**Status:** changes-requested (fixes approved; scoped-capture work added, then soak)
+**Status:** in-progress (4 defects fixed; long-run validation deferred as accepted risk)
 
 **Wave:** 1 — start this one first, it has the longest tail and the highest technical risk
 
@@ -400,3 +400,27 @@ audio source is not a measurement.
 something. Run it with continuous audio playing throughout and report per-stream ppm, the
 relative figure, lag count, dropped frames, and whether a spoken marker at ~60 minutes
 still audibly lines up.
+
+### Deferred: long-run validation (open risk, deliberately accepted)
+
+The 65-minute soak is **deferred, not cancelled.** Two questions remain unanswered and
+they are now explicitly carried as risk rather than silently dropped:
+
+1. **System-stream rate.** Reads −110 to −442 ppm across 30-second runs — too noisy to
+   characterise, and short windows cannot do it. If real at ~400 ppm that is ~1.4 s of
+   slip per hour, which breaks the cross-stream timestamp comparison T006's interruption
+   detection and speaker attribution depend on.
+2. **Stability over a call's length.** Dropout, thermal behaviour, memory growth and
+   frame-pool pressure across an hour are all untested. Frames only became real in F4, so
+   nothing has ever run long at full resolution.
+
+**Cheaper substitute, do when convenient:** a **10-minute** run with audio playing
+continuously start to finish. That is enough to separate real drift from measurement
+noise (400 ppm over 600 s accumulates 0.24 s — unmistakable), at a sixth of the cost. Run
+the full 65 later, unattended, when the machine is free.
+
+Downstream tasks may proceed on fixtures meanwhile — T004, T005, T006, T008 and T009 do
+not touch live capture. What they must **not** do is assume cross-stream timestamps are
+directly comparable. Until the system rate is characterised, treat that as unproven:
+T006 in particular should keep its interruption detection tolerant of a drift correction
+being introduced later.
