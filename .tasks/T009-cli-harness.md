@@ -1,6 +1,6 @@
 # T009 — CLI harness: WAV + frames in → timeline events out, fixtures, latency bench
 
-**Status:** todo (unblocked — T014 frozen)
+**Status:** changes-requested (harness good; fixture corpus cannot exercise the pipeline)
 
 **Wave:** 1 — fully parallel; builds against traits, stubs where crates are unfinished
 
@@ -98,3 +98,77 @@ to drive the pipeline in tests.
 ## Out of scope
 
 Any UI, live capture (T002), suggestion quality evaluation (later task once T013 lands).
+
+## Review round 1 — changes requested
+
+The harness itself is good: file-backed `CaptureBackend` with realtime and fast modes, the
+subcommand set is complete, `--kinds` filtering works, JSONL shape is right, and it runs
+with no display and no audio hardware. `ocr`, `replay` and `search` all behave. Verified
+fmt clean, strict clippy clean, 56 passed / 6 ignored.
+
+**But the fixture corpus cannot exercise the pipeline it exists to test.**
+
+`fixtures/README.md` states it plainly: *"All audio here is programmatically synthesised…
+Tone bursts… these tones intentionally contain no human speech."* The consequence was not
+followed through. Silero correctly finds no speech in a tone burst, so nothing flows
+downstream:
+
+```
+$ cargo run -p cli -- run fixtures/call-01-mic.wav --system fixtures/call-01-sys.wav
+$ echo $?
+0
+```
+
+Zero events, exit 0. `sotto-cli vad fixtures/call-01-mic.wav` likewise produces nothing.
+The committed `fixtures/timelines/call-01.jsonl` holds 6 `vad` events that **cannot be
+reproduced from the corpus** — it was generated some other way, so replay is validating a
+fiction.
+
+This is the same shape as the 2×2 frames: the artifact exists, the suite is green, and
+nothing is being tested. `fixtures/` is meant to be *"the shared asset the whole project
+tests against"* — T004, T005 and T011 all depend on it, and against tone bursts none of them
+can be validated at all.
+
+### R1. Regenerate the audio corpus with real synthetic speech
+
+The brief asked for TTS specifically. macOS ships it, so there is no licensing or consent
+issue and it stays fully deterministic. Verified working:
+
+```bash
+say -v Samantha -o out.aiff "We are already using Salesforce and the pricing feels high"
+afconvert -f WAVE -d LEI16@16000 -c 1 out.aiff out.wav
+```
+
+Zero-crossing rate 2119/s versus 185/s for the current tones — genuinely speech-shaped.
+Use **two different voices** for mic and system so speaker separation is testable, and keep
+the ground-truth JSON in step with what is actually spoken. Negative cases (silence, music)
+stay as they are; they are correct already.
+
+Then confirm the corpus does its job end to end: `run` must emit VAD, utterance and prosody
+events, and the committed reference timeline must be **regenerated from an actual run**, not
+authored alongside it.
+
+### R2. Frames need real glyphs, and the fixture must be verified against Vision
+
+Same root cause on the visual side: the generated bands contain no rendered text, so T015's
+OCR has never extracted a character.
+
+Note what I found while checking this — a PDF-rendered text PNG returned **zero
+observations from a plain Swift `VNRecognizeTextRequest`**, not just from our binding. So
+generating something that looks like text to us is not sufficient. **Whatever you generate,
+verify Vision actually reads it before committing it**, or the fixture will silently repeat
+the current problem. Render glyphs properly (CoreGraphics into a bitmap is deterministic and
+Swift is already a build dependency), then assert expected strings in a test.
+
+### R3. Silence should not look like success
+
+A run that produces no events exits 0 and prints nothing, which is indistinguishable from
+working. Emit a warning to stderr when a stage produces no output — no speech detected, no
+model configured, no frames found. This matters more now that `AGENTS.md` makes the no-key
+map tier a shipping product: users will legitimately run without a model, and "nothing
+happened" has to be distinguishable from "nothing was supposed to happen".
+
+### Re-review
+
+Corpus regenerated with real speech, reference timeline produced by an actual run, a frame
+fixture whose text Vision demonstrably reads, and empty stages reporting themselves.

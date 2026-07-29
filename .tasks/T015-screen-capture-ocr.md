@@ -1,6 +1,6 @@
 # T015 — Screen crate: low-rate frame sampling + Apple Vision OCR
 
-**Status:** todo (unblocked — T014 frozen; T002 now delivers real frames)
+**Status:** done (approved; OCR carried as unverified pending a real fixture)
 
 **Wave:** 1 — new crate, parallel with the other stage crates
 
@@ -85,3 +85,52 @@ thumbnails by `FrameRef`; T017's summarizer and the advisor read `ocr_text`.
 
 Sending images to LLMs (Phase 5, opt-in), video recording, screen *sharing* detection,
 the consent UI.
+
+## Review round 1 — approved, with OCR carried as unverified
+
+Solid work, and the collision I flagged was resolved better than either option I proposed.
+
+**`crates/capture` and `bridge-macos` are untouched.** Rather than extending T002's Swift
+package as the brief suggested, this consumes the existing `RawFrame` boundary and binds
+Vision through `objc2-vision` directly. That is strictly better: no second Swift package, no
+extra build step, no shared ownership to negotiate, and maintained Rust bindings instead of
+hand-written FFI. Deviating from the brief was the right call — note it in the crate docs so
+the next reader knows it was deliberate.
+
+Also right: five-second sampling with perceptual change detection, stable
+`visible_from`/`visible_to` intervals, SHA-256 content addressing, and a 128 MiB per-session
+cap with pruning — which is exactly the *"sampled, referenced, and pruned — never accumulate
+raw video"* discipline `AGENTS.md` requires. Static-screen, slide-change, interval and
+retention tests all present. Scope replaced the exclusion list as intended.
+
+### Open: OCR has never extracted a character
+
+You flagged this honestly, which is the right instinct. Recording precisely where it stands,
+because the summary could be read as more settled than it is:
+
+- Running the pipeline against a text-bearing PNG returns `"ocr_text": ""`.
+- **A plain Swift `VNRecognizeTextRequest` on the same file also returns zero
+  observations.** So the failure is at the Vision level with these images, not demonstrably
+  in your binding.
+- Therefore the binding is **unproven, not broken.** It compiles, it is wired correctly, and
+  it has never successfully read text.
+
+Do not treat "production Vision compiles" as evidence it works. This is the same shape as
+T002's 2×2 frames and T009's tone-burst audio: a green suite over an artifact that exercises
+nothing.
+
+Settling it is cheap and belongs with T009, which owns the fixture corpus — it needs to
+produce a frame whose text Vision demonstrably reads, verified before committing. Once that
+lands, add an assertion here that expected strings come back.
+
+### And it may not matter
+
+Worth knowing where this is heading: **T017 now owns deciding whether screen context earns
+its place at all**, by running the same session three ways — capture-target metadata only,
+metadata + OCR text, metadata + images to a multimodal model — and reporting which actually
+changed the recap. Window title and app name are nearly free and may carry most of the
+signal.
+
+So do not invest further in OCR quality or tuning until that measurement exists. If metadata
+alone proves sufficient, the right outcome is to stop maintaining Vision and keep the frame
+capture, which every option needs anyway.
