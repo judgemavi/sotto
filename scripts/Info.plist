@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>Sotto</string>
+    <key>CFBundleExecutable</key>
+    <string>sotto</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.sotto.app</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Sotto</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Sotto records your microphone locally to identify the rep side of a call and create the conversation timeline. Audio never leaves this Mac.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Sotto captures system audio and occasional screen snapshots locally to place customer speech and visible call context on your conversation timeline.</string>
+</dict>
+</plist>

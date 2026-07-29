@@ -1,3 +1,6 @@
-//! Placeholder for T002, the macOS dual-stream capture spike.
+//! Platform capture backends.
 
 #![deny(warnings)]
+
+#[cfg(target_os = "macos")]
+pub mod macos;

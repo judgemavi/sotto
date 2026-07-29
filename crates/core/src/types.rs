@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::PipelineError;
+use crate::EventId;
 
 /// The independently captured audio stream that produced an event.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -73,9 +73,7 @@ pub enum SpeechState {
     SpeechEnd,
 }
 
-/// A partial or final ASR result.
-///
-/// Consumers supersede partials using `(source, start)` as the stable key.
+/// ASR content carried by a partial or final timeline payload.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct Utterance {
@@ -83,7 +81,6 @@ pub struct Utterance {
     pub start: Duration,
     pub end: Duration,
     pub text: String,
-    pub is_final: bool,
     pub avg_logprob: f32,
     pub annotations: Vec<Annotation>,
 }
@@ -175,14 +172,15 @@ pub struct Citation {
     pub excerpt: String,
 }
 
-/// A partial or final suggestion rendered by the UI.
+/// Suggestion content carried by a partial or final timeline payload.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct Suggestion {
+    /// Timeline events whose context caused this suggestion.
+    pub anchors: Vec<EventId>,
     pub trigger: Trigger,
     pub text: String,
     pub citations: Vec<Citation>,
-    pub is_final: bool,
 }
 
 /// A locally indexed passage returned by retrieval.
@@ -274,19 +272,6 @@ pub enum PermissionStatus {
     Restricted,
 }
 
-/// The shared wire event carried over the non-blocking broadcast bus.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "serde", serde(tag = "type", content = "payload"))]
-pub enum PipelineEvent {
-    Audio(AudioFrame),
-    Vad(VadSegment),
-    Transcript(Utterance),
-    Trigger(Trigger),
-    Suggestion(Suggestion),
-    Error(PipelineError),
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Annotation, Source, Utterance};
@@ -299,7 +284,6 @@ mod tests {
             start: Duration::ZERO,
             end: Duration::from_secs(3),
             text: "sure, sounds fine".to_owned(),
-            is_final: true,
             avg_logprob: -0.2,
             annotations: vec![
                 Annotation::Hesitant,
@@ -329,6 +313,7 @@ mod tests {
     fn shared_types_satisfy_pipeline_bounds() {
         fn assert_bounds<T: Clone + Send + Sync + 'static>() {}
 
-        assert_bounds::<super::PipelineEvent>();
+        assert_bounds::<super::Utterance>();
+        assert_bounds::<crate::TimelineEvent>();
     }
 }

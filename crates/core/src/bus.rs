@@ -2,9 +2,10 @@
 //!
 //! A subscriber can fall behind and lose events, but it can never apply backpressure
 //! to capture or any other producer. Receivers log and count lag before continuing.
-//! Capture deliberately publishes high-rate frames to its own
-//! `broadcast::Sender<AudioFrame>`, not this UI-facing event bus. Pipeline orchestration
-//! must run a bridge task that lifts those frames into `PipelineEvent::Audio`.
+//! Raw capture deliberately publishes high-rate frames to its own
+//! `broadcast::Sender<AudioFrame>`, not this timeline bus. Audio frames are never
+//! timeline events: VAD, ASR, and prosody consume the separate audio channel and emit
+//! durable, lower-rate [`TimelineEvent`] values here.
 
 use std::{
     num::NonZeroUsize,
@@ -17,12 +18,12 @@ use std::{
 use thiserror::Error;
 use tokio::sync::broadcast;
 
-use crate::PipelineEvent;
+use crate::TimelineEvent;
 
 /// Cloneable publishing side of the pipeline event bus.
 #[derive(Clone, Debug)]
 pub struct EventBus {
-    sender: broadcast::Sender<PipelineEvent>,
+    sender: broadcast::Sender<TimelineEvent>,
     lagged_events: Arc<AtomicU64>,
 }
 
@@ -39,7 +40,7 @@ impl EventBus {
 
     /// Returns a sender for a pipeline stage that publishes directly.
     #[must_use]
-    pub fn sender(&self) -> broadcast::Sender<PipelineEvent> {
+    pub fn sender(&self) -> broadcast::Sender<TimelineEvent> {
         self.sender.clone()
     }
 
@@ -65,14 +66,14 @@ impl EventBus {
 #[derive(Debug)]
 pub struct EventReceiver {
     stage: Arc<str>,
-    receiver: broadcast::Receiver<PipelineEvent>,
+    receiver: broadcast::Receiver<TimelineEvent>,
     lagged_events: Arc<AtomicU64>,
     subscriber_lagged_events: u64,
 }
 
 impl EventReceiver {
     /// Receives the next available event, skipping and recording lagged events.
-    pub async fn recv(&mut self) -> Result<PipelineEvent, ReceiveError> {
+    pub async fn recv(&mut self) -> Result<TimelineEvent, ReceiveError> {
         loop {
             match self.receiver.recv().await {
                 Ok(event) => return Ok(event),

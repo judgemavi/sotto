@@ -48,8 +48,15 @@ pub enum ProviderError {
     Auth,
     #[error("provider rate limit exceeded")]
     RateLimit { retry_after: Option<Duration> },
-    #[error("provider context length exceeded: limit {limit}, requested {requested}")]
-    ContextLengthExceeded { limit: u32, requested: u32 },
+    #[error("provider context length exceeded: limit {limit:?}, requested {requested:?}")]
+    ContextLengthExceeded {
+        limit: Option<u32>,
+        requested: Option<u32>,
+    },
+    #[error("invalid completion request: {0}")]
+    InvalidRequest(String),
+    #[error("credential store failure: {0}")]
+    CredentialStore(String),
     #[error("provider network failure: {0}")]
     Network(String),
     #[error("provider returned HTTP {status}: {message}")]
