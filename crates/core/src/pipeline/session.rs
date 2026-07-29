@@ -26,6 +26,8 @@ pub enum RecordingState {
 
 #[derive(Clone, Debug, Default)]
 pub struct SessionView {
+    /// Bounded append order used by record/replay adapters.
+    pub recent_append_order: Vec<TimelineEvent>,
     pub recent_ordered: Vec<TimelineEvent>,
     pub mic_talk_time_ratio: f32,
     pub system_talk_time_ratio: f32,
@@ -287,6 +289,7 @@ impl ActorState {
         let mut ordered = self.recent.iter().cloned().collect::<Vec<_>>();
         ordered.sort_by(event_order);
         let next = SessionView {
+            recent_append_order: self.recent.iter().cloned().collect(),
             recent_ordered: ordered,
             mic_talk_time_ratio: self.ratios[0],
             system_talk_time_ratio: self.ratios[1],

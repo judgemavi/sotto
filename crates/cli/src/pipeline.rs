@@ -1,17 +1,24 @@
 use std::{
     collections::HashMap,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use asr::{Config as AsrConfig, WhisperTranscriber};
-use prosody::{Annotator, Event as ProsodyEvent};
 use serde::Serialize;
 use sotto_core::{
-    CaptureTarget, EventPayload, Session, SessionId, Source, SpeechState, TargetKind,
-    TimelineBuilder, TimelineEvent, Transcriber, TranscriptUpdate, VoiceActivityDetector,
+    AudioFrame, CaptureBackend, CaptureError, CaptureTarget, EventPayload, PermissionStatus,
+    Pipeline, PipelineConfig, Session, SessionId, Source, SpeechState, TargetKind, TimelineEvent,
+    Transcriber, TranscriptUpdate,
 };
+use tokio::sync::{Notify, broadcast};
 use vad::{SileroVad, VadConfig};
 
 use crate::file_capture::{FileCapture, FileCaptureMode, TimestampedFrames};
@@ -47,16 +54,39 @@ pub struct PipelineRun {
 }
 
 pub fn run_files(options: &PipelineOptions) -> Result<PipelineRun> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?
+        .block_on(run_files_async(options))
+}
+
+async fn run_files_async(options: &PipelineOptions) -> Result<PipelineRun> {
     let mode = if options.realtime {
         FileCaptureMode::Realtime
     } else {
         FileCaptureMode::Fast
     };
-    let mut frames = FileCapture::new(&options.mic, Source::Mic, mode).frames()?;
-    if let Some(system) = &options.system {
-        frames.extend(FileCapture::new(system, Source::System, mode).frames()?);
-    }
-    frames.sort_by_key(|frame| (frame.stream_offset, source_order(frame.source), frame.seq));
+    let metrics = Arc::new(CaptureMetrics::default());
+    let (capture, completion, frame_count) = MergedFileCapture::load(
+        &options.mic,
+        options.system.as_deref(),
+        mode,
+        Arc::clone(&metrics),
+    )?;
+    let transcriber = if let Some(path) = &options.model {
+        let mut config = AsrConfig::new(path);
+        if !options.realtime {
+            config.vad_gating = false;
+            config.agreement_passes = 1;
+            config.unstable_tail = Duration::ZERO;
+        }
+        HarnessTranscriber::Real(DrainingTranscriber::new(
+            WhisperTranscriber::new(config)?,
+            frame_count,
+        ))
+    } else {
+        HarnessTranscriber::Noop
+    };
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -75,136 +105,296 @@ pub fn run_files(options: &PipelineOptions) -> Result<PipelineRun> {
         },
         u64::try_from(now.as_millis()).unwrap_or(u64::MAX),
     );
-    let mut timeline = TimelineBuilder::new(session);
-    let screen_payloads = options
-        .frames
-        .as_deref()
-        .map(load_screen_payloads)
-        .transpose()?
-        .unwrap_or_default();
-    let mut screen_payloads = screen_payloads.into_iter().peekable();
-    let mut mic_vad = SileroVad::new(Source::Mic, VadConfig::default())?;
-    let mut system_vad = options
-        .system
-        .as_ref()
-        .map(|_| SileroVad::new(Source::System, VadConfig::default()))
-        .transpose()?;
-    let mut transcriber = options
-        .model
-        .as_ref()
-        .map(|path| {
-            let mut config = AsrConfig::new(path);
-            if !options.realtime {
-                // A fast fixture run feeds audio faster than the worker can observe live VAD
-                // controls. Treat the completed files as one batch and commit on the first pass.
-                config.vad_gating = false;
-                config.agreement_passes = 1;
-                config.unstable_tail = Duration::ZERO;
-            }
-            WhisperTranscriber::new(config)
+    let capacity = NonZeroUsize::new(65_536).unwrap_or(NonZeroUsize::MIN);
+    let pipeline = Pipeline::builder(session)
+        .capture(capture)
+        .vad(
+            SileroVad::new(Source::Mic, VadConfig::default())?,
+            SileroVad::new(Source::System, VadConfig::default())?,
+        )
+        .transcriber(transcriber)
+        .annotator(prosody::Annotator::default())
+        .config(PipelineConfig {
+            audio_capacity: NonZeroUsize::new(frame_count.saturating_add(1))
+                .unwrap_or(NonZeroUsize::MIN),
+            transcript_capacity: capacity,
+            timeline_capacity: capacity,
+            event_capacity: capacity,
+            recent_event_capacity: capacity,
+            pending_persistence_events: capacity,
+            ..PipelineConfig::default()
         })
-        .transpose()?;
-    let mut prosody = Annotator::default();
-    let mut latest_partial = HashMap::new();
-    let mut speech_ended = HashMap::new();
-    let mut frame_vad = Vec::new();
-    let mut partial_latency = Vec::new();
-    let mut final_latency = Vec::new();
+        .start()?;
+    let session = pipeline.session();
+    let mut receiver = pipeline.events().subscribe("cli-latency");
+    let collector_metrics = Arc::clone(&metrics);
+    let collector = tokio::spawn(async move {
+        let mut latency = LatencyCollector::new(collector_metrics);
+        while let Ok(event) = receiver.recv().await {
+            latency.observe(&event);
+        }
+        latency.finish()
+    });
 
-    let started = Instant::now();
-    for mut frame in frames {
-        if options.realtime {
-            let due = started + frame.stream_offset;
-            if let Some(delay) = due.checked_duration_since(Instant::now()) {
-                std::thread::sleep(delay);
+    if let Some(directory) = options.frames.as_deref() {
+        for (timestamp, payload) in load_screen_payloads(directory)? {
+            if let EventPayload::ScreenSnapshot(snapshot) = payload {
+                pipeline.emit_screen(timestamp, snapshot);
             }
-        }
-        frame.capture_ts = Instant::now();
-        let ts = frame.stream_offset;
-        while screen_payloads
-            .peek()
-            .is_some_and(|(screen_ts, _)| *screen_ts <= ts)
-        {
-            if let Some((screen_ts, payload)) = screen_payloads.next() {
-                timeline.append(screen_ts, payload);
-            }
-        }
-        let segment = match frame.source {
-            Source::Mic => {
-                let segment = mic_vad.push(&frame);
-                if let Some(error) = mic_vad.take_error() {
-                    anyhow::bail!("mic VAD failed: {error}");
-                }
-                segment
-            }
-            Source::System => {
-                let segment = system_vad
-                    .as_mut()
-                    .and_then(|detector| detector.push(&frame));
-                if let Some(error) = system_vad.as_mut().and_then(vad::SileroVad::take_error) {
-                    anyhow::bail!("system VAD failed: {error}");
-                }
-                segment
-            }
-        };
-        if let Some(segment) = segment {
-            frame_vad.push(frame.capture_ts.elapsed());
-            if segment.kind == SpeechState::SpeechEnd {
-                speech_ended.insert(segment.source, Instant::now());
-            }
-            if let Some(asr) = &transcriber {
-                asr.set_speech_state(segment.source, segment.kind);
-            }
-            prosody.observe(ProsodyEvent::Vad(&segment));
-            timeline.append(ts, EventPayload::Vad(segment));
-        }
-        if let Some(asr) = &mut transcriber {
-            asr.push(&frame);
-            append_updates(
-                asr.poll(),
-                ts,
-                &mut timeline,
-                &mut prosody,
-                &mut latest_partial,
-                &speech_ended,
-                &mut partial_latency,
-                &mut final_latency,
-            )?;
         }
     }
-    for (screen_ts, payload) in screen_payloads {
-        timeline.append(screen_ts, payload);
-    }
-    if let Some(asr) = &mut transcriber {
-        std::thread::sleep(Duration::from_millis(550));
-        let ts = timeline
-            .events()
-            .last()
-            .map_or(Duration::ZERO, TimelineEvent::ts);
-        append_updates(
-            asr.poll(),
-            ts,
-            &mut timeline,
-            &mut prosody,
-            &mut latest_partial,
-            &speech_ended,
-            &mut partial_latency,
-            &mut final_latency,
-        )?;
-        if let Some(error) = asr.poll_errors().into_iter().next() {
-            anyhow::bail!("ASR worker failed: {error}");
+    completion.wait().await;
+    pipeline.stop().await;
+    let latency = collector.await.context("latency collector failed")?;
+    let events = session.view().recent_append_order;
+    Ok(PipelineRun { events, latency })
+}
+
+#[derive(Default)]
+struct CaptureMetrics {
+    sent: Mutex<HashMap<(Source, Duration), Instant>>,
+}
+
+impl CaptureMetrics {
+    fn record(&self, frame: &AudioFrame) {
+        if let Ok(mut sent) = self.sent.lock() {
+            sent.insert((frame.source, frame.stream_offset), frame.capture_ts);
         }
     }
 
-    Ok(PipelineRun {
-        events: timeline.into_events(),
-        latency: LatencyReport {
-            frame_to_vad: percentiles(&mut frame_vad),
-            speech_end_to_partial: percentiles(&mut partial_latency),
-            speech_end_to_final: percentiles(&mut final_latency),
+    fn elapsed(&self, source: Source, timestamp: Duration) -> Option<Duration> {
+        self.sent
+            .lock()
+            .ok()?
+            .remove(&(source, timestamp))
+            .map(|sent| sent.elapsed())
+    }
+}
+
+#[derive(Clone, Default)]
+struct CaptureCompletion {
+    done: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl CaptureCompletion {
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.done.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct MergedFileCapture {
+    frames: Vec<AudioFrame>,
+    mode: FileCaptureMode,
+    completion: CaptureCompletion,
+    metrics: Arc<CaptureMetrics>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl MergedFileCapture {
+    fn load(
+        mic: &Path,
+        system: Option<&Path>,
+        mode: FileCaptureMode,
+        metrics: Arc<CaptureMetrics>,
+    ) -> Result<(Self, CaptureCompletion, usize)> {
+        let mut frames = FileCapture::new(mic, Source::Mic, mode).frames()?;
+        if let Some(path) = system {
+            frames.extend(FileCapture::new(path, Source::System, mode).frames()?);
+        }
+        // This reconstructs fixture capture arrival only. Conversation ordering belongs
+        // exclusively to `core::CallSession`.
+        frames.sort_by_key(|frame| (frame.stream_offset, frame.seq));
+        let count = frames.len();
+        let completion = CaptureCompletion::default();
+        Ok((
+            Self {
+                frames,
+                mode,
+                completion: completion.clone(),
+                metrics,
+                worker: None,
+            },
+            completion,
+            count,
+        ))
+    }
+}
+
+impl CaptureBackend for MergedFileCapture {
+    fn start(&mut self, sink: broadcast::Sender<AudioFrame>) -> Result<(), CaptureError> {
+        let frames = std::mem::take(&mut self.frames);
+        let mode = self.mode;
+        let completion = self.completion.clone();
+        let metrics = Arc::clone(&self.metrics);
+        self.worker = Some(
+            thread::Builder::new()
+                .name("sotto-cli-fixture".to_owned())
+                .spawn(move || {
+                    let started = Instant::now();
+                    for mut frame in frames {
+                        if mode == FileCaptureMode::Realtime {
+                            let due = started + frame.stream_offset;
+                            if let Some(delay) = due.checked_duration_since(Instant::now()) {
+                                thread::sleep(delay);
+                            }
+                        }
+                        frame.capture_ts = Instant::now();
+                        metrics.record(&frame);
+                        if sink.send(frame).is_err() {
+                            break;
+                        }
+                    }
+                    completion.done.store(true, Ordering::Release);
+                    completion.notify.notify_waiters();
+                })
+                .map_err(|error| CaptureError::StreamFailed(error.to_string()))?,
+        );
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+
+    fn permission_status(&self) -> PermissionStatus {
+        PermissionStatus::Authorized
+    }
+}
+
+impl Drop for MergedFileCapture {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+enum HarnessTranscriber {
+    Real(DrainingTranscriber),
+    Noop,
+}
+
+impl Transcriber for HarnessTranscriber {
+    fn push(&mut self, frame: &AudioFrame) {
+        if let Self::Real(inner) = self {
+            inner.push(frame);
+        }
+    }
+
+    fn poll(&mut self) -> Vec<TranscriptUpdate> {
+        match self {
+            Self::Real(inner) => inner.poll(),
+            Self::Noop => Vec::new(),
+        }
+    }
+}
+
+struct DrainingTranscriber {
+    inner: WhisperTranscriber,
+    expected_frames: usize,
+    pushed_frames: usize,
+    drained: bool,
+}
+
+impl DrainingTranscriber {
+    fn new(inner: WhisperTranscriber, expected_frames: usize) -> Self {
+        Self {
+            inner,
+            expected_frames,
+            pushed_frames: 0,
+            drained: false,
+        }
+    }
+}
+
+impl Transcriber for DrainingTranscriber {
+    fn push(&mut self, frame: &AudioFrame) {
+        self.pushed_frames = self.pushed_frames.saturating_add(1);
+        self.inner.push(frame);
+    }
+
+    fn poll(&mut self) -> Vec<TranscriptUpdate> {
+        let mut updates = self.inner.poll();
+        if self.drained || self.pushed_frames < self.expected_frames {
+            return updates;
+        }
+        self.drained = true;
+        let started = Instant::now();
+        let mut last_output = None;
+        while started.elapsed() < Duration::from_secs(180) {
+            thread::sleep(Duration::from_millis(100));
+            let next = self.inner.poll();
+            if !next.is_empty() {
+                last_output = Some(Instant::now());
+                updates.extend(next);
+            }
+            if last_output.is_some_and(|last| last.elapsed() >= Duration::from_millis(750)) {
+                break;
+            }
+            if !self.inner.poll_errors().is_empty() {
+                break;
+            }
+        }
+        updates
+    }
+}
+
+struct LatencyCollector {
+    metrics: Arc<CaptureMetrics>,
+    speech_ended: HashMap<Source, Instant>,
+    frame_vad: Vec<Duration>,
+    partial: Vec<Duration>,
+    final_updates: Vec<Duration>,
+}
+
+impl LatencyCollector {
+    fn new(metrics: Arc<CaptureMetrics>) -> Self {
+        Self {
+            metrics,
+            speech_ended: HashMap::new(),
+            frame_vad: Vec::new(),
+            partial: Vec::new(),
+            final_updates: Vec::new(),
+        }
+    }
+    fn observe(&mut self, event: &TimelineEvent) {
+        match event.payload() {
+            EventPayload::Vad(segment) => {
+                if let Some(value) = self.metrics.elapsed(segment.source, event.ts()) {
+                    self.frame_vad.push(value);
+                }
+                if segment.kind == SpeechState::SpeechEnd {
+                    self.speech_ended.insert(segment.source, Instant::now());
+                }
+            }
+            EventPayload::UtterancePartial(value) => {
+                if let Some(started) = self.speech_ended.get(&value.source) {
+                    self.partial.push(started.elapsed());
+                }
+            }
+            EventPayload::UtteranceFinal(value) => {
+                if let Some(started) = self.speech_ended.get(&value.source) {
+                    self.final_updates.push(started.elapsed());
+                }
+            }
+            _ => {}
+        }
+    }
+    fn finish(mut self) -> LatencyReport {
+        LatencyReport {
+            frame_to_vad: percentiles(&mut self.frame_vad),
+            speech_end_to_partial: percentiles(&mut self.partial),
+            speech_end_to_final: percentiles(&mut self.final_updates),
             speech_end_to_suggestion: None,
-        },
-    })
+        }
+    }
 }
 
 pub fn load_screen_payloads(directory: &Path) -> Result<Vec<(Duration, EventPayload)>> {
@@ -280,7 +470,6 @@ fn decode_png(path: &Path, captured_at: Duration) -> Result<screen::Frame> {
 
 #[cfg(target_os = "macos")]
 struct BestEffortVisionOcr(screen::VisionOcr);
-
 #[cfg(target_os = "macos")]
 impl screen::OcrEngine for BestEffortVisionOcr {
     fn recognize(&self, frame: &screen::Frame) -> Result<String, screen::ScreenError> {
@@ -293,7 +482,6 @@ impl screen::OcrEngine for BestEffortVisionOcr {
         }
     }
 }
-
 #[cfg(target_os = "macos")]
 fn platform_ocr() -> BestEffortVisionOcr {
     BestEffortVisionOcr(screen::VisionOcr::new())
@@ -301,68 +489,15 @@ fn platform_ocr() -> BestEffortVisionOcr {
 
 #[cfg(not(target_os = "macos"))]
 struct UnavailableOcr;
-
 #[cfg(not(target_os = "macos"))]
 impl screen::OcrEngine for UnavailableOcr {
     fn recognize(&self, _frame: &screen::Frame) -> Result<String, screen::ScreenError> {
         Ok(String::new())
     }
 }
-
 #[cfg(not(target_os = "macos"))]
 fn platform_ocr() -> UnavailableOcr {
     UnavailableOcr
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "stage state is explicit at the pipeline seam"
-)]
-fn append_updates(
-    updates: Vec<TranscriptUpdate>,
-    ts: Duration,
-    timeline: &mut TimelineBuilder,
-    prosody: &mut Annotator,
-    latest_partial: &mut HashMap<Source, TimelineEvent>,
-    speech_ended: &HashMap<Source, Instant>,
-    partial_latency: &mut Vec<Duration>,
-    final_latency: &mut Vec<Duration>,
-) -> Result<()> {
-    for update in updates {
-        let source = update.utterance().source;
-        let ended_latency = speech_ended.get(&source).map(Instant::elapsed);
-        match update {
-            TranscriptUpdate::Partial(utterance) => {
-                if let Some(latency) = ended_latency {
-                    partial_latency.push(latency);
-                }
-                let payload = EventPayload::UtterancePartial(utterance);
-                let event = if let Some(previous) = latest_partial.remove(&source) {
-                    timeline.supersede(ts, payload, &previous)?
-                } else {
-                    timeline.append(ts, payload)
-                };
-                latest_partial.insert(source, event);
-            }
-            TranscriptUpdate::Final(mut utterance) => {
-                if let Some(latency) = ended_latency {
-                    final_latency.push(latency);
-                }
-                let annotations = prosody.observe(ProsodyEvent::Utterance(&utterance));
-                utterance.annotations.extend(annotations);
-                let payload = EventPayload::UtteranceFinal(utterance);
-                if let Some(previous) = latest_partial.remove(&source) {
-                    timeline.supersede(ts, payload, &previous)?;
-                } else {
-                    timeline.append(ts, payload);
-                }
-                if let Some(delta) = prosody.last_delta().cloned() {
-                    timeline.append(ts, EventPayload::Prosody(delta));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn percentiles(values: &mut [Duration]) -> Percentiles {
@@ -374,7 +509,6 @@ fn percentiles(values: &mut [Duration]) -> Percentiles {
         p99_ms: percentile(values, 99, 100),
     }
 }
-
 fn percentile(values: &[Duration], numerator: usize, denominator: usize) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -384,14 +518,6 @@ fn percentile(values: &[Duration], numerator: usize, denominator: usize) -> f64 
         .div_ceil(denominator);
     values[index].as_secs_f64() * 1_000.0
 }
-
-const fn source_order(source: Source) -> u8 {
-    match source {
-        Source::Mic => 0,
-        Source::System => 1,
-    }
-}
-
 pub fn ingest_file(store_path: &Path, input: &Path) -> Result<bool> {
     let text = std::fs::read_to_string(input)
         .with_context(|| format!("read document {}", input.display()))?;

@@ -1,6 +1,6 @@
 # T011 — Core pipeline: wire the conveyor belt end to end
 
-**Status:** changes-requested (implementation good; collapse the duplicate CLI wiring)
+**Status:** changes-requested (R1 done; transcript coverage defect + missing ground-truth assertion)
 
 **Wave:** 2
 
@@ -142,3 +142,64 @@ planning gap, not an implementation error.
 
 CLI delegating to `core::pipeline`, one ordering implementation, reference timeline regenerated
 from the real path, and `sotto-cli run` still emitting a correct timeline against the fixtures.
+
+## Review round 2 — R1 done; a functional defect it exposed
+
+**The structural fix is verified.** `cli::run_files` builds `Pipeline::builder(session)`, and
+`TimelineBuilder`, `source_order` and `append_updates` are all gone from the CLI. One wiring
+now, and `sotto-cli run` exercises the production path — I reproduced 10 VAD events and 2
+OCR snapshots through real Silero and real Vision. Full-workspace clippy clean, 67 passed.
+
+Collapsing the duplication did exactly what it was supposed to do: it made a real problem
+visible.
+
+### R2. The pipeline loses about 70% of the transcript
+
+`fixtures/call-01-ground-truth.json` declares five utterances. The regenerated reference
+timeline contains two, one of them a fragment:
+
+| Ground truth | Produced |
+|---|---|
+| mic @1s "Thanks for joining. How are you handling pricing today?" | *missing* |
+| system @6s "We need predictable pricing for the enterprise rollout." | *missing* |
+| mic @13s "Let me walk through the enterprise plan." | *missing* |
+| system @18s "The price is higher than Acme, our current vendor." | `'and vendor.'` |
+| mic @24s "The migration and support are included." | exact |
+
+The pattern is the diagnosis: **only the last utterance per source survives.** That is not
+random loss. Two candidates, and it is worth determining which before changing anything:
+
+- **The commit policy never fires progressively.** T005 commits only after an unstable tail
+  plus N agreeing passes. In fast (non-realtime) fixture mode, frames arrive far faster than
+  the ~500 ms window cadence, so a given span may never be re-transcribed enough times to
+  agree — leaving everything uncommitted until the stream ends.
+- **The end-of-stream drain flushes only the final window.** `DrainingTranscriber` sets
+  `drained` once; if the underlying transcriber has multiple pending windows, a single drain
+  pass would surface only the last.
+
+Either way the consequence is the same and it is severe: the map tier's entire value is a
+readable transcript, and 70% of it is absent. Also check `--realtime` against fast mode — if
+they differ, the commit policy is timing-dependent, which matters for a live call.
+
+### R3. Nothing compares output to the ground truth that is sitting in the repo
+
+`rg` finds no test reading `*-ground-truth.json`. The corpus was built in T009 specifically
+so the pipeline could be checked against known answers, and then the reference timeline was
+regenerated and committed as correct without ever being compared to them. That is why a
+70% shortfall landed with a green suite.
+
+Add an integration test that loads `call-01-ground-truth.json` and asserts, per source and
+in order, that each expected utterance appears with reasonable word overlap. Exact string
+equality is wrong here — Whisper on TTS audio will not match verbatim, and the negative and
+crosstalk fixtures have ground truth too. Something like: every expected utterance matched
+by a final whose text shares a majority of its words, no expected utterance missing.
+
+This is the guard the verification rule exists to demand, and it is the sixth time the
+pattern has appeared. Please make it a real assertion rather than a smoke check — it is the
+only thing standing between "the transcript looks plausible" and "the transcript is right".
+
+### Re-review
+
+R2 diagnosed and fixed with coverage close to ground truth, R3 asserting against the
+ground-truth files, `--realtime` and fast mode agreeing, and the reference timeline
+regenerated once the loss is fixed.

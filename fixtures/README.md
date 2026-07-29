@@ -22,8 +22,9 @@ cargo run -p cli --example generate_fixtures
 Generation intentionally requires macOS because `say`, `afconvert`, AppKit font
 rendering, and Vision verification are part of the fixture provenance.
 
-The reference timeline is the stdout of an actual full CLI run using whisper.cpp's
-`tiny.en-q5_1` model, not a hand-authored approximation. For stable replay, its generated
+The reference timeline is the stdout of an actual full CLI run through
+`core::Pipeline`, using real Silero, prosody, Apple Vision, and whisper.cpp's
+`tiny.en-q5_1` model—not a hand-authored approximation or a separate CLI pipeline. For stable replay, its generated
 session id is normalized to `1` and temporary cached frame references are replaced by
 their source fixture paths; event timestamps, VAD boundaries, OCR, ASR text, and prosody
 are preserved from the run. It is stable JSONL intended for downstream replay tests. A
