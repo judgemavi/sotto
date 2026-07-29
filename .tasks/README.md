@@ -81,8 +81,9 @@ each file, once:
 | 0.5 | 1 | **T014** | session timeline model — blocks every event producer |
 | 1 | 0–1 | T002, T003, T004, T005, T006, T007, T008, T009, T010, T015 | ten, fully disjoint |
 | 2 | 1 | T011, T012 | pipeline wiring + dev window |
-| 3 | 2 | T016, T017 | **the note-taker dogfood gate** |
-| 4 | 3 | T013 | advisor — gated on wave 3 passing |
+| 3 | 2 | T016, T017 | **the map tier — first shippable, works with no API key** |
+| 4 | 3 | T019 | topical clustering — the second organising axis |
+| 5 | 3b | T013 | advisor — realtime, gated on the map tier being good |
 
 **T014 is the current bottleneck.** The `AGENTS.md` reframe made the session timeline the
 spine of the product, and T001's frozen `PipelineEvent` cannot express it. T014 reopens

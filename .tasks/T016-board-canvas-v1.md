@@ -70,3 +70,29 @@ product**. Build it to be used by us, on real calls, not to be demoed.
 
 Suggestions and any advising UI, topic clustering, user annotations (Phase 4), the
 overlay lens (T012 owns the seam; the production lens is Phase 4), shipping this.
+
+
+## Amendment — the board is now a shipping tier, not a dogfood gate (2026-07-29)
+
+`AGENTS.md` has changed underneath this task. The map is no longer an internal milestone we
+use and discard: it is **the first usable product tier, and it ships**. It works with no API
+key configured, and onboarding runs through it — a rep tries Sotto on one call before anyone
+asks them for a credential.
+
+That raises the bar here. Previously "readable enough to prove the timeline works" was
+enough. Now:
+
+- **It must be good standalone.** Someone with no model configured should find reviewing a
+  call on this board genuinely better than scrubbing a recording. That is the bar.
+- **No dead ends where the reasoning tier would be.** With no key configured there is no
+  empty "summary" panel, no greyed-out "clusters" button, no error state. Absence of the
+  reasoning tier is a *normal* configuration, not a degraded one — the UI should not imply
+  the user is missing something broken.
+- **Leave the second axis room.** T019 produces topic regions, cross-links and open threads
+  as a derived view keyed by `EventId`. The board renders that as an **optional overlay** the
+  user can switch off, falling back to pure chronology. Design the layout so clusters can be
+  layered on later without reflowing what chronology already placed — the append-only
+  discipline you already need for live capture is the same mechanism.
+
+The gate still applies — use it on real calls and agree the timeline is accurate and
+readable before advising work starts — but it is now a product bar as well as a checkpoint.

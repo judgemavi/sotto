@@ -8,7 +8,25 @@ A desktop app for sales teams that listens to live calls (any meeting app — Zo
 
 **Sessions are explicitly started and explicitly scoped.** The user turns Sotto on and picks what to capture — an application or a window — through the system picker. Nothing outside that scope is ever captured. Sotto is not ambient, does not run in the background waiting for a call, and has no always-on mode.
 
-The end product is the copilot. The internal milestone on the way there is a note-taker: a fused audio+screen timeline good enough to read is the proof it's good enough to reason over. We dogfood that milestone; we do not ship it as a standalone product.
+## Two layers: the map, and the reasoning over it
+
+Sotto is built as a **deterministic local layer** with an **optional reasoning layer** on top. This is not an implementation detail — it is the shape of the product.
+
+**The local layer needs no API key and no network.** It captures the chosen target's audio and screen, transcribes on-device, and assembles a *map* of the session: a chronological, append-only timeline of who said what, when, with what prosody, against what was on screen. This layer is deterministic, private, and complete on its own. A user with no credentials configured still gets a reviewable record of their call.
+
+**The reasoning layer makes the map smart.** The user brings a model — Ollama for fully local, or any cloud provider with their own key — and it earns its place by doing what local tooling cannot: organising the map by *topic* rather than only by time, generating recaps, and, live, offering suggestions grounded in the company's own material. MCP extends this with the customer's own connectors and knowledge bases.
+
+The distinction that matters, because it decides what belongs where:
+
+- **Chronological structure is deterministic.** Who spoke, when, for how long, over which screen. No semantics required — local tools produce it exactly, every time.
+- **Topical structure requires meaning.** "These six exchanges are the pricing discussion." "This objection echoes one from forty minutes ago." That is the model's job, and it is a *derived view* over the append-only log, never a mutation of it.
+
+Add a model and the board gains a second organising axis — the map becomes closer to a mind map than a transcript. Remove it and the board is still correct, just chronological. Nothing breaks; capability degrades.
+
+Two consequences to hold onto:
+
+1. **The map layer is domain-neutral; the advice layer is not.** Organising a conversation generalises fine. Knowing which moment deserves an interruption does not — restraint requires knowing what matters, which is what keeps the advisor specifically a sales tool. General substrate, specific advice.
+2. **`core` must never depend on `providers`.** The crate graph is what enforces the tier boundary. If reasoning code lands in `core`, the no-key tier stops being real.
 
 Core differentiators (do not compromise these):
 
@@ -19,6 +37,7 @@ Core differentiators (do not compromise these):
    **Consent is structural, not a policy.** Capture scope is enforced by the OS content filter, not by us filtering afterwards: if the user picked one window, nothing else is ever in the buffer, so there is nothing to redact, prune, or be trusted about. Prefer the system picker — it is the affordance users already know from screen sharing, and macOS draws its own indicator around the captured window. An allowlist chosen by the user beats any blocklist we maintain.
 5. **Lightweight by construction.** Sotto is a single native Rust binary. Small footprint is part of the product's identity ("local-first" should *feel* local-first) — resist dependencies and architecture choices that bloat it.
 6. **The board, not a toast.** Suggestions appear anchored in the conversation that triggered them, on a spatial canvas — not as disembodied pop-ups. Context is what makes a suggestion trustworthy.
+7. **Useful before it is smart.** The app works with no API key configured: capture, transcribe, and map. Intelligence is an upgrade the user opts into by bringing a model, not a gate on getting any value at all. This is also the honest onboarding path — a rep can run it on one call before anyone asks them for a credential.
 
 ## The session timeline (core abstraction)
 
@@ -37,9 +56,10 @@ The **session record** carries what the timeline is *of*: start and end wall-clo
 
 Rules:
 - **Append-only.** Corrections (partial → final) are new events referencing the superseded id, never mutations. Layout and consumers rely on this.
-- **Both partials and finals are first-class** from day one. The note-taker milestone only needs finals; the copilot needs partials. The schema never assumes batch.
+- **Both partials and finals are first-class** from day one. The map tier only needs finals; the live copilot needs partials. The schema never assumes batch.
 - **Persistence:** timelines land in SQLite (same file as RAG). Past timelines are ingested into RAG — every recorded call makes future advising smarter about that account ("what did they object to last time?" is answerable for free).
-- Consumers: (a) live board UI, (b) advising layer, (c) post-call summarizer, (d) RAG ingester. All read the same spine.
+- Consumers: (a) live board UI, (b) advising layer, (c) post-call summarizer, (d) topical clustering, (e) RAG ingester. All read the same spine.
+- **Derived views never mutate the log.** Topical clusters, themes and cross-references produced by a model are projections *over* the timeline, stored alongside it and recomputable from it. A model's opinion is not a fact about what happened, and the record of what happened has to survive being reinterpreted — including by a different model, or none.
 
 ## UI model: the whiteboard
 
@@ -106,7 +126,8 @@ One language, one binary. No Electron, no webview, no sidecar/IPC boundary.
 /crates/prosody        # annotation extraction
 /crates/screen         # frame sampling, Apple Vision OCR, screen.snapshot events
 /crates/providers      # LLM provider abstraction (streaming, cancellation, caching)
-/crates/advisor        # watcher/suggester loop, triggers, speculative execution
+/crates/advisor        # realtime LLM path: watcher/suggester loop, triggers, speculative execution
+/crates/insight        # offline LLM path: topical clustering, post-call summaries, derived views
 /crates/rag            # rusqlite + sqlite-vec + fastembed; timeline persistence + ingestion
 /crates/mcp            # MCP client wrapper (isolates rmcp)
 /crates/app            # GPUI application: board canvas, overlay lens, settings, tray, updater
@@ -133,14 +154,19 @@ Timebox: 7 days.
 - `cli` harness: WAV (+ frame fixtures) in → timeline events out; latency measurements; CI integration tests
 - Minimal GPUI dev window rendering the raw live timeline (first real GPUI code beyond the spike)
 
-### Phase 2 — Internal note-taker milestone (dogfood gate — NOT shipped)
+### Phase 2 — The map: the first usable tier (works with no API key)
 - Board canvas v1: utterance blocks per speaker, prosody-as-space, screen thumbnails pinned to their interval
-- Post-call summarizer consumer (BYOK LLM) producing a structured recap from the timeline
+- Session start/stop with the target picker, and post-call review of a persisted timeline
 - Timeline → RAG ingestion (past calls become retrievable account memory)
-- **Gate:** record real calls; the fused timeline must be accurate and *readable* before any advising work begins. If the timeline isn't good enough to read, it isn't good enough to reason over — fix it here.
+- **This tier ships without any model configured.** Everything above is deterministic and local. Onboarding must not require a key.
+- **Gate:** record real calls and use the board. The fused timeline must be accurate and *readable* before advising work begins — if it isn't good enough to read, it isn't good enough to reason over. This is now a product bar, not only a dogfood checkpoint.
 
-### Phase 3 — Intelligence loop
-- `providers`: streaming + cancellation + keychain storage; GPUI settings screens for keys/model selection (use gpui-component)
+### Phase 3 — The reasoning layer (offline first)
+- `providers`: streaming + cancellation + keychain storage; GPUI settings screens for keys/model selection (use gpui-component), including the no-key and Ollama paths
+- `insight`: post-call summaries and **topical clustering** — the second organising axis that turns a chronological timeline into a mind-map-like view. No latency budget, so this is where screen-context and prompt-shape questions get settled cheaply before the realtime path inherits them.
+- Derived views render on the board as an optional overlay the user can turn off, falling back to pure chronology
+
+### Phase 3b — The realtime loop
 - `advisor`: two-tier watcher/suggester loop with speculative calls; trigger types v1: competitor mention, pricing question, objection, discovery-gap
 - `rag`: battlecard/doc ingestion, sqlite-vec retrieval (docs + past timelines), prompt assembly with cached static prefix
 - Suggestions land on the board anchored to their triggering events; overlay lens shows the board's newest edge
@@ -168,9 +194,11 @@ Timebox: 7 days.
 
 ## Explicit non-goals (v1)
 
-- No standalone note-taker product — the note-taker is an internal milestone and dogfood gate only
+- No *marketing* of a standalone note-taker. The map tier is a real product tier — it ships, it works without a key, and onboarding runs through it — but Sotto is positioned and sold as a sales copilot. We are not entering the Granola/Otter/Fathom category; we are making the substrate useful so the copilot has somewhere to stand.
 - **No ambient or always-on capture.** No background listening, no "record my whole day", no auto-start on detecting a meeting. Every session is explicitly started and explicitly scoped by the user. This is a deliberate decision, not a missing feature: ambient capture would record people who never consented (a legal exposure in two-party-consent jurisdictions), break the two-stream speaker model that gives us diarization for free, and trade a defensible wedge for a crowded undifferentiated one. Revisit only via an ADR with evidence.
-- No general-purpose personal-recall product — the pipeline is domain-neutral by construction, but the product is a sales copilot. Domain specificity is what makes "quiet by default" computable: restraint requires knowing what matters.
+- No general-purpose personal-recall product — the map layer is domain-neutral by construction and that is deliberate, but the advice layer stays specifically a sales tool. Domain specificity is what makes "quiet by default" computable: restraint requires knowing what matters.
+- No reasoning in `core`. Summarization, clustering and suggestion all live above the `providers` boundary. If `core` ever needs an API key to do its job, the no-key tier has been lost and the architecture has drifted.
+- No model output masquerading as record. Topical clusters and summaries are derived views stored alongside the timeline, never edits to it — a different model, or none, must always be able to reproduce the original.
 - No cloud backend, no accounts, no telemetry beyond opt-in crash reports
 - No meeting bots that join calls
 - No stealth/undetectability features — ever (see Core differentiators #4)

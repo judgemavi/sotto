@@ -144,3 +144,17 @@ resolve locally. Two follow-ups, neither blocking the approval above:
   rather than relying on the runner image happening to include it.
 
 All CI follow-ups from this review are resolved.
+
+
+## Follow-up — enforce the tier boundary in CI (2026-07-29)
+
+`AGENTS.md` now states that `core` must never depend on `providers`: the map tier works with
+no API key, and the crate graph is what makes that real rather than aspirational.
+
+The headless job already proves the same kind of thing for GPUI, mechanically, with
+`cargo tree`. Add the equivalent check for `providers` in the `core` dependency graph, and
+fail the build if it appears. A convention nobody can violate accidentally is worth more
+than a paragraph in a design document — this is exactly the pattern that made the
+headless-core guard valuable.
+
+Also still open from the earlier review: add `capture` to the headless job's crate list.

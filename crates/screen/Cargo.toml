@@ -7,3 +7,14 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+png = "0.18.0"
+sha2 = "0.10.9"
+sotto_core = { package = "core", path = "../core" }
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-vision = "0.3.2"

@@ -7,7 +7,8 @@
 **Depends on:** T007 (BYOK providers) · T008 (persisted timelines) · T011 (timeline
 production). Not blocked on any UI — this is a headless consumer and must stay one.
 
-**Owns:** `crates/core/src/summarizer/**`, `prompts/summary/**`
+**Owns:** `crates/insight/**`, `prompts/summary/**`, root `Cargo.toml` (to register the
+new crate only)
 
 ## Goal
 
@@ -73,3 +74,32 @@ Phase 4's board review UI renders it; T008 ingests it into RAG as account memory
 
 Live/incremental summarisation, the advisor loop (T013), recap UI (Phase 4), sharing or
 exporting recaps anywhere off-device.
+
+
+## Amendment — moved out of `core` (2026-07-29)
+
+This task previously owned `crates/core/src/summarizer/**`. That is now wrong and would
+have broken the architecture: the summarizer calls an LLM through `providers`, so putting
+it in `core` makes `core` depend on `providers` — and `AGENTS.md` now states that the map
+tier must work with **no API key at all**, with the crate graph as the thing that enforces
+it. Reasoning code in `core` would quietly make the no-key tier a fiction.
+
+Build it in a new **`crates/insight`** crate — the offline LLM path, as distinct from
+`advisor`'s realtime path. You own registering it in the workspace root; nobody else
+touches that file while you do.
+
+`insight` is also where the **screen-context question gets settled**, because it is the one
+place with no latency budget and no prompt-cache concern. Run the same recorded session
+three ways and compare the recaps:
+
+1. capture-target metadata only (app name, window title — nearly free);
+2. metadata + OCR text from `screen.snapshot`;
+3. metadata + the frame images themselves, sent to a multimodal model.
+
+Report which actually changed the recap. Right now nothing has measured whether screen
+context earns its tokens in any form, and T015's OCR has never been verified to extract a
+character. That measurement decides three things downstream: whether `advisor` includes
+screen context at all, whether we keep maintaining Vision, and whether image context is
+worth its cost and its privacy trade-off. Do not assume — `AGENTS.md` keeps images opt-in
+precisely because sending a customer's shared screen off-device is a different promise from
+sending redacted transcript text.
