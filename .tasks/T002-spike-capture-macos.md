@@ -272,3 +272,60 @@ The single most important thing you can tell us: **can ScreenCaptureKit scope au
 chosen application, or is it system-wide?** The product's consent story, T012's indicator,
 T014's `audio_scoped` flag and T015's scope all hang off that answer. Report it plainly
 either way; "video-only scoping" is a fine answer, and silently implying more is not.
+
+## Field findings — 2026-07-29
+
+Two defects found while trying to actually run the soak, plus first real drift data.
+
+### F1. The soak binary would not launch (fixed)
+
+```
+dyld: Library not loaded: @rpath/libswift_Concurrency.dylib
+      Reason: no LC_RPATH's found
+```
+
+`Package.swift` declares `.macOS(.v14)`, but rustc's link step does not inherit that
+deployment target. The linker assumed an older minimum, resolved Swift concurrency
+against the Swift 5.5 back-deployment stub, and emitted a reference to a dylib that does
+not exist on macOS 14+ — where the concurrency runtime is folded into `libswiftCore`.
+
+Fixed by adding `.cargo/config.toml` with `MACOSX_DEPLOYMENT_TARGET = "14.0"`, which
+applies to every cargo-invoked link in the workspace, so `cli` and `app` are covered too.
+**Keep it in step with `Package.swift`'s platforms declaration** — if one moves and the
+other does not, this returns as a runtime failure that no test catches, because the
+workspace compiles and lints perfectly clean either way. Worth a line in ADR-0002.
+
+### F2. Ctrl-C loses the entire run
+
+There is no signal handling. An interrupt kills the process before `mic.finalize()` and
+`system.finalize()`, so the WAV headers never get their data length and both files are
+unreadable — and the drift summary never prints. On a 65-minute soak that means one
+mistimed keystroke costs the whole session. Add a handler that stops capture and
+finalizes on SIGINT.
+
+### F3. First drift measurements
+
+| Window | Frames | Dropped | Mic drift | System drift |
+|---|---|---|---|---|
+| 3 s | 1 | 0 | 85.756 samples/s | 609.935 samples/s |
+| 60 s | 4 | 0 | −1.035 samples/s | −4.191 samples/s |
+
+The 3-second figures were startup transient — they fell ~100× as the window grew, so
+short runs cannot be used to characterise drift at all. Zero dropped frames in both.
+
+At 60 s the mic sits at the ~1 sample/s budget and system is 4× over it. The figure that
+matters is **relative** drift, since cross-stream comparison is what T006's interruption
+detection depends on:
+
+```
+4.191 − 1.035 = 3.16 samples/s → × 3900 s ÷ 16 kHz ≈ 0.77 s of slip per hour
+```
+
+Roughly 65 ppm on mic (normal for a crystal) and 262 ppm on system (high). If those rates
+hold over the full soak, cross-stream timestamps cannot be compared directly and the
+correction step this brief already anticipates is required, not optional. If instead the
+rate keeps falling as the window grows, it was all startup transient.
+
+**The 65-minute soak decides which.** Report the two rates, the dropped-frame count, and
+whether a spoken marker at ~60 minutes still audibly lines up against continuous system
+audio — the audible check is worth more than the printed number.

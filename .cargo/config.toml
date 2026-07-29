@@ -1,0 +1,16 @@
+# The Swift bridge in crates/capture targets macOS 14 (Package.swift declares
+# .macOS(.v14)), but rustc's link step does not inherit that deployment target.
+# Without it the linker assumes an older minimum, resolves Swift concurrency
+# against the Swift 5.5 back-deployment stub, and emits a reference to
+# @rpath/libswift_Concurrency.dylib. That dylib does not exist on macOS 14+ —
+# the concurrency runtime is folded into libswiftCore — so any binary linking
+# the capture crate dies at startup with:
+#
+#   dyld: Library not loaded: @rpath/libswift_Concurrency.dylib
+#         Reason: no LC_RPATH's found
+#
+# Setting the deployment target here applies to every cargo-invoked link in the
+# workspace, so `cli`, `app` and the capture examples all get it. Keep this in
+# step with Package.swift's platforms declaration.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "14.0"
