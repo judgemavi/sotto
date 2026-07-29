@@ -1,6 +1,6 @@
 # T004 — VAD crate: Silero via ONNX Runtime
 
-**Status:** blocked (on T014 — emits timeline events)
+**Status:** todo (unblocked — T014 frozen)
 
 **Wave:** 1 — fully parallel, no platform dependencies
 

@@ -28,6 +28,10 @@ optional bundle id and window title, the displayed name, application-versus-wind
 kind, and whether audio was actually scoped to that target. This scope is recorded once
 per session rather than repeated on events. `audio_scoped = false` preserves the fact
 that a timeline may contain system-wide audio even when its video was target-scoped.
+It also stores caller-supplied Unix-millisecond start and optional end wall clocks.
+Core never reads the system clock: capture/session orchestration supplies both values,
+so session start reflects the actual lifecycle boundary rather than a later persistence
+batch and timeline tests remain deterministic.
 
 The log is append-only. A correction is a new event that references an earlier event
 from the same session. The corrected event remains in history. Builders enforce

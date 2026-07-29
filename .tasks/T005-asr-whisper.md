@@ -1,6 +1,6 @@
 # T005 — ASR crate: whisper.cpp sliding-window streaming transcription
 
-**Status:** blocked (on T014 — emits timeline events)
+**Status:** todo (unblocked — T014 frozen)
 
 **Wave:** 1 — fully parallel; develop against WAV fixtures, not live capture
 

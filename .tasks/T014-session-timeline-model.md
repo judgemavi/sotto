@@ -1,6 +1,6 @@
 # T014 — Session timeline: the canonical event model in core
 
-**Status:** changes-requested (R5 approved; R6 — session wall-clock — outstanding)
+**Status:** done (approved at review round 4 — contract frozen)
 
 **Wave:** 0.5 — blocks every crate that emits or consumes events (T004, T005, T006,
 T008, T009, T011, T015). T002, T003, T007 and T010 are unaffected and continue.
@@ -333,3 +333,36 @@ session-relative.
 
 R6 landed, existing tests still green. Then the contract re-freezes and the six-way
 fan-out goes out.
+
+## R6 implementation notes
+
+- Added caller-supplied `started_at_unix_ms` and initially-empty `ended_at_unix_ms` to
+  `Session`; `Session::new` now requires the start wall-clock alongside identity and
+  capture target.
+- Added read-only accessors for both timestamps and `Session::end` as the sole lifecycle
+  setter for the end wall-clock. Core does not read `SystemTime` or stamp either value.
+- Added coverage proving the exact caller-supplied start/end timestamps are retained and
+  a new session remains open until `end` is called.
+- Updated ADR-0004 to assign wall-clock ownership to session orchestration and distinguish
+  actual session start from delayed persistence-batch time.
+- Verified `cargo fmt --check`, strict Clippy across the workspace/all targets/all
+  features, and `cargo test --workspace --all-features`: 30 passed, 0 failed, 5 ignored
+  manual live-provider tests.
+
+## Review round 4 — approved, task complete
+
+R6 landed as specified: caller-supplied `started_at_unix_ms`, optional `ended_at_unix_ms`,
+read-only accessors, `end()` setter, and no `SystemTime::now()` anywhere in `core` — the
+crate stays deterministic and testable, matching the discipline `ts` already follows by
+being session-relative. Verified: fmt clean, strict clippy clean, 30 passed / 0 failed /
+5 ignored.
+
+**The timeline contract is now frozen.** `TimelineEvent`, `EventPayload`, `EventKind`,
+`EventId`, `SessionId`, `Session`, `CaptureTarget` and `SQLITE_SCHEMA` do not change again
+without an ADR. Six tasks unblock: T004, T005, T006, T008, T009, T015.
+
+Non-blocking observation for whoever touches this next: `end()` neither rejects a second
+call nor checks that the end time is at or after the start. Everything else in this module
+validates its invariants (foreign sessions, non-monotonic ids, unknown supersede targets),
+so this is the one place a caller can record something impossible. Worth tightening if the
+file is open anyway; not worth a round of its own.

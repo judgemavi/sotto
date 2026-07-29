@@ -1,6 +1,6 @@
 # T006 — Prosody crate: annotation extraction
 
-**Status:** blocked (on T014 — emits timeline events)
+**Status:** todo (unblocked — T014 frozen)
 
 **Wave:** 1 — fully parallel, pure computation over timings + text
 

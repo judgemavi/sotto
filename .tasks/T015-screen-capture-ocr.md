@@ -1,6 +1,6 @@
 # T015 — Screen crate: low-rate frame sampling + Apple Vision OCR
 
-**Status:** blocked (on T014; frame delivery from T002)
+**Status:** todo (unblocked — T014 frozen; T002 now delivers real frames)
 
 **Wave:** 1 — new crate, parallel with the other stage crates
 

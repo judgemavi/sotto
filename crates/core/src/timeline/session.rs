@@ -26,15 +26,23 @@ pub struct CaptureTarget {
 pub struct Session {
     id: SessionId,
     capture_target: CaptureTarget,
+    started_at_unix_ms: u64,
+    ended_at_unix_ms: Option<u64>,
     next_id: u64,
 }
 
 impl Session {
     #[must_use]
-    pub const fn new(id: SessionId, capture_target: CaptureTarget) -> Self {
+    pub const fn new(
+        id: SessionId,
+        capture_target: CaptureTarget,
+        started_at_unix_ms: u64,
+    ) -> Self {
         Self {
             id,
             capture_target,
+            started_at_unix_ms,
+            ended_at_unix_ms: None,
             next_id: 1,
         }
     }
@@ -47,6 +55,20 @@ impl Session {
     #[must_use]
     pub const fn capture_target(&self) -> &CaptureTarget {
         &self.capture_target
+    }
+
+    #[must_use]
+    pub const fn started_at_unix_ms(&self) -> u64 {
+        self.started_at_unix_ms
+    }
+
+    #[must_use]
+    pub const fn ended_at_unix_ms(&self) -> Option<u64> {
+        self.ended_at_unix_ms
+    }
+
+    pub const fn end(&mut self, ended_at_unix_ms: u64) {
+        self.ended_at_unix_ms = Some(ended_at_unix_ms);
     }
 
     /// Allocates the next monotonic id for this session.
@@ -79,12 +101,36 @@ mod tests {
     #[test]
     fn session_retains_capture_scope() {
         let target = target();
-        let session = Session::new(SessionId::new(1), target.clone());
+        let session = Session::new(SessionId::new(1), target.clone(), 1_753_776_000_000);
 
         assert_eq!(
             session.capture_target(),
             &target,
             "the session record must retain its selected capture target"
+        );
+    }
+
+    #[test]
+    fn session_lifecycle_uses_caller_supplied_wall_clock() {
+        let mut session = Session::new(SessionId::new(2), target(), 1_753_776_000_000);
+
+        assert_eq!(
+            session.started_at_unix_ms(),
+            1_753_776_000_000,
+            "the session must retain its caller-supplied start time"
+        );
+        assert_eq!(
+            session.ended_at_unix_ms(),
+            None,
+            "a newly started session must remain open"
+        );
+
+        session.end(1_753_779_600_000);
+
+        assert_eq!(
+            session.ended_at_unix_ms(),
+            Some(1_753_779_600_000),
+            "ending a session must retain the caller-supplied end time"
         );
     }
 

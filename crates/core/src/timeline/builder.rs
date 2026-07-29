@@ -240,6 +240,7 @@ mod tests {
                 kind: TargetKind::Application,
                 audio_scoped: true,
             },
+            1_753_776_000_000,
         )
     }
 
