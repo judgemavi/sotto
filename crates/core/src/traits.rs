@@ -73,7 +73,36 @@ pub trait VoiceActivityDetector: Send {
 /// Produces sliding-window partials and final utterances from audio frames.
 pub trait Transcriber: Send {
     fn push(&mut self, frame: &AudioFrame);
-    fn poll(&mut self) -> Vec<Utterance>;
+    fn poll(&mut self) -> Vec<TranscriptUpdate>;
+}
+
+/// A transcription result and whether it is still subject to revision.
+///
+/// Mirrors the timeline's `UtterancePartial` / `UtteranceFinal` split rather than
+/// carrying a bool, so a consumer matches the same way it will match the event it
+/// becomes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TranscriptUpdate {
+    Partial(Utterance),
+    Final(Utterance),
+}
+
+impl TranscriptUpdate {
+    /// Borrows the utterance without discarding its finality at the call site.
+    #[must_use]
+    pub fn utterance(&self) -> &Utterance {
+        match self {
+            Self::Partial(utterance) | Self::Final(utterance) => utterance,
+        }
+    }
+
+    /// Consumes the update and returns its utterance.
+    #[must_use]
+    pub fn into_utterance(self) -> Utterance {
+        match self {
+            Self::Partial(utterance) | Self::Final(utterance) => utterance,
+        }
+    }
 }
 
 /// Searches the local knowledge index.

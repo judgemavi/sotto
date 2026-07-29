@@ -2,19 +2,22 @@ use std::{
     collections::{BTreeMap, HashMap},
     hash::{Hash, Hasher},
     path::Path,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
 use sotto_core::{
     BoxFuture, CaptureTarget, Chunk, RagError, Retriever, Session, SessionId, TargetKind,
     TimelineEvent,
 };
 
-use crate::schema::{migrate, storage};
+use crate::schema::{configure, migrate, storage};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DocumentKind {
@@ -52,34 +55,49 @@ pub struct SearchFilter {
 }
 
 pub struct Store {
-    connection: Mutex<Connection>,
+    writer: Mutex<Connection>,
+    reader: Mutex<Connection>,
     embedding: Mutex<Option<TextEmbedding>>,
 }
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RagError> {
         register_sqlite_vec();
-        let mut connection = Connection::open(path).map_err(storage)?;
-        migrate(&mut connection)?;
+        let mut writer = Connection::open(path.as_ref()).map_err(storage)?;
+        migrate(&mut writer)?;
+        let reader = Connection::open(path).map_err(storage)?;
+        configure(&reader)?;
         Ok(Self {
-            connection: Mutex::new(connection),
+            writer: Mutex::new(writer),
+            reader: Mutex::new(reader),
             embedding: Mutex::new(None),
         })
     }
 
     pub fn open_in_memory() -> Result<Self, RagError> {
         register_sqlite_vec();
-        let mut connection = Connection::open_in_memory().map_err(storage)?;
-        migrate(&mut connection)?;
+        static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
+        let uri = format!(
+            "file:sotto-rag-{}?mode=memory&cache=shared",
+            NEXT_DATABASE.fetch_add(1, Ordering::Relaxed)
+        );
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_URI;
+        let mut writer = Connection::open_with_flags(&uri, flags).map_err(storage)?;
+        migrate(&mut writer)?;
+        let reader = Connection::open_with_flags(&uri, flags).map_err(storage)?;
+        configure(&reader)?;
         Ok(Self {
-            connection: Mutex::new(connection),
+            writer: Mutex::new(writer),
+            reader: Mutex::new(reader),
             embedding: Mutex::new(None),
         })
     }
 
     pub fn save_session(&self, session: &Session) -> Result<(), RagError> {
         let target = session.capture_target();
-        self.connection.lock().map_err(poisoned)?.execute(
+        self.writer.lock().map_err(poisoned)?.execute(
             "INSERT INTO sessions VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET ended_at_unix_ms=excluded.ended_at_unix_ms",
             params![session.id().get().to_string(), session.started_at_unix_ms(),
                 session.ended_at_unix_ms(), target.bundle_id, target.display_name,
@@ -89,8 +107,11 @@ impl Store {
     }
 
     /// Inserts only; duplicate identities fail rather than mutating the append-only log.
+    ///
+    /// This synchronous method blocks until its transaction commits. Callers must batch
+    /// events and invoke it from a background task, never from the live capture pipeline.
     pub fn append_events(&self, events: &[TimelineEvent]) -> Result<(), RagError> {
-        let mut connection = self.connection.lock().map_err(poisoned)?;
+        let mut connection = self.writer.lock().map_err(poisoned)?;
         let transaction = connection.transaction().map_err(storage)?;
         {
             let mut statement = transaction.prepare(
@@ -115,7 +136,7 @@ impl Store {
     }
 
     pub fn load_session(&self, session_id: SessionId) -> Result<Vec<TimelineEvent>, RagError> {
-        let connection = self.connection.lock().map_err(poisoned)?;
+        let connection = self.reader.lock().map_err(poisoned)?;
         let mut statement = connection
             .prepare(
                 "SELECT id,ts,supersedes,payload FROM events WHERE session_id=?1 ORDER BY ts,id",
@@ -148,7 +169,7 @@ impl Store {
     }
 
     pub fn load_session_record(&self, id: SessionId) -> Result<Session, RagError> {
-        self.connection.lock().map_err(poisoned)?.query_row(
+        self.reader.lock().map_err(poisoned)?.query_row(
             "SELECT started_at_unix_ms,ended_at_unix_ms,capture_target_bundle_id,capture_target_display_name,capture_target_window_title,capture_target_kind,capture_target_audio_scoped FROM sessions WHERE id=?1",
             [id.get().to_string()], |row| {
                 let kind: String = row.get(5)?;
@@ -169,7 +190,7 @@ impl Store {
     ) -> Result<bool, RagError> {
         let hash = content_hash(text);
         if self
-            .connection
+            .reader
             .lock()
             .map_err(poisoned)?
             .query_row(
@@ -190,7 +211,7 @@ impl Store {
             .duration_since(UNIX_EPOCH)
             .map_err(message)?
             .as_secs();
-        let mut connection = self.connection.lock().map_err(poisoned)?;
+        let mut connection = self.writer.lock().map_err(poisoned)?;
         let transaction = connection.transaction().map_err(storage)?;
         transaction
             .execute(
@@ -253,12 +274,23 @@ impl Store {
             .embed(vec![query])?
             .pop()
             .ok_or_else(|| RagError::Embedding("empty embedding result".to_owned()))?;
-        let connection = self.connection.lock().map_err(poisoned)?;
+        self.search_with_vector(query, k, filter, &query_vector, true)
+    }
+
+    fn search_with_vector(
+        &self,
+        query: &str,
+        k: usize,
+        filter: &SearchFilter,
+        query_vector: &[f32],
+        include_keyword: bool,
+    ) -> Result<Vec<Chunk>, RagError> {
+        let connection = self.reader.lock().map_err(poisoned)?;
         let mut scores = HashMap::<String, f64>::new();
         let mut vector = connection.prepare("SELECT chunk_id FROM vec_chunks WHERE embedding MATCH ?1 AND k=?2 ORDER BY distance").map_err(storage)?;
         for (rank, row) in vector
             .query_map(
-                params![vector_blob(&query_vector), k.saturating_mul(4)],
+                params![vector_blob(query_vector), k.saturating_mul(4)],
                 |row| row.get::<_, String>(0),
             )
             .map_err(storage)?
@@ -266,15 +298,17 @@ impl Store {
         {
             scores.insert(row.map_err(storage)?, rank_score(rank));
         }
-        let mut keyword = connection.prepare("SELECT c.id FROM chunks_fts f JOIN chunks c ON c.rowid=f.rowid WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts) LIMIT ?2").map_err(storage)?;
-        for (rank, row) in keyword
-            .query_map(params![query, k.saturating_mul(4)], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(storage)?
-            .enumerate()
-        {
-            *scores.entry(row.map_err(storage)?).or_default() += rank_score(rank);
+        if include_keyword {
+            let mut keyword = connection.prepare("SELECT c.id FROM chunks_fts f JOIN chunks c ON c.rowid=f.rowid WHERE chunks_fts MATCH ?1 ORDER BY bm25(chunks_fts) LIMIT ?2").map_err(storage)?;
+            for (rank, row) in keyword
+                .query_map(params![query, k.saturating_mul(4)], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(storage)?
+                .enumerate()
+            {
+                *scores.entry(row.map_err(storage)?).or_default() += rank_score(rank);
+            }
         }
         let mut ranked: Vec<_> = scores.into_iter().collect();
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -418,4 +452,100 @@ fn chunk_markdown(text: &str) -> Vec<String> {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use rusqlite::params;
+
+    use super::*;
+
+    fn insert_chunk(store: &Store, id: &str, text: &str, vector: &[f32]) -> Result<(), RagError> {
+        let connection = store.writer.lock().map_err(poisoned)?;
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO documents VALUES('doc','battlecard','Fixture',NULL,NULL,0,'fixture')",
+                [],
+            )
+            .map_err(storage)?;
+        let blob = vector_blob(vector);
+        connection
+            .execute(
+                "INSERT INTO chunks VALUES(?1,'doc',?2,?3,1,'{}',?4)",
+                params![id, usize::from(id == "exact"), text, blob],
+            )
+            .map_err(storage)?;
+        connection
+            .execute(
+                "INSERT INTO vec_chunks(chunk_id,embedding) VALUES(?1,?2)",
+                params![id, blob],
+            )
+            .map_err(storage)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hybrid_promotes_an_exact_competitor_name_over_dense_only() -> Result<(), RagError> {
+        let store = Store::open_in_memory()?;
+        let query = vec![0.0; 384];
+        let mut nearest = query.clone();
+        nearest[0] = 0.01;
+        let mut competitor = query.clone();
+        competitor[0] = 0.02;
+        insert_chunk(&store, "dense", "General platform comparison", &nearest)?;
+        insert_chunk(
+            &store,
+            "exact",
+            "How to position against QuasarCRM",
+            &competitor,
+        )?;
+
+        let dense =
+            store.search_with_vector("QuasarCRM", 2, &SearchFilter::default(), &query, false)?;
+        let hybrid =
+            store.search_with_vector("QuasarCRM", 2, &SearchFilter::default(), &query, true)?;
+        assert_eq!(dense[0].id, "dense");
+        assert_eq!(hybrid[0].id, "exact");
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_content_skips_embedding_work() -> Result<(), RagError> {
+        let store = Store::open_in_memory()?;
+        let text = "unchanged fixture";
+        store
+            .writer
+            .lock()
+            .map_err(poisoned)?
+            .execute(
+                "INSERT INTO documents VALUES('existing','product_document','Fixture',NULL,NULL,0,?1)",
+                [content_hash(text)],
+            )
+            .map_err(storage)?;
+
+        assert!(!store.ingest_text(
+            text,
+            DocumentKind::ProductDocument,
+            IngestMetadata::default()
+        )?);
+        assert!(store.embedding.lock().map_err(poisoned)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "performance check requires the fastembed model cache"]
+    fn warm_query_embedding_and_hybrid_search_fit_latency_budget() -> Result<(), RagError> {
+        let store = Store::open_in_memory()?;
+        store.embed(vec!["warm up"])?;
+        let started = Instant::now();
+        let _results = store.search_filtered("competitor pricing", 5, &SearchFilter::default())?;
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "warm query took {:?}",
+            started.elapsed()
+        );
+        Ok(())
+    }
 }

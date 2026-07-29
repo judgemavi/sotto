@@ -28,7 +28,7 @@ use std::{
 };
 
 use ring::{Consumer, Producer};
-use sotto_core::{AsrError, AudioFrame, Source, SpeechState, Transcriber, Utterance};
+use sotto_core::{AsrError, AudioFrame, Source, SpeechState, Transcriber, TranscriptUpdate};
 use stabilizer::{Hypothesis, Stabilizer};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
@@ -81,7 +81,7 @@ pub struct WhisperTranscriber {
     mic: Producer,
     system: Producer,
     control: mpsc::Sender<Control>,
-    output: mpsc::Receiver<Utterance>,
+    output: mpsc::Receiver<TranscriptUpdate>,
     errors: Arc<Mutex<VecDeque<AsrError>>>,
     worker: Option<thread::JoinHandle<()>>,
 }
@@ -145,7 +145,7 @@ impl Transcriber for WhisperTranscriber {
         }
     }
 
-    fn poll(&mut self) -> Vec<Utterance> {
+    fn poll(&mut self) -> Vec<TranscriptUpdate> {
         self.output.try_iter().collect()
     }
 }
@@ -198,7 +198,7 @@ struct Worker {
     mic: StreamState,
     system: StreamState,
     control: mpsc::Receiver<Control>,
-    output: mpsc::Sender<Utterance>,
+    output: mpsc::Sender<TranscriptUpdate>,
     errors: Arc<Mutex<VecDeque<AsrError>>>,
     context: Option<WhisperContext>,
     last_inference: Instant,
@@ -210,7 +210,7 @@ impl Worker {
         mic: Consumer,
         system: Consumer,
         control: mpsc::Receiver<Control>,
-        output: mpsc::Sender<Utterance>,
+        output: mpsc::Sender<TranscriptUpdate>,
         errors: Arc<Mutex<VecDeque<AsrError>>>,
     ) -> Self {
         let agreement_passes = config.agreement_passes;
@@ -352,12 +352,12 @@ impl Worker {
             .consumed_samples
             .saturating_sub(u64::try_from(stream.history.len()).unwrap_or(u64::MAX));
         let base = Duration::from_secs_f64(base_samples as f64 / f64::from(SAMPLE_RATE));
-        let utterances = self
+        let updates = self
             .stream_mut(source)
             .stabilizer
             .observe(source, base, &segments);
-        for utterance in utterances {
-            let _ = self.output.send(utterance);
+        for update in updates {
+            let _ = self.output.send(update);
         }
         self.last_inference = Instant::now();
         Ok(())

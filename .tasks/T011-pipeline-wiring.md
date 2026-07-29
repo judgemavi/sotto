@@ -1,6 +1,6 @@
 # T011 — Core pipeline: wire the conveyor belt end to end
 
-**Status:** blocked (on T009, T015, T018 — T004/T005/T006/T014 done)
+**Status:** blocked (on T009, T015 — T004/T005/T006/T014/T018 done)
 
 **Wave:** 2
 

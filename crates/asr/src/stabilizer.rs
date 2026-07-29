@@ -1,4 +1,4 @@
-use sotto_core::{Source, Utterance};
+use sotto_core::{Source, TranscriptUpdate, Utterance};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -35,7 +35,7 @@ impl Stabilizer {
         source: Source,
         base: Duration,
         segments: &[Hypothesis],
-    ) -> Vec<Utterance> {
+    ) -> Vec<TranscriptUpdate> {
         let window_end = segments.last().map_or(Duration::ZERO, |s| s.end);
         let cutoff = window_end.saturating_sub(self.unstable_tail);
         let stable = segments
@@ -59,13 +59,13 @@ impl Stabilizer {
         if self.agreements >= self.required
             && let (Some(first), Some(last)) = (stable.first(), stable.last())
         {
-            output.push(make(
+            output.push(TranscriptUpdate::Final(make(
                 source,
                 base + first.start,
                 base + last.end,
                 candidate,
                 avg(&stable),
-            ));
+            )));
             self.committed_end = base + last.end;
             self.candidate.clear();
             self.agreements = 0;
@@ -87,13 +87,13 @@ impl Stabilizer {
             && partial != self.last_partial
             && let (Some(first), Some(last)) = (partial_segments.first(), partial_segments.last())
         {
-            output.push(make(
+            output.push(TranscriptUpdate::Partial(make(
                 source,
                 base + first.start,
                 base + last.end,
                 partial.clone(),
                 avg(&partial_segments),
-            ));
+            )));
             self.last_partial = partial;
         }
         output
@@ -127,7 +127,7 @@ fn make(
 #[cfg(test)]
 mod tests {
     use super::{Hypothesis, Stabilizer};
-    use sotto_core::Source;
+    use sotto_core::{Source, TranscriptUpdate};
     use std::time::Duration;
 
     fn segment(start: u64, end: u64, text: &str) -> Hypothesis {
@@ -143,19 +143,20 @@ mod tests {
     fn identical_partials_are_suppressed_and_commits_do_not_retract() {
         let mut stabilizer = Stabilizer::new(2, Duration::from_secs(2));
         let first = vec![segment(0, 1, "pricing"), segment(1, 4, "may change")];
-        assert_eq!(
-            stabilizer
-                .observe(Source::System, Duration::ZERO, &first)
-                .len(),
-            1
-        );
+        let first_updates = stabilizer.observe(Source::System, Duration::ZERO, &first);
+        assert_eq!(first_updates.len(), 1);
         let second = stabilizer.observe(Source::System, Duration::ZERO, &first);
         assert_eq!(
             second.len(),
             1,
             "stable prefix commits; duplicate partial is suppressed"
         );
-        assert_eq!(second[0].text, "pricing");
+        assert!(matches!(
+            first_updates.as_slice(),
+            [TranscriptUpdate::Partial(_)]
+        ));
+        assert!(matches!(second.as_slice(), [TranscriptUpdate::Final(_)]));
+        assert_eq!(second[0].utterance().text, "pricing");
         let revised = vec![
             segment(0, 1, "pricing retracted"),
             segment(1, 5, "is fixed"),
@@ -164,7 +165,7 @@ mod tests {
         assert!(
             emitted
                 .iter()
-                .all(|utterance| utterance.start >= Duration::from_secs(1)),
+                .all(|update| update.utterance().start >= Duration::from_secs(1)),
             "committed interval must never be emitted again"
         );
     }

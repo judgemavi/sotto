@@ -1,8 +1,13 @@
-#[cfg(test)]
+#![expect(
+    clippy::tests_outside_test_module,
+    reason = "integration test files compile only under cfg(test)"
+)]
+
 mod tests {
     use std::time::Duration;
 
     use rag::Store;
+    use rusqlite::Connection;
     use sotto_core::{
         CaptureTarget, EventPayload, Session, SessionId, Source, SpeechState, TargetKind,
         TimelineBuilder, VadSegment,
@@ -68,6 +73,39 @@ mod tests {
         assert!(
             store.append_events(timeline.events()).is_err(),
             "missing session must violate its foreign key"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migrating_a_version_one_database_preserves_existing_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("rag.sqlite3");
+        {
+            let store = Store::open(&path)?;
+            store.save_session(&session())?;
+        }
+        {
+            let connection = Connection::open(&path)?;
+            connection.execute_batch(
+                "DROP INDEX documents_kind_account_idx;\
+                 DROP INDEX chunks_doc_id_idx;\
+                 PRAGMA user_version = 1;",
+            )?;
+        }
+
+        let migrated = Store::open(&path)?;
+        let loaded = migrated.load_session_record(SessionId::new(7))?;
+        let expected = session();
+        assert_eq!(loaded.id(), expected.id());
+        assert_eq!(loaded.capture_target(), expected.capture_target());
+        assert_eq!(loaded.started_at_unix_ms(), expected.started_at_unix_ms());
+        assert_eq!(loaded.ended_at_unix_ms(), expected.ended_at_unix_ms());
+        let connection = Connection::open(path)?;
+        assert_eq!(
+            connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+            2
         );
         Ok(())
     }

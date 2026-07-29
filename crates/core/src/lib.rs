@@ -17,7 +17,7 @@ pub use timeline::{
 };
 pub use traits::{
     BoxFuture, BoxStream, CancellationToken, CaptureBackend, CompletionProvider, Retriever,
-    Transcriber, VoiceActivityDetector,
+    Transcriber, TranscriptUpdate, VoiceActivityDetector,
 };
 pub use types::{
     Annotation, AudioFrame, Chunk, Citation, CompletionMessage, CompletionRequest, Delta,

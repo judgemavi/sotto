@@ -1,6 +1,6 @@
 # T018 — Fix the `Transcriber` contract so it can express finality
 
-**Status:** todo
+**Status:** done (approved at review round 1)
 
 **Wave:** blocking — T011 cannot wire ASR into the timeline correctly until this lands
 
@@ -81,3 +81,21 @@ consume, and supersession only terminates because something is eventually final.
 ## Out of scope
 
 Any other change to `core`. The rest of the contract stays frozen.
+
+## Review round 1 — approved
+
+`TranscriptUpdate::{Partial, Final}` added with `utterance()` / `into_utterance()`
+accessors, `Transcriber::poll` returns it, `Utterance` gained no `is_final`, and the ASR
+stabilizer assigns finality at its commit decision — asserted directly:
+
+```rust
+assert!(matches!(second.as_slice(), [TranscriptUpdate::Final(_)]));
+```
+
+ADR-0005 records the general lesson rather than just the fix: when a field moves from a
+returned struct into an enum discriminant, every trait returning that struct has to be
+re-checked. That is the review failure worth remembering — the one-line signature change
+was never the hard part.
+
+The contract is frozen again. T011 can now wire ASR into the timeline without inferring
+finality.

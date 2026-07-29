@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 use sotto_core::{RagError, SQLITE_SCHEMA};
 
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 const RAG_SCHEMA: &str = r#"
 CREATE TABLE documents (
@@ -22,12 +22,12 @@ CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
 END;
 CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}');
 CREATE VIRTUAL TABLE vec_chunks USING vec0(chunk_id TEXT PRIMARY KEY, embedding float[384]);
+CREATE INDEX documents_kind_account_idx ON documents(kind, account_id);
+CREATE INDEX chunks_doc_id_idx ON chunks(doc_id);
 "#;
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
-    connection
-        .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
-        .map_err(storage)?;
+    configure(connection)?;
     let version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
         .map_err(storage)?;
@@ -45,8 +45,26 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(storage)?;
         transaction.commit().map_err(storage)?;
+    } else if version == 1 {
+        let transaction = connection.transaction().map_err(storage)?;
+        transaction
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS documents_kind_account_idx ON documents(kind, account_id);\
+                 CREATE INDEX IF NOT EXISTS chunks_doc_id_idx ON chunks(doc_id);",
+            )
+            .map_err(storage)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(storage)?;
+        transaction.commit().map_err(storage)?;
     }
     Ok(())
+}
+
+pub(crate) fn configure(connection: &Connection) -> Result<(), RagError> {
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+        .map_err(storage)
 }
 
 pub(crate) fn storage(error: rusqlite::Error) -> RagError {

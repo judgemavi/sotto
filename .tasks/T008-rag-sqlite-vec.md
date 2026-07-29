@@ -1,6 +1,6 @@
 # T008 — RAG crate: sqlite-vec + fastembed local retrieval
 
-**Status:** changes-requested (review round 1)
+**Status:** done (approved at review round 2)
 
 **Wave:** 1 — fully parallel
 
@@ -164,3 +164,30 @@ header in `.tasks/README.md` — worth matching so the codebase reads consistent
 ### Re-review
 
 R1 and R2 addressed, existing tests still green.
+
+## Review round 2 — approved
+
+Both items fixed, and one trap avoided that I did not flag.
+
+**R1.** `Store` now holds separate `writer` and `reader` connections, and the split is
+actually used: `save_session`, `append_events` and `ingest_text` take the writer;
+`load_session`, `load_session_record` and `search_filtered` take the reader. Retrieval no
+longer waits behind an append or an embedding batch, which is what WAL was there to allow.
+`append_events` now documents that it blocks and must be called from a background task,
+never the live pipeline — so T011 cannot mistake it for cheap.
+
+**Avoided trap:** `open_in_memory` uses `file:sotto-rag-{n}?mode=memory&cache=shared` with
+`SQLITE_OPEN_URI` and a per-store counter. Two plain `:memory:` connections would each have
+got a private database, so the reader would never have seen the writer's data — tests would
+have failed confusingly, or worse, passed by only exercising one side. Catching that
+unprompted is the good kind of care.
+
+**R2.** Hybrid-vs-dense, unchanged-content, and v1→v2 migration are all tested, including
+`migrating_a_version_one_database_preserves_existing_data` — the one that matters most,
+since users will have real timelines in this file when the schema next moves.
+
+The latency check is `#[ignore]`d behind the fastembed model cache, with an explicit reason
+string. That is the honest way to do it, and better than a test that quietly passes without
+measuring. It does mean the **~50 ms retrieval budget is still unverified** — carry it as
+open until the fixture corpus exists and it can run for real. Note it in the crate docs so
+the next person does not read a green suite as proof of latency.
