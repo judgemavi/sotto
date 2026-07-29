@@ -11,9 +11,9 @@ pub mod types;
 pub use bus::{EventBus, EventReceiver, ReceiveError};
 pub use error::{AsrError, CaptureError, PipelineError, ProviderError, RagError, VadError};
 pub use timeline::{
-    EventId, EventKind, EventPayload, FrameRef, LenientReplay, MarkKind, ProsodyDelta, ReplayState,
-    SQLITE_SCHEMA, ScreenSnapshot, Session, SessionId, TimelineBuilder, TimelineError,
-    TimelineEvent, UserAnnotation, replay, replay_lenient,
+    CaptureTarget, EventId, EventKind, EventPayload, FrameRef, LenientReplay, MarkKind,
+    ProsodyDelta, ReplayState, SQLITE_SCHEMA, ScreenSnapshot, Session, SessionId, TargetKind,
+    TimelineBuilder, TimelineError, TimelineEvent, UserAnnotation, replay, replay_lenient,
 };
 pub use traits::{
     BoxFuture, BoxStream, CancellationToken, CaptureBackend, CompletionProvider, Retriever,

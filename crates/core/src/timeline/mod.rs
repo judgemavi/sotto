@@ -28,4 +28,4 @@ pub use event::{
     TimelineEvent, UserAnnotation,
 };
 pub use schema::SQLITE_SCHEMA;
-pub use session::Session;
+pub use session::{CaptureTarget, Session, TargetKind};

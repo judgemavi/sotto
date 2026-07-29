@@ -23,6 +23,12 @@ session-scoped monotonic id, session-relative timestamp, optional superseded eve
 and a typed payload. Partial and final utterances and suggestions are distinct payload
 variants.
 
+The session record stores the capture target selected through the system picker:
+optional bundle id and window title, the displayed name, application-versus-window
+kind, and whether audio was actually scoped to that target. This scope is recorded once
+per session rather than repeated on events. `audio_scoped = false` preserves the fact
+that a timeline may contain system-wide audio even when its video was target-scoped.
+
 The log is append-only. A correction is a new event that references an earlier event
 from the same session. The corrected event remains in history. Builders enforce
 same-session, earlier-id supersession, and replay validates the same invariants.
@@ -57,6 +63,8 @@ declared foreign keys by default.
   rendering the recovered state.
 - Session-relative timestamps keep exported logs portable; wall-clock start belongs
   on the session record.
+- A persisted call remains explicit about what the user selected and whether its audio
+  scope matched that selection.
 - Payload JSON remains inspectable and evolvable, while indexed envelope columns make
   timeline filtering efficient.
 - Raw audio remains ephemeral and cannot be reconstructed from the timeline.

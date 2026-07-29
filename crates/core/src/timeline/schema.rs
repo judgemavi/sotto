@@ -9,7 +9,16 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY NOT NULL,
     started_at_unix_ms INTEGER NOT NULL,
-    ended_at_unix_ms INTEGER
+    ended_at_unix_ms INTEGER,
+    capture_target_bundle_id TEXT,
+    capture_target_display_name TEXT NOT NULL,
+    capture_target_window_title TEXT,
+    capture_target_kind TEXT NOT NULL CHECK (
+        capture_target_kind IN ('application', 'window')
+    ),
+    capture_target_audio_scoped INTEGER NOT NULL CHECK (
+        capture_target_audio_scoped IN (0, 1)
+    )
 );
 
 CREATE TABLE events (

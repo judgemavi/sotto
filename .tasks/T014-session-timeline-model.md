@@ -1,6 +1,6 @@
 # T014 — Session timeline: the canonical event model in core
 
-**Status:** changes-requested (round 1 approved; one addition in round 2 — see end)
+**Status:** changes-requested (R5 approved; R6 — session wall-clock — outstanding)
 
 **Wave:** 0.5 — blocks every crate that emits or consumes events (T004, T005, T006,
 T008, T009, T011, T015). T002, T003, T007 and T010 are unaffected and continue.
@@ -268,3 +268,68 @@ suggestion.
 
 R5 landed, schema updated, existing tests still green. Then the contract re-freezes and six
 tasks unblock.
+
+## R5 implementation notes
+
+- Added `CaptureTarget` and two-valued `TargetKind` (`Application | Window`) to the
+  immutable session record. `Session::new` now requires the selected target, and both
+  `Session` and `TimelineBuilder` expose it read-only.
+- Added nullable bundle id/window title plus required display name, constrained kind,
+  and constrained integer `audio_scoped` columns to `sessions` in `SQLITE_SCHEMA`.
+- Added capture-target retention and JSON round-trip coverage, including the stable
+  snake-case target-kind representation used by SQLite. `Source` remains exactly
+  `Mic | System`.
+- Updated ADR-0004 to record session-level capture scope and why an unscoped-audio fact
+  must remain durable.
+- Verified `cargo fmt --check`, strict Clippy across the workspace/all targets/all
+  features, and `cargo test --workspace --all-features`: 29 passed, 0 failed, 5 ignored
+  manual live-provider tests.
+
+## Review round 3 — R5 approved; one small gap (R6)
+
+`CaptureTarget` and `TargetKind` match the spec, `Source` stayed two-valued, accessors are
+read-only, ADR-0004 explains why scope is recorded once per session rather than per event,
+and `audio_scoped = false` correctly preserves the fact that a timeline may hold
+system-wide audio even when its video was target-scoped. Verified: fmt clean, strict
+clippy clean, 29 passed / 0 failed / 5 ignored.
+
+Worth calling out: the test asserting the JSON encodes `"kind":"window"` exists to keep
+the Rust enum and the SQL `CHECK (capture_target_kind IN ('application','window'))` from
+drifting apart. That mismatch would have failed silently at the persistence boundary and
+only in production. Good instinct — keep doing that where a Rust type and the schema encode
+the same vocabulary.
+
+### R6 — the session record is missing its wall-clock
+
+`SQLITE_SCHEMA` declares `started_at_unix_ms INTEGER NOT NULL` and `ended_at_unix_ms`, but
+`Session` carries neither. `AGENTS.md` specifies the session record as *"start and end
+wall-clock, and the capture target"* — the capture target landed, the clock did not, so
+T008 has no source for a column the schema requires.
+
+This matters because of *when* the value would otherwise be taken. T008 persists events on
+a background task in batches, so the obvious implementation stamps `started_at` at first
+write — which is not when the session started, and is wrong by however long the first
+batch took. Nothing detects it, and it is baked into persisted data forever.
+
+Add both to `Session`, supplied by the caller rather than read from the clock inside
+`core`:
+
+```rust
+pub const fn new(
+    id: SessionId,
+    capture_target: CaptureTarget,
+    started_at_unix_ms: u64,
+) -> Self
+pub fn end(&mut self, ended_at_unix_ms: u64)
+pub const fn started_at_unix_ms(&self) -> u64
+pub const fn ended_at_unix_ms(&self) -> Option<u64>
+```
+
+Keep `core` free of `SystemTime::now()` — the caller passes the timestamp, which keeps the
+crate testable and deterministic, the same discipline `ts` already follows by being
+session-relative.
+
+### Re-review
+
+R6 landed, existing tests still green. Then the contract re-freezes and the six-way
+fan-out goes out.

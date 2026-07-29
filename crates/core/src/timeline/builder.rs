@@ -47,6 +47,11 @@ impl TimelineBuilder {
         }
     }
 
+    #[must_use]
+    pub const fn session(&self) -> &Session {
+        &self.session
+    }
+
     pub fn append(&mut self, ts: Duration, payload: EventPayload) -> TimelineEvent {
         let event = TimelineEvent::new(
             self.session.next_event_id(),
@@ -223,7 +228,20 @@ fn apply_event(
 mod tests {
     use std::time::Duration;
 
-    use crate::{Annotation, Source, Utterance};
+    use crate::{Annotation, CaptureTarget, Source, TargetKind, Utterance};
+
+    fn session(id: u128) -> Session {
+        Session::new(
+            SessionId::new(id),
+            CaptureTarget {
+                bundle_id: Some("com.example.calls".to_owned()),
+                display_name: "Calls".to_owned(),
+                window_title: None,
+                kind: TargetKind::Application,
+                audio_scoped: true,
+            },
+        )
+    }
 
     use super::{
         EventPayload, Session, SessionId, TimelineBuilder, TimelineError, replay, replay_lenient,
@@ -242,7 +260,7 @@ mod tests {
 
     #[test]
     fn supersede_chain_replays_deterministically() -> Result<(), Box<dyn std::error::Error>> {
-        let mut builder = TimelineBuilder::new(Session::new(SessionId::new(7)));
+        let mut builder = TimelineBuilder::new(session(7));
         let partial = builder.append(
             Duration::from_millis(100),
             EventPayload::UtterancePartial(utterance("we")),
@@ -279,9 +297,9 @@ mod tests {
 
     #[test]
     fn rejects_foreign_session_supersede() {
-        let mut first = TimelineBuilder::new(Session::new(SessionId::new(1)));
+        let mut first = TimelineBuilder::new(session(1));
         let foreign = first.append(Duration::ZERO, EventPayload::UtteranceFinal(utterance("x")));
-        let mut second = TimelineBuilder::new(Session::new(SessionId::new(2)));
+        let mut second = TimelineBuilder::new(session(2));
 
         let result = second.supersede(
             Duration::from_secs(1),
@@ -297,7 +315,7 @@ mod tests {
     #[test]
     fn rejects_later_event_supersede() {
         let session_id = SessionId::new(3);
-        let mut builder = TimelineBuilder::new(Session::new(session_id));
+        let mut builder = TimelineBuilder::new(session(session_id.get()));
         let future = super::TimelineEvent::new(
             super::EventId::new(9),
             session_id,
@@ -319,7 +337,7 @@ mod tests {
 
     #[test]
     fn checkpoint_bounds_payload_buffer_without_losing_supersession() -> Result<(), TimelineError> {
-        let mut builder = TimelineBuilder::new(Session::new(SessionId::new(4)));
+        let mut builder = TimelineBuilder::new(session(4));
         let partial = builder.append(
             Duration::ZERO,
             EventPayload::UtterancePartial(utterance("partial")),
