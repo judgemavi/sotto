@@ -438,6 +438,8 @@ fn audio_worker(
     ready: Arc<ArrayQueue<AudioPacket>>,
     sink: broadcast::Sender<AudioFrame>,
 ) {
+    let mut mic_resampler = Resampler::default();
+    let mut system_resampler = Resampler::default();
     while running.load(Ordering::Acquire) || !ready.is_empty() {
         if let Some(mut packet) = ready.pop() {
             let mono: Vec<f32> = packet
@@ -445,7 +447,11 @@ fn audio_worker(
                 .chunks_exact(packet.channels)
                 .map(|frame| frame.iter().sum::<f32>() / packet.channels as f32)
                 .collect();
-            let output = resample_linear(&mono, packet.sample_rate, OUTPUT_RATE);
+            let resampler = match packet.source {
+                Source::Mic => &mut mic_resampler,
+                Source::System => &mut system_resampler,
+            };
+            let output = resampler.process(&mono, packet.sample_rate, OUTPUT_RATE);
             let _ = sink.send(AudioFrame {
                 source: packet.source,
                 samples: output.into(),
@@ -462,27 +468,87 @@ fn audio_worker(
     }
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "bounded nonnegative interpolation positions are converted to sample indices and f32 fractions"
-)]
-fn resample_linear(input: &[f32], input_rate: u32, output_rate: u32) -> Vec<f32> {
-    if input.is_empty() || input_rate == 0 {
-        return Vec::new();
+/// Stateful linear resampler that preserves fractional phase across packet boundaries.
+///
+/// The previous implementation computed `input.len() * output_rate / input_rate` per
+/// packet with integer division and no carry, so every packet whose length was not an
+/// exact multiple of the ratio silently dropped the remainder. That is a systematic
+/// sample deficit, not rounding noise: it measured as roughly -3,956 ppm on the mic
+/// stream against -110 ppm on system audio, purely because the mic delivers smaller
+/// packets and therefore loses proportionally more. Two streams losing samples at
+/// different rates drift apart, which breaks the cross-stream timestamp comparison that
+/// speaker attribution and interruption detection both depend on.
+///
+/// Keeping the read position and the trailing sample between calls makes the packet
+/// boundary invisible: no samples are lost and interpolation stays continuous.
+#[derive(Default)]
+struct Resampler {
+    /// Input sample index the next output position sits on, relative to the next
+    /// buffer's start. `-1` interpolates against `previous`.
+    index: i64,
+    /// Sub-sample phase in `[0, 1)`, carried between packets so none are lost.
+    fraction: f64,
+    /// Final sample of the previous packet, acting as index -1 of the current one.
+    previous: Option<f32>,
+}
+
+impl Resampler {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "phase is bounded to [0,1) and packet lengths to i64; audio samples are f32 by definition"
+    )]
+    fn process(&mut self, input: &[f32], input_rate: u32, output_rate: u32) -> Vec<f32> {
+        if input.is_empty() || input_rate == 0 || output_rate == 0 {
+            return Vec::new();
+        }
+        let step = f64::from(input_rate) / f64::from(output_rate);
+        let length = input.len();
+        let mut output = Vec::new();
+
+        // `index` is the input sample just before the next output position; -1 means the
+        // position falls between the previous packet's tail and this packet's first
+        // sample, which is exactly the boundary the old implementation discarded.
+        while self.index < length as i64 {
+            let lower = self.sample_at(input, self.index);
+            let Some(upper) = self.upper_sample(input, self.index) else {
+                break;
+            };
+            output.push(lower + (upper - lower) * self.fraction as f32);
+
+            self.fraction += step;
+            let advance = self.fraction.floor();
+            self.fraction -= advance;
+            self.index = self.index.saturating_add(advance as i64);
+        }
+
+        self.previous = input.last().copied();
+        self.index -= length as i64;
+        output
     }
-    let output_len_u64 =
-        (input.len() as u64).saturating_mul(u64::from(output_rate)) / u64::from(input_rate);
-    let output_len = usize::try_from(output_len_u64).unwrap_or(usize::MAX);
-    (0..output_len)
-        .map(|index| {
-            let position = index as f64 * f64::from(input_rate) / f64::from(output_rate);
-            let lower = position.floor() as usize;
-            let upper = lower.saturating_add(1).min(input.len() - 1);
-            let fraction = (position - lower as f64) as f32;
-            input[lower] + (input[upper] - input[lower]) * fraction
-        })
-        .collect()
+
+    fn sample_at(&self, input: &[f32], index: i64) -> f32 {
+        usize::try_from(index).map_or_else(
+            |_| {
+                self.previous
+                    .unwrap_or_else(|| input.first().copied().unwrap_or(0.0))
+            },
+            |index| input.get(index).copied().unwrap_or(0.0),
+        )
+    }
+
+    /// The sample after `index`, or `None` when it has not been delivered yet — in which
+    /// case the remaining phase is carried into the next packet rather than dropped.
+    fn upper_sample(&self, input: &[f32], index: i64) -> Option<f32> {
+        let next = index.saturating_add(1);
+        match usize::try_from(next) {
+            Ok(next) => input.get(next).copied(),
+            Err(_) => Some(
+                self.previous
+                    .unwrap_or_else(|| input.first().copied().unwrap_or(0.0)),
+            ),
+        }
+    }
 }
 
 unsafe extern "C" fn audio_callback(
@@ -608,7 +674,7 @@ unsafe extern "C" fn frame_callback(
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureStatus, resample_linear};
+    use super::{CaptureStatus, Resampler};
 
     #[test]
     fn capture_status_codes_round_trip() {
@@ -630,7 +696,7 @@ mod tests {
     #[test]
     fn resamples_48khz_to_16khz() {
         let input = vec![0.25; 480];
-        let output = resample_linear(&input, 48_000, 16_000);
+        let output = Resampler::default().process(&input, 48_000, 16_000);
         assert_eq!(
             output.len(),
             160,
@@ -639,6 +705,51 @@ mod tests {
         assert!(
             output.iter().all(|sample| *sample == 0.25),
             "constant samples should remain constant"
+        );
+    }
+
+    #[test]
+    fn ragged_packets_do_not_lose_samples() {
+        // 48k -> 16k over packet lengths that are not multiples of the 3:1 ratio. The
+        // previous per-packet integer division dropped the remainder every time, which
+        // showed up as a systematic ~-3,956 ppm deficit on the mic stream.
+        let mut resampler = Resampler::default();
+        let mut produced = 0_usize;
+        let mut consumed = 0_usize;
+        for length in [100_usize, 101, 103, 97, 160, 1, 2, 512] {
+            produced += resampler.process(&vec![0.5; length], 48_000, 16_000).len();
+            consumed += length;
+        }
+        let expected = consumed / 3;
+        assert!(
+            produced.abs_diff(expected) <= 1,
+            "expected about {expected} output samples from {consumed} input, got {produced}"
+        );
+    }
+
+    #[test]
+    fn phase_is_continuous_across_packet_boundaries() {
+        // One ramp split into ragged packets must resample the same as the whole ramp.
+        let ramp: Vec<f32> = (0..600).map(|index| index as f32).collect();
+        let whole = Resampler::default().process(&ramp, 48_000, 16_000);
+
+        let mut split = Vec::new();
+        let mut resampler = Resampler::default();
+        let mut offset = 0_usize;
+        for length in [7_usize, 130, 44, 219, 200] {
+            let end = (offset + length).min(ramp.len());
+            split.extend(resampler.process(&ramp[offset..end], 48_000, 16_000));
+            offset = end;
+        }
+
+        assert_eq!(
+            whole.len(),
+            split.len(),
+            "splitting the input must not change how many samples come out"
+        );
+        assert!(
+            whole.iter().zip(&split).all(|(a, b)| (a - b).abs() < 0.001),
+            "packet boundaries must not perturb interpolation"
         );
     }
 }

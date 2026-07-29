@@ -34,6 +34,33 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, 
         self.config = config
     }
 
+    /// Backing-pixel size of a display, capped to the Rust frame-pool budget.
+    ///
+    /// `SCDisplay.width`/`height` are in points; OCR quality depends on real pixels, so
+    /// scale by the matching screen's `backingScaleFactor`. The cap keeps a single frame
+    /// within `MAX_FRAME_BYTES` (40 MiB) at 4 bytes per pixel, so an oversized or
+    /// multi-Retina display degrades resolution rather than being dropped by the Rust
+    /// side for exceeding the buffer.
+    private static func frameSize(for display: SCDisplay) -> (Int, Int) {
+        let scale = NSScreen.screens.first { screen in
+            (screen.deviceDescription[
+                NSDeviceDescriptionKey("NSScreenNumber")
+            ] as? CGDirectDisplayID) == display.displayID
+        }?.backingScaleFactor ?? 2.0
+
+        var width = Int((Double(display.width) * scale).rounded())
+        var height = Int((Double(display.height) * scale).rounded())
+        guard width > 0, height > 0 else { return (display.width, display.height) }
+
+        let maxPixels = (40 * 1024 * 1024) / 4
+        if width * height > maxPixels {
+            let shrink = (Double(maxPixels) / Double(width * height)).squareRoot()
+            width = max(1, Int(Double(width) * shrink))
+            height = max(1, Int(Double(height) * shrink))
+        }
+        return (width, height)
+    }
+
     func start() async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(
             false,
@@ -49,8 +76,15 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, 
         streamConfig.excludesCurrentProcessAudio = true
         streamConfig.sampleRate = 48_000
         streamConfig.channelCount = 1
-        streamConfig.width = 2
-        streamConfig.height = 2
+        // Capture frames at the display's real backing resolution, capped so a frame
+        // always fits the preallocated pool buffers on the Rust side (MAX_FRAME_BYTES).
+        // These were previously hardcoded to 2x2: ScreenCaptureKit requires a video
+        // output even for audio-only capture, and 2x2 was the cheapest way to satisfy
+        // that. Screen context is now a real timeline producer, so the placeholder has
+        // to go — at 2x2 every captured frame was 16 bytes of nothing.
+        let (frameWidth, frameHeight) = Self.frameSize(for: display)
+        streamConfig.width = frameWidth
+        streamConfig.height = frameHeight
         streamConfig.minimumFrameInterval = CMTime(seconds: 10, preferredTimescale: 600)
         streamConfig.queueDepth = 2
         streamConfig.pixelFormat = kCVPixelFormatType_32BGRA

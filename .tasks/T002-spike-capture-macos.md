@@ -329,3 +329,74 @@ rate keeps falling as the window grows, it was all startup transient.
 **The 65-minute soak decides which.** Report the two rates, the dropped-frame count, and
 whether a spoken marker at ~60 minutes still audibly lines up against continuous system
 audio — the audible check is worth more than the printed number.
+
+### F4. Frames were captured at 2×2 pixels (fixed)
+
+`streamConfig.width/height` were hardcoded to `2`. ScreenCaptureKit requires a video
+output even for audio-only capture, and 2×2 was the cheapest way to satisfy that while
+this spike was audio-only — but screen context became a Phase 1 producer and the
+placeholder was never revisited. Every captured PNG was 83 bytes of nothing.
+
+Now sized from the display's backing resolution (`SCDisplay` points ×
+`NSScreen.backingScaleFactor`), capped so a frame stays inside `MAX_FRAME_BYTES` so an
+oversized display degrades resolution rather than being dropped. Verified: 3456×2234,
+~1.8 MiB per frame.
+
+**What this invalidated:** every prior "0 frames dropped" result. The frame path had never
+been exercised — stride handling, pool pressure, backpressure isolation — because each
+frame was 16 bytes. Treat all frame-related results before this as meaningless.
+
+### F5. PNG encoding on the audio path starved the capture (fixed)
+
+With real frames, `write_png` converts ~7.7M pixels inline on the same loop that drains
+the audio broadcast. The receiver fell behind, and `while let Ok(..) = try_recv()`
+silently swallowed `Lagged` — so dropped audio looked like drift. Measured rates blew out
+to +12,805 ppm and nothing reported a problem.
+
+Frame writing now runs on its own thread, and lag is counted and printed rather than
+discarded. The bridge already isolates video backpressure from audio; the harness has to
+do the same or it measures itself.
+
+### F6. The resampler lost samples at every packet boundary (fixed — root cause of the drift)
+
+`resample_linear` computed `input.len() * output_rate / input_rate` with **integer
+division, per packet, with no phase carried across boundaries**. Any packet length that
+was not an exact multiple of the ratio discarded its remainder. Mic packets are smaller
+than system-audio packets, so the mic lost proportionally more — which is exactly the
+asymmetry the numbers showed.
+
+Replaced with a stateful `Resampler` that keeps the fractional read position and the
+previous packet's trailing sample, making packet boundaries invisible. Two tests added:
+ragged packet lengths must not lose samples, and one ramp split into ragged packets must
+resample identically to the whole ramp.
+
+| | before | after |
+|---|---|---|
+| mic delivered rate | 15936.71 Hz (−3,956 ppm) | 16000.45 Hz (**+28 ppm**) |
+
++28 ppm is ordinary crystal drift. The mic stream is now essentially exact.
+
+### F7. Drift instrumentation was measuring the wrong thing (fixed)
+
+The mic's `stream_offset` is derived from the host clock (`captured.duration_since(origin)`),
+so `DriftTracker` was comparing the host clock against itself and reported ≈0 no matter
+what the device did. It could not have detected F6 — a −3,956 ppm defect — and gave false
+confidence instead.
+
+Added `RateTracker`, which counts samples actually delivered per second of wall clock.
+That works identically for both paths, and the **difference between the two streams** is
+the number the product cares about, since cross-stream timestamp comparison is what
+speaker attribution and interruption detection rest on. The soak now prints per-stream
+ppm and the resulting seconds-of-slip-per-hour.
+
+### Still open: the system stream's rate
+
+Mic is settled. System audio reads between −110 and −442 ppm across short runs, which is
+too noisy to characterise — and short runs cannot do it anyway, as F3 showed. It also only
+means something when audio is genuinely playing for the whole window; SCK delivery with no
+audio source is not a measurement.
+
+**The 65-minute soak is still required**, now against a build where the numbers mean
+something. Run it with continuous audio playing throughout and report per-stream ppm, the
+relative figure, lag count, dropped frames, and whether a spoken marker at ~60 minutes
+still audibly lines up.
