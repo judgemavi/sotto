@@ -1,6 +1,6 @@
 # T003 — Spike B: GPUI whiteboard canvas + overlay lens
 
-**Status:** todo
+**Status:** in-progress (toolchain fully resolved — no environmental blocker remains)
 
 **Wave:** 1 — start early alongside T002; **timeboxed to 7 days**
 
@@ -93,3 +93,93 @@ task. A two-week fight is not.
 Real timeline data, settings screens, tray/menubar, persistence, styling beyond what the
 performance test requires. This is a throwaway spike — T012 and T016 build the real thing
 from its findings.
+
+## Notes
+
+- Pinned aligned latest releases exactly: `gpui = 0.2.2`, `gpui-component = 0.5.1`.
+- Built a shared append-only `Scene`, stable anchored suggestions, viewport culling, and
+  board/overlay lenses over one GPUI entity. Model tests cover no-reflow and culling with
+  10,000 accumulated utterances.
+- The executable's Tokio producer now starts an anchored suggestion periodically and
+  streams five incremental text updates at 100 ms intervals. Scroll pans a lens in world
+  space; Control-scroll zooms between 0.15x and 3x without modifying shared placements.
+- The fake producer runs on Tokio and crosses one bounded channel drained by one GPUI
+  foreground task; ADR-0003 records the seam for T012.
+- Full validation now passes: `cargo check -p app`, `cargo test -p app` (3/3), strict app
+  Clippy, plus `cargo test --workspace --all-features` (21 passed, 5 ignored) and strict
+  workspace Clippy. The two `manual_is_multiple_of` findings are fixed.
+- Culling now uses the monotonic append order to seek with `partition_point`; it does not
+  linearly scan the whole accumulated scene. The release harness appends at ~60 Hz and
+  requests continuous animation frames.
+- GPUI's popup implementation already supplies NSPanel, non-activating style, popup level,
+  all-Spaces, and full-screen-auxiliary behavior. The only objc2 escape hatch obtains the
+  owning NSWindow from GPUI's raw NSView and calls `setIgnoresMouseEvents:`; the harness
+  alternates passive/interactive modes every five seconds.
+- Toolchain: GPUI 0.2.2; Xcode 26.6 (17F113); Metal Toolchain 17F109 / Apple metal
+  32023.883. Transitive `block 0.1.6` and `proc-macro-error2 0.2.1` emit non-actionable
+  future-incompatibility warnings.
+- One-minute release smoke evidence: 7,179 frame intervals, p50 8.332 ms, p95 13.517 ms;
+  process CPU 8.7%, RSS 72,608 KiB at 1:29 elapsed. This was not run beside a real call.
+- The task remains `in-progress`: the real 30-minute resource measurements, full-screen
+  call test, focus/keystroke test, and click-through behavior have not been demonstrated.
+  The 10/30-minute frame-time drift, multiple-zoom visible counts, GPU usage, real-call
+  resource load, full-screen presence, keystroke focus, and manual click-through evidence
+  remain unrun. No verdict is claimed.
+
+## Environment update — Xcode installed (2026-07-29)
+
+Xcode 26.6 (17F113) is now installed at `/Applications/Xcode.app`, replacing the
+Command Line Tools–only host that blocked this task. Two consequences:
+
+1. **The Metal Toolchain is a separate 688 MB component in Xcode 26**, not part of the base
+   install. It has now been downloaded (`Metal Toolchain 17F109`) and verified:
+   `xcrun metal --version` reports `Apple metal version 32023.883`, target
+   `air64-apple-darwin25.5.0`. GPUI compiles Metal shaders at build time, so this — not
+   Xcode itself — was the real gate. **No environmental blocker remains.**
+
+   Record both the Xcode version (26.6 / 17F113) and the Metal Toolchain version (17F109)
+   in ADR-0003 alongside the pinned GPUI version. GPUI is pinned exactly, and a host
+   toolchain that only works on one Xcode version is exactly the fragility that ADR exists
+   to capture. T010 needs the same two versions pinned in CI.
+
+2. **Nothing about the spike's substance changes.** The timebox is unchanged and still
+   measured in working days, not calendar days lost to environment setup. The verdict is
+   still the deliverable, and a clean "fail" with an ADR is still a successful outcome.
+
+With the toolchain resolved, the parts that were deferred as unverifiable are now in
+scope and are the point of the task:
+
+- the 30-minute continuous append at 60fps with no reflow, measured, with **frame-time
+  drift as content accumulates** reported explicitly — that single number decides this
+  spike;
+- culling verified at several zoom levels, not assumed;
+- all three overlay behaviours against a real full-screen Zoom or Meet call, especially
+  the keystroke test: type in meeting chat while the panel updates and confirm nothing is
+  dropped;
+- resource measurements with a real call running on the same machine.
+
+Report the resolved GPUI version and the exact Xcode version together — T012 and T016
+inherit both.
+
+### First full-workspace verification (2026-07-29, post-Metal)
+
+With the Metal Toolchain installed, `app` compiles for the first time and the **whole
+workspace is buildable** — a state this project has never been in. Results:
+
+- `cargo check -p app` — **passes.** `gpui = "=0.2.2"`, `gpui-component = "=0.5.1"`, both
+  pinned exactly as required. Build takes ~27s incremental from warm deps.
+- `cargo test --workspace --all-features` — **21 passed, 0 failed, 5 ignored** (up from 18;
+  `app` contributed 3).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` — **fails, 2
+  errors in `app`**, both `clippy::manual_is_multiple_of` at `crates/app/src/main.rs:108`
+  and `:110` (`index % 2 == 0` → `index.is_multiple_of(2)`).
+
+Fix the two lints. They are trivial, but the reason they exist is worth noting: **`app` has
+never once been linted**, because the Metal gate meant it could not compile. Assume nothing
+in this crate has been checked against the strict table and re-read it accordingly — the
+board README documents the house idiom.
+
+Two upstream crates (`block v0.1.6`, `proc-macro-error2 v2.0.1`, both transitive through
+GPUI) emit future-incompatibility warnings. Not actionable now; note them in ADR-0003 as
+part of the GPUI dependency picture, since pinning GPUI exactly means we inherit its
+dependency graph deliberately.

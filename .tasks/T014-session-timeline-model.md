@@ -1,6 +1,6 @@
 # T014 — Session timeline: the canonical event model in core
 
-**Status:** todo
+**Status:** changes-requested (round 1 approved; one addition in round 2 — see end)
 
 **Wave:** 0.5 — blocks every crate that emits or consumes events (T004, T005, T006,
 T008, T009, T011, T015). T002, T003, T007 and T010 are unaffected and continue.
@@ -137,3 +137,134 @@ on `EventPayload`. Adding a new event kind is an ADR.
 ## Out of scope
 
 SQLite I/O (T008), screen capture itself (T015), any UI, the advisor.
+
+## Notes
+
+- Added the immutable `TimelineEvent` envelope, all reviewed payload variants and
+  discriminants, session-scoped id allocation, validated append/supersede construction,
+  and deterministic replay state. Event fields are private with read-only accessors so
+  callers cannot mutate an appended event.
+- Removed payload-level `is_final`; partial and final utterances/suggestions are now
+  separate event variants. Suggestions carry their triggering event anchors so T013
+  does not need to reopen the contract. Raw `AudioFrame`s remain excluded from the
+  timeline bus.
+- Added serde coverage for every payload variant plus replay, supersession-chain,
+  foreign-session, and later-event rejection tests.
+- Defined the SQLite schema contract in core and documented that T008 owns its I/O and
+  migrations in ADR-0004.
+- Registered empty `screen` and `advisor` stubs without adding workspace dependencies.
+- Formatting plus the integrated all-feature headless test and strict Clippy suites
+  pass across core, capture, VAD, ASR, prosody, screen, providers, advisor, RAG, MCP,
+  and CLI. A complete workspace check is temporarily blocked on T003's GPUI dependency
+  requiring full Xcode/Metal on this host; T003 records that environmental gate
+  separately.
+- Review round 1: `TimelineBuilder` now uses O(1) known/active id sets and supports
+  checkpointing pending payloads for persistence without losing supersession validity.
+  T011's persistence-before-drop rule is documented in the module and ADR.
+- Review round 1: strict replay remains the invariant validator; `replay_lenient`
+  reports and skips malformed persisted rows so the valid remainder of a call renders.
+- Review round 1: the schema contract now requires `PRAGMA foreign_keys = ON` for every
+  T008 SQLite connection.
+
+## Review round 1 — changes requested (light)
+
+The model is right. Immutable envelope with private fields and read-only accessors,
+partial/final as separate variants, `is_final` correctly removed from the payloads,
+`Suggestion.anchors` added so T013 will not need to reopen the contract, deterministic
+replay, foreign-session and later-target supersession both rejected, every payload variant
+round-tripping through JSON, and the "audio frames are never timeline events" invariant
+documented where someone will actually read it. ADR-0004 records the core-defines /
+rag-implements split. Verified clean.
+
+Two changes before this re-freezes, because both are shaped by the API rather than hidden
+behind it — cheap now, expensive once six crates depend on them.
+
+### R1. `supersede()` is O(n) per call, on the live path
+
+```rust
+if !self.events.iter().any(|event| event.id() == target.id())
+```
+
+Sliding-window ASR supersedes its previous partial roughly twice a second per speaker, so
+over a two-hour call this scans a log of tens of thousands of events tens of thousands of
+times. Keep a `HashSet<EventId>` (or check presence via the id range plus a set of
+superseded ids) and make it O(1).
+
+### R2. The API makes T011's bounded-memory requirement unachievable
+
+`TimelineBuilder` holds every event for the life of the session, and `supersede()` requires
+the target to still be in `self.events`. T011's acceptance criterion is bounded memory over
+a two-hour call, and its only escape today is `into_events()`, which consumes the builder
+and ends the session.
+
+These two requirements cannot both hold as written. Resolve it here, in the owning task:
+give the builder an eviction or checkpoint operation that drains committed events for
+persistence while keeping enough state to validate future supersessions — the id set is
+small, the payloads are what is large. Then document the rule T011 must follow: which
+events may be evicted, and what happens if something supersedes an evicted target.
+
+### R3. Decide strict-vs-lenient replay, and say which
+
+`replay()` returns `UnknownSupersededEvent` when a target is not active — correct for
+validating a log you just built, but it also means one bad row makes a persisted session
+**unopenable**: T008 loads, T016 replays, the whole call fails to render. Given the board
+is the post-call artifact, a timeline that partly renders beats one that refuses to.
+
+Either keep strict replay and add a lenient loading path for T008/T016, or document that
+persisted logs are trusted and say why. Note that `serde` already bypasses the constructor,
+so deserialized events are not covered by the builder's guarantees regardless.
+
+### R4. Note for T008, no change here
+
+The composite `FOREIGN KEY (session_id, supersedes)` in `SQLITE_SCHEMA` is inert unless the
+connection sets `PRAGMA foreign_keys = ON` — SQLite defaults it off per connection. Add that
+to the schema contract comment so T008 does not inherit a guarantee that silently is not one.
+
+## Re-review
+
+R1–R3 addressed, the eviction rule documented for T011, and the existing test suite still
+green.
+
+
+## Review round 2 — approved, with one small addition
+
+All four items landed and verified: `HashSet`-backed O(1) supersession lookup,
+`checkpoint()` with a test proving supersession survives eviction, strict and lenient
+replay both documented and tested, and `PRAGMA foreign_keys = ON` in the schema with the
+per-connection caveat spelled out. Workspace is clean: 25 passed, 0 failed, 5 ignored.
+
+### R5 — record the capture target on the session (do this before re-freezing)
+
+`AGENTS.md` now scopes every session to a user-chosen application or window, and states
+that the session record carries what the timeline is *of*. Add it while this task is still
+open:
+
+```rust
+pub struct CaptureTarget {
+    pub bundle_id: Option<String>,
+    pub display_name: String,      // what the picker showed the user
+    pub window_title: Option<String>,
+    pub kind: TargetKind,          // Application | Window
+    pub audio_scoped: bool,        // false if audio is system-wide — see T002
+}
+```
+
+Hang it off the session, not off every event — it is per-session, and the events already
+carry `session_id`. Include it in the `sessions` table in `SQLITE_SCHEMA`.
+
+`audio_scoped` matters more than it looks: T002 is still determining whether
+ScreenCaptureKit can scope audio per-application. If it cannot, every consumer needs to
+know the recording may contain audio from outside the chosen target — T012's indicator has
+to say so, and a persisted timeline should still be honest about it a year later. A
+timeline that cannot explain its own scope cannot be explained to the person in it.
+
+**Note on `Source`:** the earlier review floated generalising `Source` beyond two values,
+on the assumption that ambient capture might be a direction. It is not — `AGENTS.md` now
+lists ambient capture as an explicit non-goal, and scoped sessions preserve
+mic-equals-rep / target-equals-customer. **`Source` stays two-valued.** Disregard that
+suggestion.
+
+### Re-review
+
+R5 landed, schema updated, existing tests still green. Then the contract re-freezes and six
+tasks unblock.

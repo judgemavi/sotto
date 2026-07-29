@@ -6,6 +6,8 @@
 
 A desktop app for sales teams that listens to live calls (any meeting app — Zoom, Meet, Teams, dialers), transcribes audio and captures screen context locally, lays the conversation out as a live visual timeline, and places talking points, objection responses, and battlecards *into* that timeline as the call unfolds — grounded in the company's own materials and CRM context.
 
+**Sessions are explicitly started and explicitly scoped.** The user turns Sotto on and picks what to capture — an application or a window — through the system picker. Nothing outside that scope is ever captured. Sotto is not ambient, does not run in the background waiting for a call, and has no always-on mode.
+
 The end product is the copilot. The internal milestone on the way there is a note-taker: a fused audio+screen timeline good enough to read is the proof it's good enough to reason over. We dogfood that milestone; we do not ship it as a standalone product.
 
 Core differentiators (do not compromise these):
@@ -14,6 +16,7 @@ Core differentiators (do not compromise these):
 2. **BYOK (bring your own keys).** Users supply their own API keys (Anthropic, OpenAI, Google, OpenRouter, Ollama for fully local). We never proxy inference through our servers. Keys live in the OS keychain.
 3. **Bring your own agents.** MCP client support so companies plug in their own CRM connectors / knowledge bases / agents.
 4. **Transparent by design.** NO stealth features. We are an enablement tool (Gong/Balto category), not a concealment tool (Cluely category). Never implement screen-share invisibility, capture-evasion, or anything designed to hide the app from other call participants. Consent handling is a first-class feature.
+   **Consent is structural, not a policy.** Capture scope is enforced by the OS content filter, not by us filtering afterwards: if the user picked one window, nothing else is ever in the buffer, so there is nothing to redact, prune, or be trusted about. Prefer the system picker — it is the affordance users already know from screen sharing, and macOS draws its own indicator around the captured window. An allowlist chosen by the user beats any blocklist we maintain.
 5. **Lightweight by construction.** Sotto is a single native Rust binary. Small footprint is part of the product's identity ("local-first" should *feel* local-first) — resist dependencies and architecture choices that bloat it.
 6. **The board, not a toast.** Suggestions appear anchored in the conversation that triggered them, on a spatial canvas — not as disembodied pop-ups. Context is what makes a suggestion trustworthy.
 
@@ -22,13 +25,15 @@ Core differentiators (do not compromise these):
 The canonical data structure of the entire product is the **session timeline**: an append-only, timestamped, heterogeneous event log per call. Everything is a producer into it or a consumer of it.
 
 Event kinds (extend deliberately; all share `{id, session_id, ts, kind, payload}`):
-- `utterance.partial` / `utterance.final` — per speaker stream (rep = mic, customer = system audio), text + prosody annotations
+- `utterance.partial` / `utterance.final` — per speaker stream (rep = mic, customer = captured target's audio), text + prosody annotations
 - `vad` — speech start/stop per stream
 - `prosody` — pauses, interruptions, speech rate, talk-time ratio deltas
 - `screen.snapshot` — low-rate frame reference + OCR-extracted text + active-app metadata ("Zoom fullscreen", "slide changed")
 - `trigger` — watcher-model classification (competitor mention, pricing question, objection, discovery-gap)
 - `suggestion.partial` / `suggestion.final` — advising-layer output, **anchored to the event(s) that triggered it**
 - `annotation.user` — rep's own marks/notes on the board
+
+The **session record** carries what the timeline is *of*: start and end wall-clock, and the capture target the user chose (bundle id, window title). A timeline without a recorded scope is not reproducible and cannot be explained to the person in it.
 
 Rules:
 - **Append-only.** Corrections (partial → final) are new events referencing the superseded id, never mutations. Layout and consumers rely on this.
@@ -37,6 +42,8 @@ Rules:
 - Consumers: (a) live board UI, (b) advising layer, (c) post-call summarizer, (d) RAG ingester. All read the same spine.
 
 ## UI model: the whiteboard
+
+**Starting a session is a deliberate, two-step act:** turn Sotto on, pick the target. The picker is the system's, not ours. While a session runs, the indicator shows *what* is being captured — the target's name, and audio versus screen distinctly — not merely that something is. Stopping is always one obvious action away, and the app never resumes a session on its own.
 
 The conversation renders as a **spatial, zoomable, live-appending canvas**:
 
@@ -61,10 +68,13 @@ One language, one binary. No Electron, no webview, no sidecar/IPC boundary.
   - Prefer the official crates.io release; fall back to a pinned git revision of the Zed repo if a needed fix isn't released. Avoid unofficial forks unless unavoidable (record as ADR).
   - When docs run out, the reference is the Zed source code — reading it is the expected workflow, not a workaround.
 - **Async runtime:** tokio for the pipeline and network. Bridge carefully to GPUI's own executor at the UI boundary (single, well-defined seam: timeline events → UI entities).
-- **Audio capture** (two separate streams: mic = rep, system audio = customer):
+- **Capture scope:** every session begins with the user choosing a target — an application or a window — via `SCContentSharingPicker`. That choice builds the `SCContentFilter` for both video and audio, so scope is enforced by the OS rather than by us discarding data afterwards. The chosen target (bundle id, window title) is recorded on the session and is useful context downstream: knowing the session is Zoom versus Keynote is free signal for the board and the advisor.
+  - **Open question for Spike A:** ScreenCaptureKit scopes *video* per-window/per-application natively. Whether *audio* can be scoped to the target application on our minimum macOS version must be verified, not assumed. If audio remains system-wide, say so plainly in the UI and the ADR — the scope guarantee is then video-only, and Slack pings and Spotify are in the recording.
+- **Audio capture** (two separate streams: mic = rep, target-app audio = customer):
   - macOS: ScreenCaptureKit via a small Swift bridge (static lib, FFI). Mic via `cpal` or the same bridge.
   - Windows (later): WASAPI loopback via `cpal`, Windows.Graphics.Capture via `windows` crate, behind the same capture trait.
-- **Screen capture:** same ScreenCaptureKit session, low-rate (0.1–0.2 fps or on significant change); local OCR via Apple Vision; emits `screen.snapshot` timeline events. Screen context is core to the timeline from Phase 1 — not a later add-on. Sending *images* to LLMs remains opt-in per user (cost); OCR text flows by default.
+  - Two streams remain two speakers: the mic is the rep, the captured target is the other party. This is what gives us speaker attribution without a diarization model, and it is a reason to keep sessions scoped rather than ambient.
+- **Screen capture:** same ScreenCaptureKit session and the same content filter, low-rate (0.1–0.2 fps or on significant change); local OCR via Apple Vision; emits `screen.snapshot` timeline events. Screen context is core to the timeline from Phase 1 — not a later add-on. Sending *images* to LLMs remains opt-in per user (cost); OCR text flows by default. Because capture is scoped to a chosen window, there is no exclusion list to maintain — the password manager was never in frame.
 - **VAD:** Silero via ONNX Runtime (`ort` crate), per-frame on both streams.
 - **ASR:** whisper.cpp via `whisper-rs`, Metal acceleration. Sliding-window partial transcripts: ring buffer, re-transcribe last ~10s every ~500ms, emit partials + finals.
 - **Prosody extraction:** pause lengths, interruptions, speech rate, talk-time ratio — emitted as annotations alongside transcript text.
@@ -108,7 +118,7 @@ One language, one binary. No Electron, no webview, no sidecar/IPC boundary.
 
 ### Phase 0 — Two de-risk spikes (gating decisions, do before everything else)
 
-**Spike A — Capture (highest technical risk):** a throwaway, **signed and notarized** macOS binary that captures mic + system audio as two streams (plus a low-rate screen frame every 10s) via the Swift/ScreenCaptureKit bridge for 60+ minutes without drift or dropout, and handles the Screen & System Audio Recording permission flow including detecting revoked permission and guiding re-grant. Success criterion: dual-stream WAVs + frame PNGs on disk, correct and in sync. Set up code signing + notarization in CI **now** — capture bugs on unsigned builds waste days.
+**Spike A — Capture (highest technical risk):** a throwaway, **signed and notarized** macOS binary that lets the user pick a target application or window via `SCContentSharingPicker`, then captures mic + that target's audio as two streams (plus a low-rate screen frame every 10s) via the Swift/ScreenCaptureKit bridge for 60+ minutes without drift or dropout, and handles the Screen & System Audio Recording permission flow including detecting revoked permission and guiding re-grant. Success criterion: dual-stream WAVs + frame PNGs on disk, correct and in sync, containing only the chosen target. Must also answer whether audio can be scoped to the target application, and what happens when the chosen window closes mid-session. Set up code signing + notarization in CI **now** — capture bugs on unsigned builds waste days.
 
 **Spike B — GPUI canvas (gates the UI decision):** a GPUI app proving the whiteboard is buildable:
 1. A zoomable/pannable canvas that appends fake utterance blocks continuously at 60fps for 30+ minutes (append-only layout, no reflow of existing content), with a suggestion card streaming token-by-token anchored to a block.
@@ -159,6 +169,8 @@ Timebox: 7 days.
 ## Explicit non-goals (v1)
 
 - No standalone note-taker product — the note-taker is an internal milestone and dogfood gate only
+- **No ambient or always-on capture.** No background listening, no "record my whole day", no auto-start on detecting a meeting. Every session is explicitly started and explicitly scoped by the user. This is a deliberate decision, not a missing feature: ambient capture would record people who never consented (a legal exposure in two-party-consent jurisdictions), break the two-stream speaker model that gives us diarization for free, and trade a defensible wedge for a crowded undifferentiated one. Revisit only via an ADR with evidence.
+- No general-purpose personal-recall product — the pipeline is domain-neutral by construction, but the product is a sales copilot. Domain specificity is what makes "quiet by default" computable: restraint requires knowing what matters.
 - No cloud backend, no accounts, no telemetry beyond opt-in crash reports
 - No meeting bots that join calls
 - No stealth/undetectability features — ever (see Core differentiators #4)

@@ -49,9 +49,10 @@ needs keys configurable before the note-taker gate can be dogfooded at all.
     - Model selection per role (watcher, suggester, summarizer), including the Ollama
      fully-local path with no key at all.
    - Audio device selection and a level meter per stream.
-   - Screen capture: on/off, sample rate, and the app-exclusion list from T015. Screen
-     capture sees password managers and DMs — this control is a consent feature, and it
-     must be reachable without hunting.
+   - Session start: the target picker flow. Starting a session is turn-on-then-pick, using
+     `SCContentSharingPicker` rather than a chooser of our own. Stopping is always one
+     obvious action away, and the app never resumes a session by itself. There is no
+     app-exclusion list any more — scope replaced it.
    - Speculation aggressiveness — `AGENTS.md` makes this a user setting because it is
      their tokens and their tradeoff. Present the cost implication honestly in the UI.
 
@@ -59,11 +60,15 @@ needs keys configurable before the note-taker gate can be dogfooded at all.
    downloaded — each with a clear message and an action. Distinguish *your key is bad*
    from *the network is down*, using T007's error taxonomy.
 
-6. **Recording indicator.** A visible, always-present indicator whenever capture is
-   live — and it must now cover **screen capture as well as audio**, distinctly. A user
-   who knows their audio is recorded may not realise their screen is. This is a consent
-   feature and a core differentiator, not decoration: it cannot be hidden, and no setting
-   may disable it.
+6. **Recording indicator — show *what*, not just *that*.** A visible, always-present
+   indicator whenever capture is live, naming the captured target and distinguishing audio
+   from screen. A user who knows their audio is recorded may not realise their screen is,
+   and a user who picked one window should be able to confirm at a glance that it is still
+   the only thing being captured. This is a consent feature and a core differentiator, not
+   decoration: it cannot be hidden, and no setting may disable it.
+
+   If T002 reports that audio cannot be scoped per-application, the indicator must say so
+   — "screen: Zoom · audio: system" is honest; implying both are scoped is not.
 
 ## Acceptance
 
@@ -71,8 +76,8 @@ needs keys configurable before the note-taker gate can be dogfooded at all.
   as new events rather than in-place edits.
 - Frame time stable over a one-hour synthetic session.
 - Keys round-trip through the keychain and never render back.
-- Recording indicator provably visible whenever capture is active, distinguishing audio
-  from screen.
+- Recording indicator provably visible whenever capture is active, naming the target and
+  distinguishing audio from screen — and truthful about which of them is actually scoped.
 - The seam is documented well enough for T016 to build the board on it without changes.
 
 ## Out of scope
