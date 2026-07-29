@@ -8,4 +8,4 @@
 mod schema;
 mod store;
 
-pub use store::{DocumentKind, IngestMetadata, SearchFilter, Store};
+pub use store::{DocumentKind, IngestMetadata, SearchFilter, Store, TimelinePersistence};

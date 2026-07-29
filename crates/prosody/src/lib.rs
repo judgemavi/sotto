@@ -191,6 +191,18 @@ impl Annotator {
     }
 }
 
+impl sotto_core::TranscriptAnnotator for Annotator {
+    fn observe_vad(&mut self, segment: &sotto_core::VadSegment) {
+        self.observe(Event::Vad(segment));
+    }
+
+    fn annotate(&mut self, utterance: &mut sotto_core::Utterance) -> Option<ProsodyDelta> {
+        let annotations = self.observe(Event::Utterance(utterance));
+        utterance.annotations.extend(annotations);
+        self.last_delta().cloned()
+    }
+}
+
 #[must_use]
 pub fn select(annotations: &[Annotation], budget: usize) -> Vec<Annotation> {
     let mut indexed: Vec<_> = annotations.iter().cloned().enumerate().collect();

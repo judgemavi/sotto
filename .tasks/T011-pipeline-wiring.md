@@ -1,6 +1,6 @@
 # T011 — Core pipeline: wire the conveyor belt end to end
 
-**Status:** todo (unblocked — all dependencies done)
+**Status:** changes-requested (implementation good; collapse the duplicate CLI wiring)
 
 **Wave:** 2
 
@@ -84,3 +84,61 @@ the same log, which is what makes the fused audio+screen artifact the product de
 ## Out of scope
 
 Trigger classification and suggestions (T013), UI (T012).
+
+## Review round 1 — changes requested (one structural item; the code itself is good)
+
+Verified independently: fmt clean, strict **full-workspace** clippy clean (your report cited
+core/prosody/rag only — the whole workspace does pass), 67 passed / 0 failed / 6 ignored.
+
+The implementation is careful work and several things are exactly right:
+
+- **Layering holds.** `PersistenceSink` is a `BoxFuture`-returning trait in `core`, implemented
+  in `rag` as `TimelinePersistence` via `spawn_blocking` — so blocking SQLite never occupies a
+  runtime worker, and `core` gained no dependency on `rag` or `providers`. The tier boundary in
+  `AGENTS.md` survives, and the dyn-compatible trait shape carries the T007 lesson forward.
+- **Differentiated drop policy, documented per channel.** Audio drops oldest because stale
+  frames must never stall capture; finals await capacity and are never discarded. That is the
+  right asymmetry and the module doc states it plainly rather than leaving it to be inferred.
+- **Bounded under sustained failure, not just under load.** `pending_persistence_events`
+  caps retained payloads while storage is failing — the case that actually leaks in production.
+- **Shutdown is ordered producer-to-consumer** so each consumer sees EOF only after its
+  producers drain. Easy to get wrong, and the reasoning is written down.
+- Counters are exposed per stage rather than aggregated, so a lagging stage is attributable.
+
+### R1. There are now two pipelines, and the wrong one is the tested one
+
+`crates/cli/src/pipeline.rs` (411 lines) wires its own `Session`, `TimelineBuilder`,
+`source_order` and event ordering, and `crates/cli` does not reference `core::pipeline` at all.
+So:
+
+- **`core::pipeline` has never run with real components.** Its fixture test feeds genuine WAVs
+  through *test doubles* for VAD and ASR. That is a fine unit boundary in isolation, but it
+  means the production pipeline has never seen Silero, Whisper, or Vision.
+- **The path that has been exercised end to end is the CLI's** — that is what produced the 10
+  VAD events and `fixtures/timelines/call-01.jsonl`. So the committed reference timeline
+  validates the CLI's ordering, not `core`'s.
+- **The two orderings already differ.** The CLI sorts frames by
+  `(stream_offset, source_order, seq)`; `core` merges utterances by start, end, final-before-partial,
+  system-before-mic, event id. Two implementations of "ordering" that no test compares will
+  drift, and a fix applied to one will silently not apply to the other.
+- The concurrency properties this task exists to guarantee — no stage stalling another — are
+  not exercised by the CLI at all, since it runs sequentially.
+
+By the verification rule in `.tasks/README.md` this is the fifth instance of the pattern: an
+artifact with a green suite that has not been run against real inputs.
+
+**Fix:** make `cli::run_files` a thin adapter over `core::pipeline`. The CLI keeps what is
+genuinely its own — WAV decoding, frame loading, JSONL emission, latency percentiles, stderr
+warnings — and delegates stage wiring, session/timeline construction, merge ordering and
+persistence to `core`. Then regenerate `fixtures/timelines/call-01.jsonl` from that path, so the
+reference timeline validates the pipeline we actually ship.
+
+**This one is my fault, not yours.** T009's brief explicitly told it to build stub-tolerant
+wiring of its own so the harness could exist before the stage crates landed — and I never wrote
+the follow-up step to collapse it into `core::pipeline` once T011 arrived. The duplication is a
+planning gap, not an implementation error.
+
+### Re-review
+
+CLI delegating to `core::pipeline`, one ordering implementation, reference timeline regenerated
+from the real path, and `sotto-cli run` still emitting a correct timeline against the fixtures.

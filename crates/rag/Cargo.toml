@@ -15,6 +15,7 @@ serde.workspace = true
 serde_json.workspace = true
 sqlite-vec = "0.1.6"
 sotto_core = { package = "core", path = "../core", features = ["serde"] }
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tempfile = "3.20.0"

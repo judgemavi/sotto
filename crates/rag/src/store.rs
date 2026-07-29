@@ -3,7 +3,7 @@ use std::{
     hash::{Hash, Hasher},
     path::Path,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -13,8 +13,8 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
 use sotto_core::{
-    BoxFuture, CaptureTarget, Chunk, RagError, Retriever, Session, SessionId, TargetKind,
-    TimelineEvent,
+    BoxFuture, CaptureTarget, Chunk, PersistenceSink, RagError, Retriever, Session, SessionId,
+    TargetKind, TimelineEvent,
 };
 
 use crate::schema::{configure, migrate, storage};
@@ -58,6 +58,30 @@ pub struct Store {
     writer: Mutex<Connection>,
     reader: Mutex<Connection>,
     embedding: Mutex<Option<TextEmbedding>>,
+}
+
+/// Non-blocking adapter from the core pipeline's persistence task to T008's SQLite store.
+#[derive(Clone)]
+pub struct TimelinePersistence {
+    store: Arc<Store>,
+}
+
+impl TimelinePersistence {
+    #[must_use]
+    pub const fn new(store: Arc<Store>) -> Self {
+        Self { store }
+    }
+}
+
+impl PersistenceSink for TimelinePersistence {
+    fn append<'a>(&'a self, events: Vec<TimelineEvent>) -> BoxFuture<'a, Result<(), RagError>> {
+        let store = Arc::clone(&self.store);
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || store.append_events(&events))
+                .await
+                .map_err(|error| RagError::Storage(error.to_string()))?
+        })
+    }
 }
 
 impl Store {

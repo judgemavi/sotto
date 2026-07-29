@@ -4,12 +4,18 @@
 
 pub mod bus;
 pub mod error;
+pub mod pipeline;
 pub mod timeline;
 pub mod traits;
 pub mod types;
 
 pub use bus::{EventBus, EventReceiver, ReceiveError};
 pub use error::{AsrError, CaptureError, PipelineError, ProviderError, RagError, VadError};
+pub use pipeline::{
+    BackpressureCounters, CallSession, NoopAnnotator, NoopPersistence, PersistenceSink, Pipeline,
+    PipelineBuilder, PipelineConfig, PipelineHandle, RecordingState, SessionView,
+    TranscriptAnnotator,
+};
 pub use timeline::{
     CaptureTarget, EventId, EventKind, EventPayload, FrameRef, LenientReplay, MarkKind,
     ProsodyDelta, ReplayState, SQLITE_SCHEMA, ScreenSnapshot, Session, SessionId, TargetKind,

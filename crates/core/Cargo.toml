@@ -17,8 +17,11 @@ futures-core = "0.3.33"
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 tracing.workspace = true
+
+[dev-dependencies]
+hound = "3.5.1"
 
 [lints]
 workspace = true
