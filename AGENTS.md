@@ -97,6 +97,8 @@ One language, one binary. No Electron, no webview, no sidecar/IPC boundary.
 - **Screen capture:** same ScreenCaptureKit session and the same content filter, low-rate (0.1–0.2 fps or on significant change); local OCR via Apple Vision; emits `screen.snapshot` timeline events. Screen context is core to the timeline from Phase 1 — not a later add-on. Sending *images* to LLMs remains opt-in per user (cost); OCR text flows by default. Because capture is scoped to a chosen window, there is no exclusion list to maintain — the password manager was never in frame.
 - **VAD:** Silero via ONNX Runtime (`ort` crate), per-frame on both streams.
 - **ASR:** whisper.cpp via `whisper-rs`, Metal acceleration. Sliding-window partial transcripts: ring buffer, re-transcribe last ~10s every ~500ms, emit partials + finals.
+  - **Weights are downloaded on first run, not bundled.** Default to `base.en`; offer `small.en` and `medium.en` for users who will trade latency for accuracy. Confirm the default against the CLI latency bench rather than assuming — the observed misrecognition of "Acme" as "acne" on fixture audio is the kind of thing a larger model fixes and a latency budget may not afford.
+  - **Be honest that first launch needs the network.** Everything else about this product is offline, so the one download is worth stating plainly in the UI rather than discovering. Verify integrity, show progress, and make it resumable. After that first fetch the map tier is fully local and needs no key and no connection.
 - **Prosody extraction:** pause lengths, interruptions, speech rate, talk-time ratio — emitted as annotations alongside transcript text.
 - **LLM provider layer:** hand-rolled abstraction over Anthropic / OpenAI / Google / OpenRouter / Ollama. `reqwest` + SSE streaming; speculative calls as tokio tasks with abort handles; prompt caching for static context. No heavy framework — this is ~500 lines we control.
 - **RAG:** `rusqlite` + sqlite-vec, embeddings via `fastembed-rs`. Battlecards, product docs, account notes, and past session timelines — all in one local SQLite file. Retrieval is in-process with the pipeline: zero IPC hops on the hot path.
@@ -159,7 +161,8 @@ Timebox: 7 days.
 - Session start/stop with the target picker, and post-call review of a persisted timeline
 - Timeline → RAG ingestion (past calls become retrievable account memory)
 - **This tier ships without any model configured.** Everything above is deterministic and local. Onboarding must not require a key.
-- **Gate:** record real calls and use the board. The fused timeline must be accurate and *readable* before advising work begins — if it isn't good enough to read, it isn't good enough to reason over. This is now a product bar, not only a dogfood checkpoint.
+- **Gate:** use the board on real conversations. The fused timeline must be accurate and *readable* before advising work begins — if it isn't good enough to read, it isn't good enough to reason over. This is a product bar, not only a dogfood checkpoint.
+  - **It does not have to be a sales call.** Capture is scoped to any window or application, so any two-party conversation exercises the whole map tier: two audio streams, speaker attribution, prosody, screen frames, OCR, board layout. A 1:1 with a colleague works — mic is you, the captured app is them. Only the *advisor* needs real sales calls, because trigger types and battlecard grounding are the sales-specific parts. Do not let the map tier's validation wait on access to a sales pipeline.
 
 ### Phase 3 — The reasoning layer (offline first)
 - `providers`: streaming + cancellation + keychain storage; GPUI settings screens for keys/model selection (use gpui-component), including the no-key and Ollama paths

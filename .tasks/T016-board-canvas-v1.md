@@ -1,6 +1,6 @@
 # T016 — Board canvas v1: the timeline as a readable whiteboard
 
-**Status:** blocked (on T003 verdict, T011, T012)
+**Status:** blocked (on T020 verdict, T012)
 
 **Wave:** 3 — Phase 2, the note-taker dogfood gate
 
@@ -96,3 +96,15 @@ enough. Now:
 
 The gate still applies — use it on real calls and agree the timeline is accurate and
 readable before advising work starts — but it is now a product bar as well as a checkpoint.
+
+
+## Amendment — the gate does not need sales calls (2026-07-29)
+
+Clarified in `AGENTS.md`: capture is scoped to any window or application, so validating this
+tier does not require access to a sales pipeline. Any two-party conversation exercises
+everything the map tier does — two audio streams with speaker attribution, prosody, screen
+frames, OCR, board layout, post-call review. A 1:1 with a colleague is sufficient: mic is
+you, the captured app is them.
+
+Only the advisor's validation needs real sales calls, because trigger types and battlecard
+grounding are the sales-specific parts. Do not block this gate on sales-call access.

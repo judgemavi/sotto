@@ -88,3 +88,17 @@ convention. Fixed-capacity SPSC rings, lazy model lifecycle, Metal. 4 tests, cli
 it by reporting rather than editing frozen `core` or faking it downstream was the right
 call. Tracked as **T018**; once that lands, return here to emit
 `TranscriptUpdate::{Partial, Final}` instead of bare `Utterance`s.
+
+
+## Decision recorded — model distribution (2026-07-29)
+
+`AGENTS.md` now settles what was drifting toward being decided by accident:
+
+- **Weights download on first run; nothing is bundled.** Default **`base.en`**, with
+  `small.en` and `medium.en` offered for users who will trade latency for accuracy.
+- **Confirm the default against the CLI latency bench rather than assuming it.** The
+  misrecognition of "Acme" as "acne" on fixture audio is exactly the class of error a larger
+  model fixes and a latency budget may not afford — so the choice is a measurement, not a
+  preference.
+- First launch therefore needs the network even though nothing else in the product does. That
+  gets stated plainly in the UI, not discovered. Download work itself is Phase 4.

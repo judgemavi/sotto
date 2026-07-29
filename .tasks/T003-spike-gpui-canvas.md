@@ -1,6 +1,6 @@
 # T003 — Spike B: GPUI whiteboard canvas + overlay lens
 
-**Status:** in-progress (toolchain fully resolved — no environmental blocker remains)
+**Status:** superseded by T020 for the remaining measurements and the verdict
 
 **Wave:** 1 — start early alongside T002; **timeboxed to 7 days**
 
@@ -183,3 +183,11 @@ Two upstream crates (`block v0.1.6`, `proc-macro-error2 v2.0.1`, both transitive
 GPUI) emit future-incompatibility warnings. Not actionable now; note them in ADR-0003 as
 part of the GPUI dependency picture, since pinning GPUI exactly means we inherit its
 dependency graph deliberately.
+
+
+## Superseded by T020 for the remaining measurements (2026-07-29)
+
+The canvas, culling and click-through work here is accepted. The unclaimed checks — 30-minute
+append, zoom/GPU, full-screen call, keystroke, click-through — plus the verdict itself are
+split into **T020** so they can be picked up cold and finished, rather than staying open while
+T012 and T016 wait.
