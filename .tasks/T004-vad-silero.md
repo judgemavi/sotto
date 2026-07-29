@@ -80,3 +80,22 @@ configurable hysteresis, steady-state push benchmark. Verified clean under stric
 Three tests is lean for the crate, but the logic is mechanical and the hysteresis
 thresholds are the part that will actually need tuning against real audio rather than more
 unit tests. Revisit when T009's fixture corpus exists.
+
+## Defect found later — the model was missing a required input (fixed in T009's round)
+
+`SileroVad` never passed the `sr` (sample-rate) tensor the ONNX model requires, so **real
+inference was never running**. Fixed during T009's fixture work:
+
+```rust
+.run(inputs!["input" => input, "state" => state, "sr" => sample_rate])
+```
+
+This crate was approved with three passing tests and a benchmark while not working. The
+tone-burst fixtures made it invisible: silence in, silence out, green suite. It surfaced
+only once the corpus contained real speech and a pipeline run produced 10 VAD events where
+it had produced none.
+
+The lesson is not about VAD. A unit test that feeds synthetic input to a model and asserts
+on structure will pass whether or not the model is doing anything. Any crate wrapping a
+model needs at least one test over **real** data with a known expected answer — see the
+verification rule in `.tasks/README.md`.

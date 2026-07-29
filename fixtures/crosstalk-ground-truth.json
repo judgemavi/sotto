@@ -1,1 +1,9 @@
-{"labels":["interruption","crosstalk"],"segments":{"mic":[[2000,14000],[19000,27000]],"system":[[8000,20000]]}}
+{
+  "labels":["interruption","crosstalk"],
+  "provenance":{"tts":"macOS say","mic_voice":"Samantha","system_voice":"Daniel","rate_wpm":185},
+  "transcript":[
+    {"source":"mic","start_ms":2000,"text":"Let me explain how the rollout works across your entire organization."},
+    {"source":"system","start_ms":8000,"text":"I need to stop you there because our timeline is much shorter than that."},
+    {"source":"mic","start_ms":19000,"text":"We can phase the migration and train each regional team."}
+  ]
+}

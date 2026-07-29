@@ -1,1 +1,9 @@
-{"labels":["objection","competitor_mention"],"segments":{"mic":[[1000,7000],[18000,26000]],"system":[[8000,18000]]},"transcript":"The price is higher than Acme, our current vendor."}
+{
+  "labels":["objection","competitor_mention"],
+  "provenance":{"tts":"macOS say","mic_voice":"Samantha","system_voice":"Daniel","rate_wpm":185},
+  "transcript":[
+    {"source":"mic","start_ms":1000,"text":"What concerns do you have about moving forward?"},
+    {"source":"system","start_ms":8000,"text":"The price is higher than Acme, our current vendor."},
+    {"source":"mic","start_ms":18000,"text":"Our enterprise plan includes migration and priority support."}
+  ]
+}

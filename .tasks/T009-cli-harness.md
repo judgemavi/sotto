@@ -1,6 +1,6 @@
 # T009 — CLI harness: WAV + frames in → timeline events out, fixtures, latency bench
 
-**Status:** changes-requested (harness good; fixture corpus cannot exercise the pipeline)
+**Status:** done (approved at review round 2)
 
 **Wave:** 1 — fully parallel; builds against traits, stubs where crates are unfinished
 
@@ -172,3 +172,55 @@ happened" has to be distinguishable from "nothing was supposed to happen".
 
 Corpus regenerated with real speech, reference timeline produced by an actual run, a frame
 fixture whose text Vision demonstrably reads, and empty stages reporting themselves.
+
+## Review round 2 — approved
+
+All three items fixed, and verified independently rather than from the report.
+
+**R1 — the corpus is real speech now.** `say` with Samantha and Daniel gives two distinct
+voices, and the decisive check is that the pipeline actually flows: a fixture run emits
+**10 VAD events where it previously emitted zero**. The reference timeline is genuine
+output — 10 vad, 3 utterance_final, 3 prosody, 2 screen_snapshot — with real Whisper
+transcription in it ("The migration and support are included."). Imperfect transcription of
+TTS audio is expected and fine; what matters is that it is transcription rather than
+fiction.
+
+**R2 — Vision demonstrably reads the frames:**
+
+```
+"ocr_text":"Sotto Product Overview\nLocal-first sales call copilot"
+"ocr_text":"Enterprise Pricing\nMigration and support included"
+```
+
+So T015's binding was never broken — it was unverified, and is now verified working.
+
+**R3 — silence reports itself,** and better than asked. The warnings explain causation
+rather than just absence:
+
+```
+warning: ASR stage disabled (no model configured)
+warning: prosody stage emitted no events (ASR produced no utterances)
+warning: screen stage disabled (no frames provided)
+```
+
+Telling the user prosody was empty *because* ASR produced nothing is the difference between
+a warning and a useful one.
+
+Verified: fmt clean, strict workspace clippy clean, 59 passed / 0 failed / 6 ignored.
+
+### The Silero fix is the most valuable thing in this round
+
+> *"Fixed Silero's missing `sr` model input, which was silently preventing real VAD inference."*
+
+`crates/vad` never passed the sample-rate tensor the model requires. VAD was not running
+real inference — and **I approved T004 with three green tests and a benchmark over a crate
+that did not work.** The tone-burst fixtures hid it perfectly: no speech in, no speech out,
+tests pass, everyone satisfied.
+
+This is the fourth instance of one pattern: 2×2 frames, tone-burst audio, glyphless frames,
+and now a VAD model missing a required input. Every time, an artifact existed, the suite was
+green, and nothing was being exercised. Every time it surfaced only by running the thing
+against real data. The verification rule in `.tasks/README.md` now says so explicitly.
+
+Crossing into `crates/vad` to fix it was the right call rather than filing it and leaving a
+broken crate approved. T004's notes record the defect.

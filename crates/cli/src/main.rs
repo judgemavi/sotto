@@ -89,6 +89,8 @@ fn main() -> Result<()> {
             realtime,
             kinds,
         } => {
+            let asr_configured = model.is_some();
+            let frames_configured = frames.is_some();
             let run = run_files(&PipelineOptions {
                 mic: wav,
                 system,
@@ -96,6 +98,7 @@ fn main() -> Result<()> {
                 model,
                 realtime,
             })?;
+            warn_run_stages(&run.events, asr_configured, frames_configured);
             write_events(&run.events, &parse_kinds(&kinds)?)?;
         }
         Command::Transcribe { wav, model } => {
@@ -106,6 +109,12 @@ fn main() -> Result<()> {
                 model: Some(model),
                 realtime: false,
             })?;
+            warn_if_missing(&run.events, "ASR", |kind| {
+                matches!(
+                    kind,
+                    EventKind::UtterancePartial | EventKind::UtteranceFinal
+                )
+            });
             write_events(
                 &run.events,
                 &HashSet::from([EventKind::UtterancePartial, EventKind::UtteranceFinal]),
@@ -119,10 +128,15 @@ fn main() -> Result<()> {
                 model: None,
                 realtime: false,
             })?;
+            warn_if_missing(&run.events, "VAD", |kind| kind == EventKind::Vad);
             write_events(&run.events, &HashSet::from([EventKind::Vad]))?;
         }
         Command::Ocr { frames_dir } => {
-            for (_, payload) in cli::pipeline::load_screen_payloads(&frames_dir)? {
+            let payloads = cli::pipeline::load_screen_payloads(&frames_dir)?;
+            if payloads.is_empty() {
+                eprintln!("warning: screen stage emitted no events (no frames found)");
+            }
+            for (_, payload) in payloads {
                 println!("{}", serde_json::to_string(&payload)?);
             }
         }
@@ -168,6 +182,34 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn warn_run_stages(events: &[TimelineEvent], asr_configured: bool, frames_configured: bool) {
+    warn_if_missing(events, "VAD", |kind| kind == EventKind::Vad);
+    if asr_configured {
+        warn_if_missing(events, "ASR", |kind| {
+            matches!(
+                kind,
+                EventKind::UtterancePartial | EventKind::UtteranceFinal
+            )
+        });
+        warn_if_missing(events, "prosody", |kind| kind == EventKind::Prosody);
+    } else {
+        eprintln!("warning: ASR stage disabled (no model configured)");
+        eprintln!("warning: prosody stage emitted no events (ASR produced no utterances)");
+    }
+    if frames_configured {
+        warn_if_missing(events, "screen", |kind| kind == EventKind::ScreenSnapshot);
+    } else {
+        eprintln!("warning: screen stage disabled (no frames provided)");
+    }
+    eprintln!("warning: advisor stage disabled (no reasoning model configured)");
+}
+
+fn warn_if_missing(events: &[TimelineEvent], stage: &str, emitted: impl Fn(EventKind) -> bool) {
+    if !events.iter().any(|event| emitted(event.kind())) {
+        eprintln!("warning: {stage} stage emitted no events");
+    }
 }
 
 fn write_events(events: &[TimelineEvent], kinds: &HashSet<EventKind>) -> Result<()> {

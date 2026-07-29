@@ -140,9 +140,12 @@ impl SileroVad {
             .map_err(|error| VadError::Inference(error.to_string()))?;
         let state = TensorRef::from_array_view(state_view)
             .map_err(|error| VadError::Inference(error.to_string()))?;
+        let sample_rate = [i64::from(SAMPLE_RATE)];
+        let sample_rate = TensorRef::from_array_view(([1_usize], &sample_rate[..]))
+            .map_err(|error| VadError::Inference(error.to_string()))?;
         let outputs = self
             .session
-            .run(inputs!["input" => input, "state" => state])
+            .run(inputs!["input" => input, "state" => state, "sr" => sample_rate])
             .map_err(|error| VadError::Inference(error.to_string()))?;
         let output = outputs
             .get("output")

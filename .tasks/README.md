@@ -73,6 +73,27 @@ each file, once:
 )]
 ```
 
+## The verification rule
+
+A green test suite over an artifact that exercises nothing is the failure mode of this
+project. It has happened four times:
+
+| What existed | Why it proved nothing |
+|---|---|
+| Screen frames captured at 2×2 pixels | every frame was 83 bytes; the frame path was never run |
+| Audio fixtures of tone bursts | Silero correctly finds no speech in a tone, so nothing flowed |
+| Frame fixtures with no rendered glyphs | OCR had never extracted a character |
+| Silero missing its required `sr` input | VAD ran no real inference; tests passed anyway |
+
+Every one passed review. Every one surfaced only by running the thing against real data.
+
+So: **if your crate wraps a model, a device, or an OS API, at least one test must run real
+input through it and assert on a known real answer.** Structure assertions over synthetic
+input pass whether or not the thing under test does anything at all.
+
+And when a stage produces nothing, say so — on stderr, with the cause. Silence that looks
+like success is how all four of these survived.
+
 ## Waves
 
 | Wave | Phase | Tasks | Notes |

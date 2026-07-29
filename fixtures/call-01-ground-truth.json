@@ -1,13 +1,14 @@
 {
+  "provenance": {"tts":"macOS say","mic_voice":"Samantha","system_voice":"Daniel","rate_wpm":185},
   "transcript": [
-    {"source":"mic","start_ms":1000,"end_ms":5000,"text":"Thanks for joining. How are you handling pricing today?"},
-    {"source":"system","start_ms":6000,"end_ms":12000,"text":"We need predictable pricing for the enterprise rollout."},
-    {"source":"mic","start_ms":13000,"end_ms":17000,"text":"Let me walk through the enterprise plan."},
-    {"source":"system","start_ms":18000,"end_ms":23000,"text":"The price is higher than Acme, our current vendor."},
-    {"source":"mic","start_ms":24000,"end_ms":28000,"text":"The migration and support are included."}
+    {"source":"mic","start_ms":1000,"text":"Thanks for joining. How are you handling pricing today?"},
+    {"source":"system","start_ms":6000,"text":"We need predictable pricing for the enterprise rollout."},
+    {"source":"mic","start_ms":13000,"text":"Let me walk through the enterprise plan."},
+    {"source":"system","start_ms":18000,"text":"The price is higher than Acme, our current vendor."},
+    {"source":"mic","start_ms":24000,"text":"The migration and support are included."}
   ],
   "screen": [
-    {"at_ms":0,"file":"00000-overview.png","expected_ocr":"Sotto product overview"},
-    {"at_ms":15000,"file":"15000-pricing.png","expected_ocr":"Enterprise pricing"}
+    {"at_ms":0,"file":"00000-overview.png","expected_ocr":"Sotto Product Overview"},
+    {"at_ms":15000,"file":"15000-pricing.png","expected_ocr":"Enterprise Pricing"}
   ]
 }

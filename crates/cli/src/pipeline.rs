@@ -92,7 +92,17 @@ pub fn run_files(options: &PipelineOptions) -> Result<PipelineRun> {
     let mut transcriber = options
         .model
         .as_ref()
-        .map(|path| WhisperTranscriber::new(AsrConfig::new(path)))
+        .map(|path| {
+            let mut config = AsrConfig::new(path);
+            if !options.realtime {
+                // A fast fixture run feeds audio faster than the worker can observe live VAD
+                // controls. Treat the completed files as one batch and commit on the first pass.
+                config.vad_gating = false;
+                config.agreement_passes = 1;
+                config.unstable_tail = Duration::ZERO;
+            }
+            WhisperTranscriber::new(config)
+        })
         .transpose()?;
     let mut prosody = Annotator::default();
     let mut latest_partial = HashMap::new();
@@ -120,10 +130,22 @@ pub fn run_files(options: &PipelineOptions) -> Result<PipelineRun> {
             }
         }
         let segment = match frame.source {
-            Source::Mic => mic_vad.push(&frame),
-            Source::System => system_vad
-                .as_mut()
-                .and_then(|detector| detector.push(&frame)),
+            Source::Mic => {
+                let segment = mic_vad.push(&frame);
+                if let Some(error) = mic_vad.take_error() {
+                    anyhow::bail!("mic VAD failed: {error}");
+                }
+                segment
+            }
+            Source::System => {
+                let segment = system_vad
+                    .as_mut()
+                    .and_then(|detector| detector.push(&frame));
+                if let Some(error) = system_vad.as_mut().and_then(vad::SileroVad::take_error) {
+                    anyhow::bail!("system VAD failed: {error}");
+                }
+                segment
+            }
         };
         if let Some(segment) = segment {
             frame_vad.push(frame.capture_ts.elapsed());

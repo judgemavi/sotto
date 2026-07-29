@@ -1,94 +1,168 @@
-use std::{f32::consts::TAU, fs, path::Path};
+use std::{fs, path::Path, process::Command};
 
 const RATE: u32 = 16_000;
 const SECONDS: u32 = 30;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg!(target_os = "macos") {
+        return Err("fixture generation requires macOS `say` and `afconvert`".into());
+    }
+
     let root = Path::new("fixtures");
     fs::create_dir_all(root.join("call-01-frames"))?;
     fs::create_dir_all(root.join("timelines"))?;
-    write_wav(
-        &root.join("call-01-mic.wav"),
-        &[(1, 5, 185.0), (13, 17, 205.0), (24, 28, 195.0)],
+    let temporary = tempfile::tempdir()?;
+
+    write_dialogue(
+        root.join("call-01-mic.wav"),
+        "Samantha",
+        &[
+            (1, "Thanks for joining. How are you handling pricing today?"),
+            (13, "Let me walk through the enterprise plan."),
+            (24, "The migration and support are included."),
+        ],
+        temporary.path(),
     )?;
-    write_wav(
-        &root.join("call-01-sys.wav"),
-        &[(6, 12, 225.0), (18, 23, 235.0)],
+    write_dialogue(
+        root.join("call-01-sys.wav"),
+        "Daniel",
+        &[
+            (6, "We need predictable pricing for the enterprise rollout."),
+            (18, "The price is higher than Acme, our current vendor."),
+        ],
+        temporary.path(),
     )?;
-    write_wav(
-        &root.join("objection-mic.wav"),
-        &[(1, 7, 190.0), (18, 26, 200.0)],
+    write_dialogue(
+        root.join("objection-mic.wav"),
+        "Samantha",
+        &[
+            (1, "What concerns do you have about moving forward?"),
+            (
+                18,
+                "Our enterprise plan includes migration and priority support.",
+            ),
+        ],
+        temporary.path(),
     )?;
-    write_wav(&root.join("objection-system.wav"), &[(8, 18, 230.0)])?;
-    write_wav(
-        &root.join("crosstalk-mic.wav"),
-        &[(2, 14, 180.0), (19, 27, 200.0)],
+    write_dialogue(
+        root.join("objection-system.wav"),
+        "Daniel",
+        &[(8, "The price is higher than Acme, our current vendor.")],
+        temporary.path(),
     )?;
-    write_wav(&root.join("crosstalk-system.wav"), &[(8, 20, 240.0)])?;
-    write_wav(
-        &root.join("long-silence.wav"),
-        &[(1, 4, 210.0), (25, 29, 220.0)],
+    write_dialogue(
+        root.join("crosstalk-mic.wav"),
+        "Samantha",
+        &[
+            (
+                2,
+                "Let me explain how the rollout works across your entire organization.",
+            ),
+            (
+                19,
+                "We can phase the migration and train each regional team.",
+            ),
+        ],
+        temporary.path(),
     )?;
-    write_wav(&root.join("silence.wav"), &[])?;
-    write_wav(&root.join("music.wav"), &[(0, 30, 440.0)])?;
-    write_png(
-        &root.join("call-01-frames/00000-overview.png"),
-        [30, 45, 60, 255],
+    write_dialogue(
+        root.join("crosstalk-system.wav"),
+        "Daniel",
+        &[(
+            8,
+            "I need to stop you there because our timeline is much shorter than that.",
+        )],
+        temporary.path(),
     )?;
-    write_png(
-        &root.join("call-01-frames/15000-pricing.png"),
-        [230, 245, 255, 255],
+    write_dialogue(
+        root.join("long-silence.wav"),
+        "Samantha",
+        &[(1, "Let me check that."), (25, "Yes, support is included.")],
+        temporary.path(),
     )?;
+    write_silence(root.join("silence.wav"))?;
+    write_music(root.join("music.wav"))?;
+
+    let status = Command::new("swift")
+        .arg("crates/cli/examples/render_fixture_frames.swift")
+        .arg(root.join("call-01-frames"))
+        .status()?;
+    if !status.success() {
+        return Err("Swift frame renderer failed".into());
+    }
     Ok(())
 }
 
-fn write_wav(path: &Path, intervals: &[(u32, u32, f32)]) -> Result<(), hound::Error> {
+fn write_dialogue(
+    path: impl AsRef<Path>,
+    voice: &str,
+    turns: &[(u32, &str)],
+    temporary: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut track = vec![0_i16; (RATE * SECONDS) as usize];
+    for (index, (start, text)) in turns.iter().enumerate() {
+        let aiff = temporary.join(format!("{voice}-{index}.aiff"));
+        let wav = temporary.join(format!("{voice}-{index}.wav"));
+        run(Command::new("say")
+            .args(["-v", voice, "-r", "185", "-o"])
+            .arg(&aiff)
+            .arg(text))?;
+        run(Command::new("afconvert")
+            .args(["-f", "WAVE", "-d", "LEI16@16000", "-c", "1"])
+            .arg(&aiff)
+            .arg(&wav))?;
+        let mut reader = hound::WavReader::open(wav)?;
+        let offset = (*start * RATE) as usize;
+        for (destination, sample) in track[offset..].iter_mut().zip(reader.samples::<i16>()) {
+            *destination = sample?;
+        }
+    }
+    write_samples(path, &track)
+}
+
+fn write_silence(path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
+    write_samples(path, &vec![0; (RATE * SECONDS) as usize])
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the bounded sine amplitude is deliberately quantized to PCM i16"
+)]
+fn write_music(path: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
+    let samples = (0..RATE * SECONDS)
+        .map(|index| {
+            let phase = index as f32 / RATE as f32 * 440.0 * std::f32::consts::TAU;
+            (phase.sin() * 5_898.0) as i16
+        })
+        .collect::<Vec<_>>();
+    write_samples(path, &samples)
+}
+
+fn write_samples(
+    path: impl AsRef<Path>,
+    samples: &[i16],
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut writer = hound::WavWriter::create(
         path,
         hound::WavSpec {
             channels: 1,
             sample_rate: RATE,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
         },
     )?;
-    for sample_index in 0..RATE * SECONDS {
-        let second = sample_index / RATE;
-        let value = intervals
-            .iter()
-            .find(|(start, end, _)| second >= *start && second < *end)
-            .map_or(0.0, |(_, _, frequency)| {
-                let envelope = ((sample_index % RATE) as f32 / RATE as f32 * std::f32::consts::PI)
-                    .sin()
-                    .abs();
-                (sample_index as f32 / RATE as f32 * *frequency * TAU).sin() * 0.18 * envelope
-            });
-        writer.write_sample(value)?;
+    for sample in samples {
+        writer.write_sample(*sample)?;
     }
-    writer.finalize()
+    writer.finalize()?;
+    Ok(())
 }
 
-fn write_png(path: &Path, rgba: [u8; 4]) -> Result<(), Box<dyn std::error::Error>> {
-    let (width, height) = (320, 180);
-    let file = fs::File::create(path)?;
-    let mut encoder = png::Encoder::new(file, width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header()?;
-    let mut pixels = rgba.repeat(width as usize * height as usize);
-    // High-contrast bands make slide changes deterministic for perceptual hashing.
-    for y in 70..110_usize {
-        for x in 35..285_usize {
-            let index = (y * width as usize + x) * 4;
-            pixels[index..index + 4].copy_from_slice(&[
-                rgba[0] ^ 0xff,
-                rgba[1] ^ 0xff,
-                rgba[2] ^ 0xff,
-                255,
-            ]);
-        }
+fn run(command: &mut Command) -> Result<(), Box<dyn std::error::Error>> {
+    let display = format!("{command:?}");
+    if command.status()?.success() {
+        Ok(())
+    } else {
+        Err(format!("command failed: {display}").into())
     }
-    writer.write_image_data(&pixels)?;
-    writer.finish()?;
-    Ok(())
 }
