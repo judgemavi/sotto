@@ -1,6 +1,6 @@
 # T011 — Core pipeline: wire the conveyor belt end to end
 
-**Status:** changes-requested (R1 done; transcript coverage defect + missing ground-truth assertion)
+**Status:** done (approved at review round 4)
 
 **Wave:** 2
 
@@ -285,3 +285,61 @@ ever regenerated.
 One final per utterance with partials superseded rather than re-committed, speech-derived
 timestamps within tolerance of ground truth, the two-directional assertion in place, and the
 reference timeline regenerated after both fixes.
+
+## Review round 4 — approved
+
+Verified independently against the ground truth rather than from the report.
+
+**R4 — one final per utterance, partials superseded.** 5 finals for 5 expected, zero
+duplicate texts. Chain integrity checks out: 9 supersede links, every target present and
+strictly earlier, 1 session, and each chain terminates in an `utterance_final`. So a partial
+revises a partial and a final replaces the chain — which is exactly the shape T014's
+append-only rule and T001's `(source, start)` key were designed for. Strict replay through
+`sotto-cli replay` succeeds.
+
+**R5 — timestamps are real speech boundaries now.**
+
+| ground truth | produced | delta |
+|---|---|---|
+| 1000 ms | 1184 ms | +184 |
+| 6000 ms | 6048 ms | +48 |
+| 13000 ms | 13024 ms | +24 |
+| 18000 ms | 18208 ms | +208 |
+| 24000 ms | 24096 ms | +96 |
+
+All inside 208 ms, against 5-second quantisation before. Prosody consequently carries
+meaningful values — real pause durations around 3.2 s, talk-time ratios near 0.52/0.56 —
+where previously it was derived from window origins and meant nothing.
+
+**R6 — the assertion is two-directional now**: ordered per-source coverage, duplicate
+rejection, bounded counts, 1.5 s start tolerance, and fast/realtime signature equality. It
+would fail on both of the defects from the last two rounds.
+
+Verified: fmt clean, strict full-workspace clippy clean, 68 passed / 0 failed / 7 ignored.
+
+### Three notes, none blocking
+
+- **`avg_logprob` is always `0.0`.** Whisper reports a real confidence and it is being
+  dropped. It costs nothing to plumb through, and it is the natural signal for the advisor to
+  suppress suggestions built on a shaky transcript, or for the board to render a
+  low-confidence utterance differently. Worth capturing while the code is fresh.
+- **`speech_rate` reads 200–324 wpm against TTS generated at 185 wpm.** Plausible if it is
+  measured over speech-only duration excluding pauses — but T006 uses rate *change against a
+  speaker's own baseline* as a signal, so it is worth confirming the denominator is what you
+  intend rather than discovering it later through a wrong `[hesitant]`.
+- **One final still misrecognises**: `'The price is higher than Acme, our customers are at the
+  price of Acme.'` for `'…our current vendor.'`. That is ASR accuracy on synthetic speech, not
+  a pipeline defect, and it passes the 55% overlap check legitimately. Useful as a recorded
+  baseline: if a model change moves this, you will see it.
+
+### The pipeline is now real
+
+`sotto-cli run` drives the production `core::pipeline` end to end through real Silero,
+Whisper, prosody and Vision, and produces a timeline that matches known ground truth on
+content, ordering, supersession and timing. That is the first point in this project where the
+thing being shipped is also the thing being tested.
+
+Worth keeping in view: the test that proves it is `#[ignore]`d behind `SOTTO_WHISPER_MODEL`,
+so it does not run in CI. **Run it deliberately before regenerating the timeline fixture
+ever again** — that discipline is now the only thing standing between the fixture and the
+class of defect the last three rounds found.

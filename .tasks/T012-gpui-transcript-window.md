@@ -1,6 +1,6 @@
 # T012 — GPUI dev window: live timeline + settings screens
 
-**Status:** blocked (on T003, T011)
+**Status:** blocked (on T003 verdict — T011 done)
 
 **Wave:** 2
 

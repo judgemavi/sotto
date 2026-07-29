@@ -16,7 +16,7 @@ use serde::Serialize;
 use sotto_core::{
     AudioFrame, CaptureBackend, CaptureError, CaptureTarget, EventPayload, PermissionStatus,
     Pipeline, PipelineConfig, Session, SessionId, Source, SpeechState, TargetKind, TimelineEvent,
-    Transcriber, TranscriptUpdate,
+    Transcriber, TranscriptUpdate, Utterance, VadSegment, VoiceActivityDetector,
 };
 use tokio::sync::{Notify, broadcast};
 use vad::{SileroVad, VadConfig};
@@ -73,6 +73,7 @@ async fn run_files_async(options: &PipelineOptions) -> Result<PipelineRun> {
         mode,
         Arc::clone(&metrics),
     )?;
+    let speech = Arc::new(Mutex::new(Vec::<VadSegment>::new()));
     let transcriber = if let Some(path) = &options.model {
         let mut config = AsrConfig::new(path);
         // The pipeline's VAD stage is an independent timeline producer; it does not
@@ -90,6 +91,7 @@ async fn run_files_async(options: &PipelineOptions) -> Result<PipelineRun> {
         HarnessTranscriber::Real(DrainingTranscriber::new(
             WhisperTranscriber::new(config)?,
             frame_count,
+            Arc::clone(&speech),
         ))
     } else {
         HarnessTranscriber::Noop
@@ -116,8 +118,14 @@ async fn run_files_async(options: &PipelineOptions) -> Result<PipelineRun> {
     let pipeline = Pipeline::builder(session)
         .capture(capture)
         .vad(
-            SileroVad::new(Source::Mic, VadConfig::default())?,
-            SileroVad::new(Source::System, VadConfig::default())?,
+            RecordingVad::new(
+                SileroVad::new(Source::Mic, VadConfig::default())?,
+                Arc::clone(&speech),
+            ),
+            RecordingVad::new(
+                SileroVad::new(Source::System, VadConfig::default())?,
+                Arc::clone(&speech),
+            ),
         )
         .transcriber(transcriber)
         .annotator(prosody::Annotator::default())
@@ -288,6 +296,33 @@ enum HarnessTranscriber {
     Noop,
 }
 
+struct RecordingVad {
+    inner: SileroVad,
+    speech: Arc<Mutex<Vec<VadSegment>>>,
+}
+
+impl RecordingVad {
+    fn new(inner: SileroVad, speech: Arc<Mutex<Vec<VadSegment>>>) -> Self {
+        Self { inner, speech }
+    }
+}
+
+impl VoiceActivityDetector for RecordingVad {
+    fn push(&mut self, frame: &AudioFrame) -> Option<VadSegment> {
+        let segment = self.inner.push(frame);
+        if let Some(segment) = &segment
+            && let Ok(mut speech) = self.speech.lock()
+        {
+            speech.push(segment.clone());
+        }
+        segment
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
 impl Transcriber for HarnessTranscriber {
     fn push(&mut self, frame: &AudioFrame) {
         if let Self::Real(inner) = self {
@@ -308,16 +343,59 @@ struct DrainingTranscriber {
     expected_frames: usize,
     pushed_frames: usize,
     drained: bool,
+    speech: Arc<Mutex<Vec<VadSegment>>>,
+    candidates: HashMap<(Source, Duration), Utterance>,
+    raw_updates: Vec<TranscriptUpdate>,
 }
 
 impl DrainingTranscriber {
-    fn new(inner: WhisperTranscriber, expected_frames: usize) -> Self {
+    fn new(
+        inner: WhisperTranscriber,
+        expected_frames: usize,
+        speech: Arc<Mutex<Vec<VadSegment>>>,
+    ) -> Self {
         Self {
             inner,
             expected_frames,
             pushed_frames: 0,
             drained: false,
+            speech,
+            candidates: HashMap::new(),
+            raw_updates: Vec::new(),
         }
+    }
+
+    fn revise(&mut self, updates: Vec<TranscriptUpdate>) -> Vec<TranscriptUpdate> {
+        let speech = self.speech.lock().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |segments| segments.clone(),
+        );
+        let mut revisions = Vec::new();
+        for update in updates {
+            let mut utterance = update.into_utterance();
+            let midpoint = utterance.start + utterance.end.saturating_sub(utterance.start) / 2;
+            let Some(segment) = speech
+                .iter()
+                .filter(|segment| segment.source == utterance.source && segment.end.is_some())
+                .min_by_key(|segment| segment.start.abs_diff(midpoint))
+            else {
+                continue;
+            };
+            utterance.start = segment.start;
+            if let Some(end) = segment.end {
+                utterance.end = end;
+            }
+            let key = (utterance.source, utterance.start);
+            let replace = self
+                .candidates
+                .get(&key)
+                .is_none_or(|current| word_count(&utterance.text) >= word_count(&current.text));
+            if replace {
+                self.candidates.insert(key, utterance.clone());
+            }
+            revisions.push(TranscriptUpdate::Partial(utterance));
+        }
+        revisions
     }
 }
 
@@ -328,15 +406,28 @@ impl Transcriber for DrainingTranscriber {
     }
 
     fn poll(&mut self) -> Vec<TranscriptUpdate> {
-        let mut updates = self.inner.poll();
+        self.raw_updates.extend(self.inner.poll());
         if self.drained || self.pushed_frames < self.expected_frames {
-            return updates;
+            return Vec::new();
         }
         self.drained = true;
         self.inner.drain();
-        updates.extend(self.inner.poll());
+        self.raw_updates.extend(self.inner.poll());
+        let raw_updates = std::mem::take(&mut self.raw_updates);
+        let mut updates = self.revise(raw_updates);
+        let mut finals = self
+            .candidates
+            .drain()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        finals.sort_by_key(|value| (value.start, value.source == Source::Mic));
+        updates.extend(finals.into_iter().map(TranscriptUpdate::Final));
         updates
     }
+}
+
+fn word_count(text: &str) -> usize {
+    text.split_whitespace().count()
 }
 
 struct LatencyCollector {

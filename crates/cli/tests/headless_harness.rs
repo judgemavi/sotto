@@ -15,6 +15,7 @@ mod tests {
     #[derive(Deserialize)]
     struct ExpectedUtterance {
         source: Source,
+        start_ms: u64,
         text: String,
     }
 
@@ -132,8 +133,8 @@ mod tests {
                 let realtime = run_files(&options(true))?;
                 assert_ground_truth("call-01 --realtime", &truth.transcript, &realtime.events)?;
                 assert_eq!(
-                    final_texts(&fast.events),
-                    final_texts(&realtime.events),
+                    final_signature(&fast.events),
+                    final_signature(&realtime.events),
                     "audio-time inference must not depend on fixture wall-clock pacing"
                 );
             }
@@ -170,7 +171,36 @@ mod tests {
         expected: &[ExpectedUtterance],
         events: &[sotto_core::TimelineEvent],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let actual = final_texts(events);
+        let actual = finals_by_source(events);
+        for source in [Source::Mic, Source::System] {
+            let expected_count = expected
+                .iter()
+                .filter(|value| value.source == source)
+                .count();
+            let candidates = actual.get(&source).map(Vec::as_slice).unwrap_or_default();
+            if candidates.len() < expected_count || candidates.len() > expected_count + 1 {
+                return Err(format!(
+                    "{corpus}: {:?} produced {} finals for {} expected utterances",
+                    source,
+                    candidates.len(),
+                    expected_count
+                )
+                .into());
+            }
+            for (index, left) in candidates.iter().enumerate() {
+                for right in &candidates[index + 1..] {
+                    if word_overlap(&left.text, &right.text) >= 0.75
+                        && word_overlap(&right.text, &left.text) >= 0.75
+                    {
+                        return Err(format!(
+                            "{corpus}: duplicate {:?} finals {:?} and {:?}",
+                            source, left.text, right.text
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
         let mut next = HashMap::from([(Source::Mic, 0_usize), (Source::System, 0_usize)]);
         for utterance in expected {
             let candidates = actual
@@ -181,30 +211,57 @@ mod tests {
             let Some((offset, _)) = candidates[start..]
                 .iter()
                 .enumerate()
-                .find(|(_, text)| word_overlap(&utterance.text, text) >= 0.55)
+                .find(|(_, value)| word_overlap(&utterance.text, &value.text) >= 0.55)
             else {
                 return Err(format!(
                     "{corpus}: missing ordered {:?} utterance {:?}; finals: {:?}",
-                    utterance.source, utterance.text, candidates
+                    utterance.source,
+                    utterance.text,
+                    candidates
+                        .iter()
+                        .map(|value| &value.text)
+                        .collect::<Vec<_>>()
                 )
                 .into());
             };
+            let matched = &candidates[start + offset];
+            let expected_start = std::time::Duration::from_millis(utterance.start_ms);
+            if matched.start.abs_diff(expected_start) > std::time::Duration::from_millis(1_500) {
+                return Err(format!(
+                    "{corpus}: {:?} final {:?} starts at {:?}, expected {:?}",
+                    utterance.source, matched.text, matched.start, expected_start
+                )
+                .into());
+            }
             next.insert(utterance.source, start + offset + 1);
         }
         Ok(())
     }
 
-    fn final_texts(events: &[sotto_core::TimelineEvent]) -> HashMap<Source, Vec<String>> {
-        let mut output = HashMap::<Source, Vec<String>>::new();
+    fn finals_by_source(
+        events: &[sotto_core::TimelineEvent],
+    ) -> HashMap<Source, Vec<sotto_core::Utterance>> {
+        let mut output = HashMap::<Source, Vec<sotto_core::Utterance>>::new();
         for event in events {
             if let EventPayload::UtteranceFinal(value) = event.payload() {
-                output
-                    .entry(value.source)
-                    .or_default()
-                    .push(value.text.clone());
+                output.entry(value.source).or_default().push(value.clone());
             }
         }
         output
+    }
+
+    fn final_signature(
+        events: &[sotto_core::TimelineEvent],
+    ) -> Vec<(Source, std::time::Duration, String)> {
+        events
+            .iter()
+            .filter_map(|event| match event.payload() {
+                EventPayload::UtteranceFinal(value) => {
+                    Some((value.source, value.start, value.text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn word_overlap(expected: &str, actual: &str) -> f64 {

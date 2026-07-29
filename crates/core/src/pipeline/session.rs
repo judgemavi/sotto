@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     num::NonZeroUsize,
     sync::{
         Arc, RwLock,
@@ -140,6 +140,7 @@ struct ActorState {
     ratios: [f32; 2],
     recording: RecordingState,
     unrecorded: u64,
+    active_utterances: HashMap<(Source, Duration), TimelineEvent>,
 }
 
 impl ActorState {
@@ -153,6 +154,7 @@ impl ActorState {
             ratios: [0.0; 2],
             recording: RecordingState::Recording,
             unrecorded: 0,
+            active_utterances: HashMap::new(),
         }
     }
 
@@ -162,12 +164,10 @@ impl ActorState {
         output: &tokio::sync::broadcast::Sender<TimelineEvent>,
     ) {
         let events = match message {
-            StageMessage::Payload(ts, payload) => vec![self.timeline.append(ts, payload)],
+            StageMessage::Payload(ts, payload) => vec![self.append_payload(ts, payload)],
             StageMessage::Annotated(ts, utterance, delta) => {
-                let mut events = vec![
-                    self.timeline
-                        .append(ts, EventPayload::UtteranceFinal(utterance)),
-                ];
+                let mut events =
+                    vec![self.append_payload(ts, EventPayload::UtteranceFinal(utterance))];
                 if let Some(delta) = delta {
                     events.push(self.timeline.append(ts, EventPayload::Prosody(delta)));
                 }
@@ -180,6 +180,23 @@ impl ActorState {
             }
             self.publish(event, output);
         }
+    }
+
+    fn append_payload(&mut self, ts: Duration, payload: EventPayload) -> TimelineEvent {
+        let key = match &payload {
+            EventPayload::UtterancePartial(value) | EventPayload::UtteranceFinal(value) => {
+                Some((value.source, value.start))
+            }
+            _ => None,
+        };
+        let event = key
+            .and_then(|key| self.active_utterances.get(&key))
+            .and_then(|previous| self.timeline.supersede(ts, payload.clone(), previous).ok())
+            .unwrap_or_else(|| self.timeline.append(ts, payload));
+        if let Some(key) = key {
+            self.active_utterances.insert(key, event.clone());
+        }
+        event
     }
 
     fn attempt_checkpoint(
