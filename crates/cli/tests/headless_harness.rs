@@ -1,9 +1,22 @@
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, process::Command};
+    use std::{collections::HashMap, path::Path, process::Command};
 
     use cli::{PipelineOptions, run_files};
-    use sotto_core::EventKind;
+    use serde::Deserialize;
+    use sotto_core::{EventKind, EventPayload, Source};
+
+    #[derive(Deserialize)]
+    struct GroundTruth {
+        #[serde(default)]
+        transcript: Vec<ExpectedUtterance>,
+    }
+
+    #[derive(Deserialize)]
+    struct ExpectedUtterance {
+        source: Source,
+        text: String,
+    }
 
     #[test]
     fn paired_fixture_runs_without_display_or_audio_hardware()
@@ -79,6 +92,55 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "requires SOTTO_WHISPER_MODEL and runs real on-device inference"]
+    fn real_asr_covers_ground_truth_in_order_and_pacing_modes_agree()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures");
+        let model = std::env::var_os("SOTTO_WHISPER_MODEL")
+            .ok_or("SOTTO_WHISPER_MODEL must point to ggml Whisper weights")?;
+        let corpora = [
+            ("call-01", "call-01-mic.wav", Some("call-01-sys.wav")),
+            (
+                "crosstalk",
+                "crosstalk-mic.wav",
+                Some("crosstalk-system.wav"),
+            ),
+            ("long-silence", "long-silence.wav", None),
+            (
+                "objection",
+                "objection-mic.wav",
+                Some("objection-system.wav"),
+            ),
+        ];
+
+        for (name, mic, system) in corpora {
+            let truth: GroundTruth = serde_json::from_slice(&std::fs::read(
+                root.join(format!("{name}-ground-truth.json")),
+            )?)?;
+            let options = |realtime| PipelineOptions {
+                mic: root.join(mic),
+                system: system.map(|path| root.join(path)),
+                frames: None,
+                model: Some(model.clone().into()),
+                realtime,
+            };
+            let fast = run_files(&options(false))?;
+            assert_ground_truth(name, &truth.transcript, &fast.events)?;
+
+            if name == "call-01" {
+                let realtime = run_files(&options(true))?;
+                assert_ground_truth("call-01 --realtime", &truth.transcript, &realtime.events)?;
+                assert_eq!(
+                    final_texts(&fast.events),
+                    final_texts(&realtime.events),
+                    "audio-time inference must not depend on fixture wall-clock pacing"
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn pricing_frame_contains_text_readable_by_vision() -> Result<(), Box<dyn std::error::Error>> {
@@ -101,5 +163,69 @@ mod tests {
             String::from_utf8_lossy(&output.stderr),
         );
         Ok(())
+    }
+
+    fn assert_ground_truth(
+        corpus: &str,
+        expected: &[ExpectedUtterance],
+        events: &[sotto_core::TimelineEvent],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let actual = final_texts(events);
+        let mut next = HashMap::from([(Source::Mic, 0_usize), (Source::System, 0_usize)]);
+        for utterance in expected {
+            let candidates = actual
+                .get(&utterance.source)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let start = *next.get(&utterance.source).unwrap_or(&0);
+            let Some((offset, _)) = candidates[start..]
+                .iter()
+                .enumerate()
+                .find(|(_, text)| word_overlap(&utterance.text, text) >= 0.55)
+            else {
+                return Err(format!(
+                    "{corpus}: missing ordered {:?} utterance {:?}; finals: {:?}",
+                    utterance.source, utterance.text, candidates
+                )
+                .into());
+            };
+            next.insert(utterance.source, start + offset + 1);
+        }
+        Ok(())
+    }
+
+    fn final_texts(events: &[sotto_core::TimelineEvent]) -> HashMap<Source, Vec<String>> {
+        let mut output = HashMap::<Source, Vec<String>>::new();
+        for event in events {
+            if let EventPayload::UtteranceFinal(value) = event.payload() {
+                output
+                    .entry(value.source)
+                    .or_default()
+                    .push(value.text.clone());
+            }
+        }
+        output
+    }
+
+    fn word_overlap(expected: &str, actual: &str) -> f64 {
+        let expected = words(expected);
+        let actual = words(actual);
+        if expected.is_empty() {
+            return 1.0;
+        }
+        let matched = expected.iter().filter(|word| actual.contains(word)).count();
+        matched as f64 / expected.len() as f64
+    }
+
+    fn words(text: &str) -> Vec<String> {
+        text.split_whitespace()
+            .map(|word| {
+                word.chars()
+                    .filter(|character| character.is_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>()
+            })
+            .filter(|word| !word.is_empty())
+            .collect()
     }
 }

@@ -132,6 +132,17 @@ impl WhisperTranscriber {
             Err(poisoned) => poisoned.into_inner().drain(..).collect(),
         }
     }
+
+    /// Blocks until every audio window queued before this call has been inferred.
+    ///
+    /// File-backed capture uses this at end of stream. Live callers normally rely on
+    /// cadence polling and the pipeline's producer-to-consumer shutdown instead.
+    pub fn drain(&mut self) {
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        if self.control.send(Control::Drain(done_tx)).is_ok() {
+            let _ = done_rx.recv();
+        }
+    }
 }
 
 impl Transcriber for WhisperTranscriber {
@@ -143,6 +154,10 @@ impl Transcriber for WhisperTranscriber {
             Source::Mic => self.mic.push_slice(&frame.samples),
             Source::System => self.system.push_slice(&frame.samples),
         }
+        // Wake inference from audio progress, not only wall-clock time. File-backed
+        // capture may run faster than realtime, but must exercise the same sequence of
+        // audio-time windows as a live source.
+        let _ = self.control.send(Control::AudioReady(frame.source));
     }
 
     fn poll(&mut self) -> Vec<TranscriptUpdate> {
@@ -181,6 +196,8 @@ fn duration_samples(duration: Duration) -> usize {
 }
 
 enum Control {
+    AudioReady(Source),
+    Drain(mpsc::SyncSender<()>),
     Speech(Source, SpeechState),
     Shutdown,
 }
@@ -244,6 +261,11 @@ impl Worker {
         loop {
             match self.control.recv_timeout(self.config.cadence) {
                 Ok(Control::Shutdown) => return,
+                Ok(Control::AudioReady(source)) => self.transcribe_due(source),
+                Ok(Control::Drain(done)) => {
+                    self.drain_audio();
+                    let _ = done.send(());
+                }
                 Ok(Control::Speech(source, state)) => {
                     self.stream_mut(source).speech = state == SpeechState::SpeechStart
                 }
@@ -253,6 +275,11 @@ impl Worker {
             while let Ok(control) = self.control.try_recv() {
                 match control {
                     Control::Shutdown => return,
+                    Control::AudioReady(source) => self.transcribe_due(source),
+                    Control::Drain(done) => {
+                        self.drain_audio();
+                        let _ = done.send(());
+                    }
                     Control::Speech(source, state) => {
                         self.stream_mut(source).speech = state == SpeechState::SpeechStart
                     }
@@ -274,6 +301,16 @@ impl Worker {
         }
     }
 
+    fn drain_audio(&mut self) {
+        let cadence_samples = duration_samples(self.config.cadence);
+        while self.system.consumer.available() >= cadence_samples
+            || self.mic.consumer.available() >= cadence_samples
+        {
+            self.transcribe_due(Source::System);
+            self.transcribe_due(Source::Mic);
+        }
+    }
+
     fn transcribe_due(&mut self, source: Source) {
         let gating = self.config.vad_gating;
         let window_samples = duration_samples(self.config.window);
@@ -282,7 +319,10 @@ impl Worker {
         if (gating && !stream.speech) || stream.consumer.available() < cadence_samples {
             return;
         }
-        let (fresh, _) = stream.consumer.take_latest(usize::MAX);
+        // Consume one cadence at a time. Draining the whole ring here collapses a
+        // fast fixture (or a temporarily busy live worker) into its final window and
+        // permanently skips earlier speech.
+        let fresh = stream.consumer.take_oldest(cadence_samples);
         stream.consumed_samples = stream
             .consumed_samples
             .saturating_add(u64::try_from(fresh.len()).unwrap_or(u64::MAX));

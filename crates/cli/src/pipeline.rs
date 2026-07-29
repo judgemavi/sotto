@@ -75,11 +75,18 @@ async fn run_files_async(options: &PipelineOptions) -> Result<PipelineRun> {
     )?;
     let transcriber = if let Some(path) = &options.model {
         let mut config = AsrConfig::new(path);
-        if !options.realtime {
-            config.vad_gating = false;
-            config.agreement_passes = 1;
-            config.unstable_tail = Duration::ZERO;
-        }
+        // The pipeline's VAD stage is an independent timeline producer; it does not
+        // drive Whisper's optional concrete-type gate through the object-safe trait.
+        config.vad_gating = false;
+        // Fixture pacing must not alter ASR semantics. Five-second audio windows keep
+        // complete TTS utterances together, while audio-driven wakeups make fast and
+        // realtime modes execute the identical window sequence.
+        config.agreement_passes = 1;
+        config.unstable_tail = Duration::ZERO;
+        config.cadence = Duration::from_secs(5);
+        // Offline capture is allowed to outrun inference. Retain the complete
+        // 30-second corpus while the worker advances through it in FIFO order.
+        config.ring_capacity = Duration::from_secs(60);
         HarnessTranscriber::Real(DrainingTranscriber::new(
             WhisperTranscriber::new(config)?,
             frame_count,
@@ -326,22 +333,8 @@ impl Transcriber for DrainingTranscriber {
             return updates;
         }
         self.drained = true;
-        let started = Instant::now();
-        let mut last_output = None;
-        while started.elapsed() < Duration::from_secs(180) {
-            thread::sleep(Duration::from_millis(100));
-            let next = self.inner.poll();
-            if !next.is_empty() {
-                last_output = Some(Instant::now());
-                updates.extend(next);
-            }
-            if last_output.is_some_and(|last| last.elapsed() >= Duration::from_millis(750)) {
-                break;
-            }
-            if !self.inner.poll_errors().is_empty() {
-                break;
-            }
-        }
+        self.inner.drain();
+        updates.extend(self.inner.poll());
         updates
     }
 }

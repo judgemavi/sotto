@@ -203,3 +203,85 @@ only thing standing between "the transcript looks plausible" and "the transcript
 R2 diagnosed and fixed with coverage close to ground truth, R3 asserting against the
 ground-truth files, `--realtime` and fast mode agreeing, and the reference timeline
 regenerated once the loss is fixed.
+
+## Review round 3 — coverage fixed, but it over-corrected
+
+The diagnosis was right and the two root causes are real: `take_latest` discarding queued
+audio, and a silence-timeout drain that could stop Whisper between windows. Coverage went
+from 2 finals to 9, and all five ground-truth utterances are now represented. Fast and
+realtime modes agreeing on identical ordered finals is a good guarantee to have pinned.
+
+But the reference timeline now shows the opposite failure, and the new assertion cannot
+detect it.
+
+### R4. Finals are emitted more than once for the same speech
+
+```
+ 0.0s [system] 'We need predictable pricing for the enterprise rollout.'
+ 5.0s [system] 'We need predictable pricing for the enterprise rollout.'   <- same content
+ 5.0s [   mic] 'Let me walk through the Enterprise plan.'
+10.0s [   mic] 'Let me walk through the Enterprise plan.'                  <- same content
+15.0s [   mic] 'The Migration and Support.'
+20.0s [   mic] 'The migration and support are included.'                   <- extension of it
+10.0s [system] 'The price is higher than Acme, our customers are at the price of Acme.'
+15.0s [system] 'The price is higher than acne, our current vendor.'        <- same utterance, rewritten
+```
+
+Nine finals for five utterances, with four of them repeats. This breaks the invariant T005
+documents and was approved on: *"committed audio is never placed in another inference window,
+so finals cannot retract."* A span is being committed repeatedly from successive windows.
+
+The 15s/20s pair is the clearest tell — `'The Migration and Support.'` then
+`'The migration and support are included.'` is exactly the partial-then-extended shape that
+should be **one final superseding a partial**, not two finals. And the two system variants of
+the same sentence disagree with each other, so a consumer has no basis to pick.
+
+Downstream this is not cosmetic: the board renders both, the summarizer sees the conversation
+twice, and RAG ingests duplicated account memory.
+
+### R5. `Utterance.start` is the inference window boundary, not the speech boundary
+
+```
+ground truth starts (ms): [1000, 6000, 13000, 18000, 24000]
+produced starts    (ms): [0, 0, 5000, 5000, 10000, 10000, 15000, 15000, 20000]
+```
+
+Every value is an exact 5-second multiple. Three consequences, all load-bearing:
+
+- **Prosody is computed from these timings.** Pause length, speech rate and talk-time ratio
+  are all derived from utterance boundaries, so T006's output is currently meaningless — and
+  `AGENTS.md` makes prosody-as-space a differentiator ("a long pause literally reads as a gap").
+- **The board lays out spatially by time.** Quantised starts collapse the spatial meaning the
+  canvas exists to convey.
+- **It breaks the supersede key.** T001 documents `(source, start)` as the stable key for
+  superseding a partial. If `start` is the window boundary, two distinct utterances from one
+  source inside the same window collide on that key.
+
+Carry the actual speech start through from the VAD segment or the ASR segment offset rather
+than the window origin.
+
+### R6. The ground-truth assertion cannot fail this way
+
+`assert_ordered_coverage` walks *expected* utterances and finds a final at or after a moving
+cursor with ≥55% word overlap. It never checks the reverse direction: no bound on the number
+of finals, no rejection of duplicate content, no timing comparison. Nine finals including four
+repeats pass cleanly, and so would ninety.
+
+Strengthen it to be two-directional:
+
+- every expected utterance matched, in order, per source — as now;
+- **no final duplicating another final's content** for the same source;
+- final count within a small factor of the expected count;
+- each matched final's `start` within a tolerance (~1.5 s) of the ground-truth `start_ms`,
+  which would have caught R5 immediately.
+
+Gating it behind `#[ignore]` and `SOTTO_WHISPER_MODEL` is the right call — it needs real
+weights and CI has none. Note in the task that this means **the strongest test in the project
+does not run by default**, so it has to be run deliberately before the timeline fixture is
+ever regenerated.
+
+### Re-review
+
+One final per utterance with partials superseded rather than re-committed, speech-derived
+timestamps within tolerance of ground truth, the two-directional assertion in place, and the
+reference timeline regenerated after both fixes.

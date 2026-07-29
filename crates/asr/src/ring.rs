@@ -96,6 +96,20 @@ impl RingConsumer {
         (output, skipped)
     }
 
+    pub(crate) fn take_oldest(&mut self, limit: usize) -> Vec<f32> {
+        let count = self.available().min(limit);
+        let size = self.shared.slots.len();
+        let mut read = self.shared.read.load(Ordering::Relaxed);
+        let mut output = Vec::with_capacity(count);
+        for _ in 0..count {
+            // SAFETY: producer published this slot and cannot reuse it until read advances.
+            output.push(unsafe { *self.shared.slots[read].get() });
+            read = (read + 1) % size;
+        }
+        self.shared.read.store(read, Ordering::Release);
+        output
+    }
+
     /// Test/benchmark hook for observing a bounded window without exposing storage.
     #[doc(hidden)]
     pub fn take_latest_for_test(&mut self, limit: usize) -> (Vec<f32>, usize) {
@@ -120,5 +134,13 @@ mod tests {
         let (mut producer, mut consumer) = spsc_ring(5);
         producer.push_slice(&[1.0, 2.0, 3.0, 4.0]);
         assert_eq!(consumer.take_latest(2), (vec![3.0, 4.0], 2));
+    }
+
+    #[test]
+    fn oldest_window_preserves_backlog_for_later_reads() {
+        let (mut producer, mut consumer) = spsc_ring(5);
+        producer.push_slice(&[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(consumer.take_oldest(2), vec![1.0, 2.0]);
+        assert_eq!(consumer.take_oldest(2), vec![3.0, 4.0]);
     }
 }
