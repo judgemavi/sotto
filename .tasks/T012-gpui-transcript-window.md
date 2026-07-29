@@ -1,6 +1,6 @@
 # T012 — GPUI dev window: live timeline + settings screens
 
-**Status:** blocked (on T020 verdict — T011 done)
+**Status:** todo (unblocked — GPUI retained per ADR-0003)
 
 **Wave:** 2
 

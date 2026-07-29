@@ -66,7 +66,7 @@ impl Render for Lens {
                     .push(now.saturating_duration_since(last_frame));
             }
             self.last_frame = Some(now);
-            const REPORT_SECONDS: [u64; 3] = [60, 600, 1_800];
+            const REPORT_SECONDS: [u64; 4] = [60, 600, 1_200, 1_800];
             if let Some(report_at) = REPORT_SECONDS.get(self.report_index)
                 && now.duration_since(self.started).as_secs() >= *report_at
             {
@@ -78,11 +78,12 @@ impl Render for Lens {
                     .copied()
                     .unwrap_or_default();
                 eprintln!(
-                    "T003_FRAME elapsed_s={report_at} samples={} p50_ms={:.3} p95_ms={:.3}",
+                    "T020_FRAME interval_end_s={report_at} samples={} p50_ms={:.3} p95_ms={:.3}",
                     sorted.len(),
                     p50.as_secs_f64() * 1_000.0,
                     p95.as_secs_f64() * 1_000.0
                 );
+                self.frame_intervals.clear();
                 self.report_index = self.report_index.saturating_add(1);
             }
         }

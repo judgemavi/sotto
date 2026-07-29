@@ -1157,8 +1157,10 @@ dependencies = [
  "clap",
  "core",
  "hound",
+ "insight",
  "png 0.18.1",
  "prosody",
+ "providers",
  "rag",
  "screen",
  "serde",
@@ -3623,6 +3625,19 @@ checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
  "block-padding",
  "generic-array",
+]
+
+[[package]]
+name = "insight"
+version = "0.1.0"
+dependencies = [
+ "core",
+ "futures-util",
+ "rag",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 # T017 — Post-call summarizer: structured recap from the timeline
 
-**Status:** blocked (on T007, T008, T011)
+**Status:** changes-requested (implementation approved; record the finding as ADR-0006)
 
 **Wave:** 3 — Phase 2, the note-taker dogfood gate
 
@@ -103,3 +103,53 @@ screen context at all, whether we keep maintaining Vision, and whether image con
 worth its cost and its privacy trade-off. Do not assume — `AGENTS.md` keeps images opt-in
 precisely because sending a customer's shared screen off-device is a different promise from
 sending redacted transcript text.
+
+## Review round 1 — approved, with the finding needing to be written down
+
+The summarizer is solid: `crates/insight` registered correctly (so `core` still has no path to
+`providers` and the no-key tier holds), structured recaps with `EventId` citations, 20-minute
+map-reduce windows, usage aggregation and optional cost estimates, versioned prompts under
+`prompts/summary/`, and a headless `sotto-cli summarize`. Verified fmt clean, strict clippy
+clean with `--all-features`, 72 passed / 0 failed / 7 ignored.
+
+Best test in the set: `image_mode_fails_explicitly_instead_of_sending_frame_paths_as_text`.
+Silently stringifying a `FrameRef` into a text prompt is precisely the bug that would have
+looked like working multimodal support while sending the model a filesystem path. Good instinct
+to guard it.
+
+Refusing to fabricate the image arm was right. `CompletionRequest.messages[].content` is a
+`String` — the contract is text-only, so arm three was not runnable. Reporting that plainly
+beats inventing a comparison.
+
+### R1. The screen-context finding is not recorded anywhere in the repo
+
+*"OCR provided useful supporting context; metadata alone added no recap facts"* exists only in a
+chat summary. There is no ADR, no `## Notes` on this task, nothing in the crate docs. That
+finding is the whole reason this measurement was assigned to T017: it decides whether `advisor`
+carries screen context, whether we keep maintaining Vision, and whether image context is ever
+worth its cost and privacy trade. Left in a chat message it is lost by next week.
+
+Write **ADR-0006** covering: what was compared, on what session, what each arm produced, the
+recommendation, and the confidence in it.
+
+### R2. State the confidence honestly — the evidence is thin
+
+The comparison ran against the recorded fixture: 30 seconds of TTS audio and two synthetic
+slides bearing three words each ("Sotto Product Overview", "Enterprise Pricing"). That is enough
+to show the plumbing works and to give a direction. It is not enough to conclude that OCR earns
+its tokens on real calls, where slides are dense, OCR is noisy, and the transcript already says
+most of it.
+
+So frame the recommendation as provisional, with the re-test named: **run the same three-way
+comparison on a real captured session** once one exists — which the Phase 2 gate now makes easy,
+since any two-party conversation qualifies. Until then "retain OCR" is a working assumption, not
+a settled decision, and `advisor` should not hard-wire screen context on the strength of it.
+
+Also record what "omit image context" actually rests on: **absence of capability, not absence of
+value.** Supporting it would require a multimodal shape for `CompletionRequest`, which is a
+frozen-core change and therefore its own ADR. Worth stating so a future reader does not mistake
+today's text-only contract for a considered judgement that images do not help.
+
+### Re-review
+
+ADR-0006 written, with the confidence bounded and the real-session re-test named.

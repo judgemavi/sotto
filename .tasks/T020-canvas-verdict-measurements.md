@@ -1,6 +1,6 @@
 # T020 — Close out the GPUI canvas verdict
 
-**Status:** todo
+**Status:** done (approved at review round 1)
 
 **Wave:** blocking — T012 and T016 cannot start without this verdict
 
@@ -80,3 +80,46 @@ T010 needs both pinned in CI.
 ## Out of scope
 
 Real timeline data (T012 wires that), the production board (T016), settings, tray, persistence.
+
+## Review round 1 — approved
+
+The verdict is accepted, and more importantly the *epistemics* are right. I came into this
+expecting to push back on a premature pass and did not need to.
+
+**What earned the accept.** The culling measurement is the strongest evidence in the spike:
+
+| Zoom | Accumulated | Visible |
+|---:|---:|---:|
+| 3.00x | 112,500 | 2 |
+| 1.00x | 112,500 | 4 |
+| 0.15x (min) | 112,500 | 26 |
+
+At 112,500 objects — roughly 30 minutes of appends — visible objects stay bounded by viewport
+density rather than accumulated duration. Combined with the one-minute p95 of 13.5 ms, that is
+a sound *argument* that frame time will not drift, and the ADR correctly refuses to overstate
+it: *"The test does not claim GPU behaviour."* Placement-once with `partition_point` seeking,
+one bounded mpsc drained every 16 ms through `AsyncApp::update`, `WindowKind::PopUp` giving a
+non-activating panel, and exactly one `objc2` escape hatch for click-through — all documented
+well enough for T012 and T016 to build on.
+
+**Why the unrun checks do not block the accept.** They are concentrated in the *overlay*:
+full-screen visibility, focus theft, keystroke drop, click-through, colocated GPU use. The
+overlay lens is Phase 4 work. T012 (dev window + settings) and T016 (board canvas) do not
+depend on any of it, so board work can proceed on canvas evidence while overlay behaviour
+stays open. That containment is what makes "retain GPUI" defensible rather than optimistic.
+
+Naming each unrun check, explaining that the environment had no interactive meeting call, and
+writing *"residual implementation risk, especially for focus behaviour, but not a demonstrated
+GPUI failure"* is exactly the right distinction. Fixing the harness to report non-cumulative
+intervals so the outstanding run *can* expose drift — rather than running a cumulative average
+that would hide it — is the useful thing to have done with the time.
+
+### The two residual items are now tracked, not just noted
+
+A sentence in an ADR is not a work item. Both have been added as explicit acceptance criteria
+on the tasks that actually depend on them:
+
+- **The 30-minute interval run → T016.** Board frame time at scale is the board's problem, and
+  T016 cannot ship the map tier without it.
+- **Real-call overlay checks → Phase 4's production overlay lens.** Focus theft is the one most
+  likely to fail and the one a user notices instantly.

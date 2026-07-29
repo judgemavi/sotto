@@ -11,6 +11,7 @@ members = [
     "crates/screen",
     "crates/providers",
     "crates/advisor",
+    "crates/insight",
     "crates/rag",
     "crates/mcp",
     "crates/app",

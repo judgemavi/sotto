@@ -220,6 +220,34 @@ mod tests {
     }
 
     #[test]
+    fn culling_is_measured_at_supported_zoom_extremes() {
+        let mut scene = Scene::default();
+        for index in 0..112_500 {
+            scene.append_utterance(Arc::from(format!("utterance {index}")), index % 2 == 0);
+        }
+
+        let screen_width = 1_200.0;
+        for (zoom, maximum_visible) in [(3.0, 2), (1.0, 5), (0.15, 29)] {
+            let world_width = screen_width / zoom;
+            let viewport = Viewport {
+                world: SceneRect {
+                    x: scene.frontier_x() - world_width,
+                    y: 0.0,
+                    width: world_width,
+                    height: 700.0 / zoom,
+                },
+                zoom,
+            };
+            let visible = scene.visible(viewport).count();
+            eprintln!("T020_CULL zoom={zoom:.2} accumulated=112500 visible={visible}");
+            assert!(
+                visible <= maximum_visible,
+                "visible work must remain bounded by viewport density at {zoom}x"
+            );
+        }
+    }
+
+    #[test]
     fn suggestion_streaming_preserves_anchor_and_placement() {
         let mut scene = Scene::default();
         let anchor = scene.append_utterance(Arc::from("pricing"), true);

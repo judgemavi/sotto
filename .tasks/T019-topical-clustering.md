@@ -1,6 +1,6 @@
 # T019 — Topical clustering: the second organising axis
 
-**Status:** blocked (on T017 — shares `crates/insight` and its prompt learnings)
+**Status:** todo (unblocked — crates/insight exists)
 
 **Wave:** Phase 3 — the reasoning layer
 

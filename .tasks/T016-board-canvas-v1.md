@@ -1,6 +1,6 @@
 # T016 — Board canvas v1: the timeline as a readable whiteboard
 
-**Status:** blocked (on T020 verdict, T012)
+**Status:** blocked (on T012 — GPUI retained per ADR-0003)
 
 **Wave:** 3 — Phase 2, the note-taker dogfood gate
 
@@ -108,3 +108,20 @@ you, the captured app is them.
 
 Only the advisor's validation needs real sales calls, because trigger types and battlecard
 grounding are the sales-specific parts. Do not block this gate on sales-call access.
+
+## Added acceptance criteria — inherited from T020's residual risk (2026-07-29)
+
+T020 accepted GPUI on culling evidence (112,500 accumulated objects → 2/4/26 visible by zoom)
+plus a one-minute p95 of 13.5 ms, while explicitly *not* running the long interactive test. The
+harness now reports non-cumulative frame intervals, so the measurement is possible; it just has
+not happened.
+
+Board frame time at scale is this task's problem, so it lands here:
+
+- **Frame time reported at 1, 10, 20 and 30 minutes as separate figures**, not an average — an
+  average over 30 minutes hides exactly the accumulation drift being looked for.
+- Confirmed no reflow of already-placed content across the whole run.
+- Idle CPU, append CPU, RSS and GPU measured **with a real call running on the same machine**.
+
+If long-run frame time does degrade, that reopens ADR-0003 rather than being worked around
+here — say so and stop, do not paper over it.

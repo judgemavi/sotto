@@ -20,12 +20,14 @@ clap = { version = "4.5.54", features = ["derive", "env"] }
 hound = "3.5.1"
 png = "0.18.0"
 prosody = { path = "../prosody" }
+providers = { path = "../providers" }
 rag = { path = "../rag" }
 screen = { path = "../screen" }
 serde.workspace = true
 serde_json.workspace = true
 sotto-core = { package = "core", path = "../core", features = ["serde"] }
 tokio = { workspace = true, features = ["rt", "time"] }
+insight = { path = "../insight" }
 vad = { path = "../vad" }
 
 [dev-dependencies]

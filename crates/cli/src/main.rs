@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use cli::{PipelineOptions, run_files};
+use sotto_core::SessionId;
 use sotto_core::{EventKind, TimelineEvent, replay};
 use std::{
     collections::HashSet,
@@ -76,6 +77,18 @@ enum Command {
         database: PathBuf,
         #[arg(short = 'k', long, default_value_t = 5)]
         limit: usize,
+    },
+    /// Generate a cited, structured recap from a persisted session.
+    Summarize {
+        session_id: u128,
+        #[arg(long, default_value = "sotto.sqlite3")]
+        database: PathBuf,
+        #[arg(long, default_value = "ollama")]
+        provider: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long, default_value = "ocr")]
+        screen_context: String,
     },
 }
 
@@ -180,8 +193,49 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string(&chunk)?);
             }
         }
+        Command::Summarize {
+            session_id,
+            database,
+            provider,
+            model,
+            screen_context,
+        } => {
+            let kind = parse_provider(&provider)?;
+            let key = providers::load_key(kind)?;
+            let provider = std::sync::Arc::new(providers::Provider::new(kind, model, key));
+            let store = rag::Store::open(database)?;
+            let summarizer = insight::Summarizer::new(&store, provider)
+                .with_context(parse_screen_context(&screen_context)?);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let report = runtime.block_on(summarizer.summarize(SessionId::new(session_id)))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
     }
     Ok(())
+}
+
+fn parse_provider(value: &str) -> Result<providers::ProviderKind> {
+    match value {
+        "anthropic" => Ok(providers::ProviderKind::Anthropic),
+        "openai" => Ok(providers::ProviderKind::OpenAi),
+        "google" => Ok(providers::ProviderKind::Google),
+        "openrouter" => Ok(providers::ProviderKind::OpenRouter),
+        "ollama" => Ok(providers::ProviderKind::Ollama),
+        _ => anyhow::bail!(
+            "unknown provider {value}; expected anthropic, openai, google, openrouter, or ollama"
+        ),
+    }
+}
+
+fn parse_screen_context(value: &str) -> Result<insight::ContextMode> {
+    match value {
+        "metadata" => Ok(insight::ContextMode::Metadata),
+        "ocr" => Ok(insight::ContextMode::MetadataAndOcr),
+        "images" => Ok(insight::ContextMode::MetadataAndImages),
+        _ => anyhow::bail!("unknown screen context {value}; expected metadata, ocr, or images"),
+    }
 }
 
 fn warn_run_stages(events: &[TimelineEvent], asr_configured: bool, frames_configured: bool) {
