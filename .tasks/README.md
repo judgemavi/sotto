@@ -75,15 +75,29 @@ each file, once:
 
 ## Waves
 
-| Wave | Tasks | Can run concurrently |
-|---|---|---|
-| 0 | T001 | no — blocks everything |
-| 1 | T002–T010 | yes — all nine, fully disjoint |
-| 2 | T011–T013 | yes, after their listed deps land |
+| Wave | Phase | Tasks | Notes |
+|---|---|---|---|
+| 0 | — | T001 ✅ | scaffold + frozen contracts; landed as `42af01c` |
+| 0.5 | 1 | **T014** | session timeline model — blocks every event producer |
+| 1 | 0–1 | T002, T003, T004, T005, T006, T007, T008, T009, T010, T015 | ten, fully disjoint |
+| 2 | 1 | T011, T012 | pipeline wiring + dev window |
+| 3 | 2 | T016, T017 | **the note-taker dogfood gate** |
+| 4 | 3 | T013 | advisor — gated on wave 3 passing |
 
-Wave 1 contains the two Phase 0 de-risk spikes (T003, T004). They gate architecture
-decisions but do **not** block the other wave-1 crates, which are pure-Rust and
-platform-independent. Start the spikes first anyway — they have the longest tail.
+**T014 is the current bottleneck.** The `AGENTS.md` reframe made the session timeline the
+spine of the product, and T001's frozen `PipelineEvent` cannot express it. T014 reopens
+that freeze once, deliberately, in a single owned task — then re-freezes. Every crate
+that emits or consumes events waits on it.
+
+Four wave-1 tasks are *not* blocked by T014 and can start immediately: **T002** and
+**T003** (the Phase 0 spikes — start these first regardless, they have the longest tails
+and T003's verdict gates all UI work), **T007** (providers), and **T010** (CI/signing).
+
+**Wave 3 is a gate, not a milestone to rush.** `AGENTS.md`: *"If the timeline isn't good
+enough to read, it isn't good enough to reason over."* The note-taker is an internal
+dogfood step and an explicit non-goal as a product — we use it, we never ship it. No
+advising work starts until we have used the board on real calls and agreed the timeline
+is accurate and readable.
 
 ## Reporting back
 

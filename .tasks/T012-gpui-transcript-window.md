@@ -1,4 +1,4 @@
-# T012 — GPUI dev window: live transcript + settings screens
+# T012 — GPUI dev window: live timeline + settings screens
 
 **Status:** blocked (on T003, T011)
 
@@ -6,29 +6,37 @@
 
 **Depends on:** T003 (GPUI verdict and pinned version — **do not start until the spike
 passes**; if it fails, this task is rewritten against the Electron fallback) ·
-T011 (pipeline events) · T007 (provider registry, for the settings screens)
+T011 (timeline events) · T007 (provider registry, for the settings screens)
 
-**Owns:** `crates/app/src/transcript/**`, `crates/app/src/settings/**`
+**Owns:** `crates/app/src/devwindow/**`, `crates/app/src/settings/**`
 
 ## Goal
 
 The first real GPUI code beyond the spike (`AGENTS.md` Phase 1): a dev window rendering
-the live transcript, plus the Phase 2 settings screens for keys and model selection.
-Both are grouped here because they share the tokio↔GPUI seam and the gpui-component
-widget set — splitting them would mean two agents solving the same bridging problem.
+the raw live timeline, plus the settings screens for keys and model selection. Both are
+grouped here because they share the tokio↔GPUI seam and the gpui-component widget set —
+splitting them would mean two agents solving the same bridging problem.
+
+This is deliberately **not** the board. It is the debugging view — a flat, honest,
+scrolling dump of timeline events as they arrive, which is what you want when diagnosing
+why the board looks wrong. T016 builds the spatial canvas on top of the same seam.
+
+Settings ship here rather than later because Phase 2's summarizer (T017) is BYOK and
+needs keys configurable before the note-taker gate can be dogfooded at all.
 
 ## Plan
 
-1. **The seam.** Exactly one place where pipeline events cross into GPUI entities, built
+1. **The seam.** Exactly one place where timeline events cross into GPUI entities, built
    the way T003's ADR prescribes. Everything else in the UI reads GPUI state. Keep it
    in one module and document it — `AGENTS.md` calls for a single well-defined seam and
-   this is where that promise is kept or lost.
+   this is where that promise is kept or lost. **T016's board consumes this same seam**,
+   so treat its shape as an interface, not an internal detail.
 
-2. **Transcript view.** Two-column or interleaved rendering of rep versus customer
-   turns, with prosody annotations shown inline. Partials render in a visually distinct
-   state and are replaced in place when superseded — using the `(source, start)`
-   supersede key from T001, not by appending. Auto-scroll that yields when the user
-   scrolls back.
+2. **Timeline view.** A flat chronological list of every event kind — utterances per
+   speaker with inline prosody, VAD transitions, screen snapshots, errors. Show `id`,
+   `ts` and `supersedes` so append-only behaviour is directly observable; a partial being
+   superseded should be visibly a *new event referencing an old one*, not a mutation.
+   Include a kind filter. Auto-scroll that yields when the user scrolls back.
 
 3. **Performance.** Partials arrive several times a second for a call lasting an hour.
    Virtualise the list; do not re-render the whole transcript per event. Measure frame
@@ -38,9 +46,12 @@ widget set — splitting them would mean two agents solving the same bridging pr
    - Provider/key management — add, validate (a real cheap test call), and delete keys
      per provider. Keys go to the keychain via T007; the UI never persists them itself
      and never renders them back after entry.
-    - Model selection per role (watcher vs suggester), including the Ollama
-      fully-local path with no key at all.
+    - Model selection per role (watcher, suggester, summarizer), including the Ollama
+     fully-local path with no key at all.
    - Audio device selection and a level meter per stream.
+   - Screen capture: on/off, sample rate, and the app-exclusion list from T015. Screen
+     capture sees password managers and DMs — this control is a consent feature, and it
+     must be reachable without hunting.
    - Speculation aggressiveness — `AGENTS.md` makes this a user setting because it is
      their tokens and their tradeoff. Present the cost implication honestly in the UI.
 
@@ -49,17 +60,22 @@ widget set — splitting them would mean two agents solving the same bridging pr
    from *the network is down*, using T007's error taxonomy.
 
 6. **Recording indicator.** A visible, always-present indicator whenever capture is
-   live. This is a consent feature and a core differentiator, not decoration — it
-   cannot be hidden, and no setting may disable it.
+   live — and it must now cover **screen capture as well as audio**, distinctly. A user
+   who knows their audio is recorded may not realise their screen is. This is a consent
+   feature and a core differentiator, not decoration: it cannot be hidden, and no setting
+   may disable it.
 
 ## Acceptance
 
-- Live transcript from a fixture run renders smoothly with partials superseding correctly.
-- Frame time stable over a one-hour synthetic transcript.
+- Live timeline from a fixture run renders smoothly, with supersessions visibly arriving
+  as new events rather than in-place edits.
+- Frame time stable over a one-hour synthetic session.
 - Keys round-trip through the keychain and never render back.
-- Recording indicator provably visible whenever capture is active.
+- Recording indicator provably visible whenever capture is active, distinguishing audio
+  from screen.
+- The seam is documented well enough for T016 to build the board on it without changes.
 
 ## Out of scope
 
-The production overlay panel (Phase 3), suggestion rendering (T013), tray/menubar,
-auto-updater.
+The board canvas (T016), the production overlay lens (Phase 4), suggestion rendering
+(T013), tray/menubar, auto-updater.

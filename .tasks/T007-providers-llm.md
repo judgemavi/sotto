@@ -67,7 +67,8 @@ so **cancellation is a first-class requirement**, not an afterthought.
    kind of leak that ships silently.
 
 6. **Two-tier support.** The watcher (cheap/fast, called on every partial) and the
-   suggester (larger, called on trigger) may be different providers entirely. The
+   suggester (larger, called on trigger) may be different providers entirely, as may the
+   post-call summarizer (T017). The
    registry must hold multiple configured providers simultaneously and resolve by role,
    not be a single global "current provider".
 
@@ -83,7 +84,8 @@ so **cancellation is a first-class requirement**, not an afterthought.
 
 ## Contract for downstream tasks
 
-`providers::Registry::get(Role::Watcher | Role::Suggester) -> Arc<dyn CompletionProvider>`.
+`providers::Registry::get(Role) -> Arc<dyn CompletionProvider>` with roles Watcher,
+Suggester and Summarizer — T017 needs a third role and it is cheaper to have it now.
 T012's settings UI and T013's watcher loop both build on this.
 
 ## Acceptance
@@ -98,4 +100,4 @@ T012's settings UI and T013's watcher loop both build on this.
 ## Out of scope
 
 Prompt content and assembly (T013), RAG retrieval (T008), settings UI (T012),
-tool/function calling (revisit when MCP lands in Phase 4).
+tool/function calling (revisit when MCP lands in Phase 5).

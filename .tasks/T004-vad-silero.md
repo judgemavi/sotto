@@ -1,10 +1,10 @@
 # T004 — VAD crate: Silero via ONNX Runtime
 
-**Status:** todo (unblocked — T001 approved)
+**Status:** blocked (on T014 — emits timeline events)
 
 **Wave:** 1 — fully parallel, no platform dependencies
 
-**Depends on:** T001 (`AudioFrame`, `VadSegment`, `VoiceActivityDetector`)
+**Depends on:** T001 (`AudioFrame`, `VadSegment`) · T014 (`TimelineEvent`, `EventPayload::Vad`)
 
 **Owns:** `crates/vad/**`
 

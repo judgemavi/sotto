@@ -1,10 +1,10 @@
 # T005 — ASR crate: whisper.cpp sliding-window streaming transcription
 
-**Status:** todo (unblocked — T001 approved)
+**Status:** blocked (on T014 — emits timeline events)
 
 **Wave:** 1 — fully parallel; develop against WAV fixtures, not live capture
 
-**Depends on:** T001 (`AudioFrame`, `Utterance`, `Transcriber`, `AsrError`)
+**Depends on:** T001 (`AudioFrame`, `Utterance`, `Transcriber`, `AsrError`) · T014 (`UtterancePartial` / `UtteranceFinal` variants)
 
 **Owns:** `crates/asr/**`
 
@@ -46,7 +46,7 @@ a feature, not an optimisation.
 
 6. **Model lifecycle.** Lazy load, unload when idle past a timeout (`AGENTS.md` memory
    discipline). Do **not** bundle weights — the model file path is injected, and the
-   download UI is a later Phase 3 task. Support base/small/medium selection; default to
+   download UI is a later Phase 4 task. Support base/small/medium selection; default to
    whatever hits the latency budget on Apple Silicon (likely `small.en` or `base.en`).
 
 7. **Two streams, one model.** Mic and system audio both need transcription. Decide and
@@ -74,4 +74,4 @@ supersede by `(source, start)`, and `poll()` never blocks.
 ## Out of scope
 
 Speaker diarization, punctuation post-processing beyond what Whisper emits, translation,
-the model-download UI (Phase 3), prosody annotations (T006).
+the model-download UI (Phase 4), prosody annotations (T006).

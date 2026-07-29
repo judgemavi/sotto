@@ -53,7 +53,7 @@ compiles without it.
 
 7. **Release workflow** (`.github/workflows/release.yml`) on tag: build universal or
    arm64 binary, sign, notarize, staple, produce a `.dmg` or `.zip`, attach to a GitHub
-   release. Leave a documented hook for the signed update manifest the Phase 3 updater
+   release. Leave a documented hook for the signed update manifest the Phase 4 updater
    will consume — do not build the updater here.
 
 8. **Secrets documentation** (`docs/signing.md`): every required secret, how to
@@ -62,7 +62,7 @@ compiles without it.
 
 ## Contract for downstream tasks
 
-T002 uses `scripts/sign.sh` for its soak binary. The Phase 3 updater task consumes the
+T002 uses `scripts/sign.sh` for its soak binary. The Phase 4 updater task consumes the
 release artifact format defined here.
 
 ## Acceptance
@@ -75,4 +75,4 @@ release artifact format defined here.
 
 ## Out of scope
 
-The auto-updater itself (Phase 3), Windows CI (Phase 4), release notes automation.
+The auto-updater itself (Phase 4), Windows CI (Phase 5), release notes automation.

@@ -1,4 +1,4 @@
-# T002 — Spike A: dual-stream macOS audio capture (ScreenCaptureKit + mic)
+# T002 — Spike A: dual-stream macOS audio capture + low-rate screen frames
 
 **Status:** todo (unblocked — T001 approved)
 
@@ -28,12 +28,23 @@ product does not exist. `AGENTS.md` Phase 0 gates on it.
 2. **System audio** via `SCStream` (ScreenCaptureKit) with `capturesAudio = true` and
    `excludesCurrentProcessAudio = true`. On macOS 15+ prefer
    `SCContentSharingPicker`-free programmatic config against
-   `SCShareableContent.current` displays. Capture audio only — do not attach a video
-   output; requesting frames we discard is a battery and permission cost.
+   `SCShareableContent.current` displays.
    *Note for the implementer:* macOS 14.4+ also exposes `AudioHardwareTapCreate`
-   (Core Audio taps) as an alternative to SCK for audio-only capture. If SCK proves
-   awkward (it is a screen-capture API being used for audio), evaluate the tap API and
-   record the choice as ADR-0002. Either backend must sit behind the same trait.
+   (Core Audio taps) as an alternative to SCK for audio-only capture. That tradeoff has
+   shifted — see step 2b: we now want frames from the same session, which argues for
+   staying on SCK. If you still choose taps, you own a second capture mechanism for
+   video. Record the decision as ADR-0002; either backend sits behind the same trait.
+
+2b. **Screen frames from the same session.** The `AGENTS.md` reframe makes screen context
+   a Phase 1 timeline producer, so this spike must now prove frames too: attach a video
+   output to the *same* `SCStream` and deliver a frame every ~10s. One session, one
+   permission prompt, one battery cost — a second session for video is the thing to
+   avoid. Expose frames over the FFI boundary as raw buffers with timestamps; you deliver
+   them, **T015 owns everything downstream** (change detection, OCR, storage). Agree that
+   boundary with T015 before writing the bridge.
+
+   Frame delivery must not perturb audio: audio continuity is the product-critical
+   stream, and a stalled video consumer must never stall it. Verify in the soak.
 
 3. **Mic** via `cpal` in Rust — do not route the mic through the Swift bridge unless the
    two clocks force it. Two independent devices means two independent clocks; see
@@ -59,10 +70,12 @@ product does not exist. `AGENTS.md` Phase 0 gates on it.
    Settings pane. Revocation mid-call must surface a `CaptureError`, not a silent
    dead stream.
 
-7. **Soak test.** A binary (`crates/capture/examples/soak.rs`) that captures both
-   streams to two WAV files for 60+ minutes. Verify afterwards: no dropped callback
-   ranges, no drift beyond the step-5 budget, streams aligned, files independently
-   playable and containing the expected voices. Run it against a real Zoom or Meet call.
+7. **Soak test.** A binary (`crates/capture/examples/soak.rs`) that captures both audio
+   streams to two WAV files **and frames to PNGs** for 60+ minutes. Verify afterwards: no
+   dropped callback ranges, no drift beyond the step-5 budget, streams aligned, files
+   independently playable and containing the expected voices, and frames landing at the
+   expected cadence with timestamps that line up against the audio. Run it against a real
+   Zoom or Meet call.
 
 8. **Signing.** Capture bugs on unsigned builds waste days — the soak binary must be
    signed and notarized. Coordinate with T010, which owns the CI signing pipeline;
@@ -71,18 +84,20 @@ product does not exist. `AGENTS.md` Phase 0 gates on it.
 ## Contract for downstream tasks
 
 `capture::macos::MacCapture: CaptureBackend` emitting 16 kHz mono `f32` `AudioFrame`s
-on two `Source` values. T005/T006/T007 code against the trait and their own WAV
+on two `Source` values, plus raw frames handed to T015. T005/T006/T009 code against the
+trait and their own WAV
 fixtures, so they are not blocked by this task's completion.
 
 ## Acceptance
 
-- 60-minute dual-stream soak on a real call: no dropouts, drift within budget, both
-  WAVs correct and in sync.
+- 60-minute soak on a real call: no dropouts, drift within budget, both WAVs correct and
+  in sync, and frame PNGs on disk at the expected cadence and timestamps.
+- Frame delivery demonstrably does not perturb audio continuity.
 - Permission revoked mid-call produces a `CaptureError` within one second.
 - `cargo build -p capture` works from a clean clone with only Xcode CLT + Swift installed.
 - Measured drift rate and the SCK-vs-CoreAudio-tap decision written up in ADR-0002.
 
 ## Out of scope
 
-Windows/WASAPI (Phase 4 — but keep the trait boundary honest so it drops in later),
-video frame capture, OCR.
+Windows/WASAPI (Phase 5 — but keep the trait boundary honest so it drops in later),
+OCR and everything downstream of frame delivery (T015), video *recording*.

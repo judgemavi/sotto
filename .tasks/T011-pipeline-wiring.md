@@ -1,24 +1,28 @@
 # T011 — Core pipeline: wire the conveyor belt end to end
 
-**Status:** blocked (on T004, T005, T006, T009)
+**Status:** blocked (on T004, T005, T006, T009, T014, T015)
 
 **Wave:** 2
 
-**Depends on:** T001 (bus, types) · T004 (VAD) · T005 (ASR) · T006 (prosody) ·
-T009 (FileCapture, so this is testable without hardware). T002 is **not** a blocker —
-develop against `FileCapture` and swap in real capture when it lands.
+**Depends on:** T014 (timeline model) · T004 (VAD) · T005 (ASR) · T006 (prosody) ·
+T015 (screen) · T009 (file-backed capture, so this is testable without hardware).
+T002 is **not** a blocker — develop against file capture and swap in real capture when
+it lands.
 
 **Owns:** `crates/core/src/pipeline/**`, `crates/core/tests/**`
 
-> Note: this task edits `crates/core`, which T001 froze. It may add new modules under
-> `src/pipeline/` and extend `lib.rs` exports, but must **not** change `types.rs` or
-> `traits.rs`. A needed change there stops the task and comes back to the planner.
+> Note: this task edits `crates/core`, which T014 re-froze. It may add new modules under
+> `src/pipeline/` and extend `lib.rs` exports, but must **not** change `types.rs`,
+> `traits.rs` or `timeline/`. A needed change there stops the task and comes back to the
+> planner.
 
 ## Goal
 
 Turn the independent stages into the running conveyor belt of `AGENTS.md`:
 `AudioFrame → VadSegment → PartialTranscript → Trigger → Suggestion`, where every stage
-is its own tokio task and no stage waits for the previous one to "finish".
+is its own tokio task and no stage waits for the previous one to "finish" — with every
+stage producing into the **session timeline** as the shared spine. Screen snapshots join
+the same log, which is what makes the fused audio+screen artifact the product depends on.
 
 ## Plan
 
@@ -27,10 +31,10 @@ is its own tokio task and no stage waits for the previous one to "finish".
    Stages are constructed from traits so tests substitute fakes freely.
 
    Note the deliberate split at the capture boundary: `CaptureBackend::start` takes a
-   `broadcast::Sender<AudioFrame>`, **not** the `PipelineEvent` bus, so that ~100
-   frames/s across two streams never share a channel with UI-facing events. You own the
-   bridge task that lifts `AudioFrame` into `PipelineEvent::Audio` for subscribers that
-   want it — and it is the right place to decide that the UI does not want it at all.
+   `broadcast::Sender<AudioFrame>`, **not** the timeline bus, so that ~100 frames/s across
+   two streams never share a channel with the event log. Per T014, raw audio frames are
+   **never** timeline events — they must not reach the log or SQLite. Your bridge task
+   consumes frames and emits only the derived events (VAD, utterances, prosody).
 
 2. One tokio task per stage, each subscribing upstream and publishing downstream.
    No stage ever blocks on a downstream consumer. Assert this structurally: a
@@ -53,10 +57,18 @@ is its own tokio task and no stage waits for the previous one to "finish".
    Mid-call capture errors (T002's revoked-permission case) surface as
    `PipelineEvent::Error` and pause cleanly rather than tearing down.
 
-6. **Session state.** A `CallSession` holding the annotated conversation so far,
-   talk-time ratios, and the recent window used for prompt assembly. Bounded memory —
-   a two-hour call must not grow without limit; define an eviction policy for old
-   turns (they live in RAG anyway once transcripts are persisted).
+6. **Session state.** A `CallSession` owning event-id allocation, the timeline so far,
+   talk-time ratios, and the recent window used for prompt assembly. Bounded memory — a
+   two-hour call must not grow without limit. Because the timeline is append-only and
+   persisted by T008, in-memory state is a *window* over the log, not the log itself:
+   evict old events from memory and let consumers that need history read them back from
+   SQLite. Define and document that boundary — T016's board and T017's summarizer both
+   depend on knowing what is live versus what must be loaded.
+
+6b. **Timeline persistence wiring.** Feed the event stream to T008's `append_events` on a
+   background task. A slow or failed write degrades the recording only — it must never
+   apply backpressure to the live pipeline or drop a suggestion. Surface write failures
+   as an error event so the UI can tell the user the call is not being recorded.
 
 7. Integration tests over the T009 fixtures: full run produces the expected event
    sequence; latency assertions per `AGENTS.md` ("latency assertions in CI where

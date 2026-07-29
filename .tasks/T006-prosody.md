@@ -1,10 +1,10 @@
 # T006 — Prosody crate: annotation extraction
 
-**Status:** todo (unblocked — T001 approved)
+**Status:** blocked (on T014 — emits timeline events)
 
 **Wave:** 1 — fully parallel, pure computation over timings + text
 
-**Depends on:** T001 (`Annotation`, `VadSegment`, `Utterance`)
+**Depends on:** T001 (`Annotation`, `VadSegment`, `Utterance`) · T014 (`ProsodyDelta`)
 
 **Owns:** `crates/prosody/**`
 
@@ -57,7 +57,7 @@ cost, and it is cheap to build: no ML, just measurement.
    the canonical format. Do **not** write a second renderer here.
 
    What this crate owns is *selection*: which annotations are worth attaching, in what
-   order, and a token-budget mode that drops the low-salience ones first for the Phase 2
+   order, and a token-budget mode that drops the low-salience ones first for the Phase 3
    prompt assembly. Emit the chosen `Vec<Annotation>`; let `core` render it.
 
 8. Tests: hand-built `VadSegment`/`Utterance` sequences with expected annotations.
@@ -68,7 +68,7 @@ cost, and it is cheap to build: no ML, just measurement.
 
 `prosody::Annotator::observe(&mut self, event) -> Vec<Annotation>` plus a
 budget-aware `select(&[Annotation], budget) -> Vec<Annotation>`. Prompt assembly in
-Phase 2 attaches the result to an `Utterance` and calls `core`'s
+Phase 3 attaches the result to an `Utterance` and calls `core`'s
 `Utterance::render_inline`. What you select is what the suggester model sees, so treat
 selection changes as prompt changes.
 

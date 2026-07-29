@@ -4,7 +4,9 @@
 
 ## What we are building
 
-A desktop app for sales teams that listens to live calls (any meeting app — Zoom, Meet, Teams, dialers), transcribes locally, and surfaces real-time talking points, objection responses, and battlecards grounded in the company's own materials and CRM context.
+A desktop app for sales teams that listens to live calls (any meeting app — Zoom, Meet, Teams, dialers), transcribes audio and captures screen context locally, lays the conversation out as a live visual timeline, and places talking points, objection responses, and battlecards *into* that timeline as the call unfolds — grounded in the company's own materials and CRM context.
+
+The end product is the copilot. The internal milestone on the way there is a note-taker: a fused audio+screen timeline good enough to read is the proof it's good enough to reason over. We dogfood that milestone; we do not ship it as a standalone product.
 
 Core differentiators (do not compromise these):
 
@@ -13,53 +15,92 @@ Core differentiators (do not compromise these):
 3. **Bring your own agents.** MCP client support so companies plug in their own CRM connectors / knowledge bases / agents.
 4. **Transparent by design.** NO stealth features. We are an enablement tool (Gong/Balto category), not a concealment tool (Cluely category). Never implement screen-share invisibility, capture-evasion, or anything designed to hide the app from other call participants. Consent handling is a first-class feature.
 5. **Lightweight by construction.** Sotto is a single native Rust binary. Small footprint is part of the product's identity ("local-first" should *feel* local-first) — resist dependencies and architecture choices that bloat it.
+6. **The board, not a toast.** Suggestions appear anchored in the conversation that triggered them, on a spatial canvas — not as disembodied pop-ups. Context is what makes a suggestion trustworthy.
+
+## The session timeline (core abstraction)
+
+The canonical data structure of the entire product is the **session timeline**: an append-only, timestamped, heterogeneous event log per call. Everything is a producer into it or a consumer of it.
+
+Event kinds (extend deliberately; all share `{id, session_id, ts, kind, payload}`):
+- `utterance.partial` / `utterance.final` — per speaker stream (rep = mic, customer = system audio), text + prosody annotations
+- `vad` — speech start/stop per stream
+- `prosody` — pauses, interruptions, speech rate, talk-time ratio deltas
+- `screen.snapshot` — low-rate frame reference + OCR-extracted text + active-app metadata ("Zoom fullscreen", "slide changed")
+- `trigger` — watcher-model classification (competitor mention, pricing question, objection, discovery-gap)
+- `suggestion.partial` / `suggestion.final` — advising-layer output, **anchored to the event(s) that triggered it**
+- `annotation.user` — rep's own marks/notes on the board
+
+Rules:
+- **Append-only.** Corrections (partial → final) are new events referencing the superseded id, never mutations. Layout and consumers rely on this.
+- **Both partials and finals are first-class** from day one. The note-taker milestone only needs finals; the copilot needs partials. The schema never assumes batch.
+- **Persistence:** timelines land in SQLite (same file as RAG). Past timelines are ingested into RAG — every recorded call makes future advising smarter about that account ("what did they object to last time?" is answerable for free).
+- Consumers: (a) live board UI, (b) advising layer, (c) post-call summarizer, (d) RAG ingester. All read the same spine.
+
+## UI model: the whiteboard
+
+The conversation renders as a **spatial, zoomable, live-appending canvas**:
+
+- Utterance blocks flow along the time axis, colored per speaker; prosody is visible spatially (a long pause literally reads as a gap; interruptions overlap).
+- Suggestions bud off the utterance/region that triggered them — the rep sees *why* each card exists.
+- Screen snapshots pin as thumbnails to the stretch of conversation they were visible for.
+- Topic regions may cluster (pricing discussion accumulates as a zone); unresolved objections remain visually *open* — a spatial to-do the rep can glance at.
+- After the call, the board **is** the meeting artifact: reviewing = panning a map of the conversation, not scrubbing a transcript.
+
+**Two lenses, one model:**
+- **Board lens** — the full canvas. Shines on a second monitor / large screen and for post-call review.
+- **Overlay lens** — a compact always-on-top, non-activating panel for single-screen calls. It is a *viewport onto the board's newest edge* — same data, same objects, zoomed in. Never a separate UI with separate state.
+
+**Visual calm is a hard requirement.** "Quiet by default" applies to pixels: append-only layout that never reflows what the user already saw, no jumping, new objects arrive gently at the frontier. The rep glances; the rep never *watches*. Layout is incremental and stable by construction (the append-only timeline makes this tractable — exploit it).
 
 ## Stack (decided — pure Rust)
 
 One language, one binary. No Electron, no webview, no sidecar/IPC boundary.
 
-- **UI: GPUI** (Zed's GPU-accelerated UI framework) + `gpui-component` for standard widgets (settings screens, lists, inputs).
+- **UI: GPUI** (Zed's GPU-accelerated UI framework) + `gpui-component` for standard widgets (settings screens, lists, inputs). The whiteboard canvas is the reason GPUI is the right tool: a zoomable, smoothly-scrolling, constantly-appending scene with hundreds of live objects is custom GPU-accelerated rendering — GPUI's exact strength.
   - GPUI is pre-1.0 with breaking changes between versions: **pin the exact version** in Cargo.toml, upgrade deliberately with an ADR per upgrade, never `*`.
   - Prefer the official crates.io release; fall back to a pinned git revision of the Zed repo if a needed fix isn't released. Avoid unofficial forks unless unavoidable (record as ADR).
   - When docs run out, the reference is the Zed source code — reading it is the expected workflow, not a workaround.
-- **Async runtime:** tokio for the pipeline and network. Bridge carefully to GPUI's own executor at the UI boundary (single, well-defined seam: pipeline events → UI entities).
+- **Async runtime:** tokio for the pipeline and network. Bridge carefully to GPUI's own executor at the UI boundary (single, well-defined seam: timeline events → UI entities).
 - **Audio capture** (two separate streams: mic = rep, system audio = customer):
   - macOS: ScreenCaptureKit via a small Swift bridge (static lib, FFI). Mic via `cpal` or the same bridge.
   - Windows (later): WASAPI loopback via `cpal`, Windows.Graphics.Capture via `windows` crate, behind the same capture trait.
+- **Screen capture:** same ScreenCaptureKit session, low-rate (0.1–0.2 fps or on significant change); local OCR via Apple Vision; emits `screen.snapshot` timeline events. Screen context is core to the timeline from Phase 1 — not a later add-on. Sending *images* to LLMs remains opt-in per user (cost); OCR text flows by default.
 - **VAD:** Silero via ONNX Runtime (`ort` crate), per-frame on both streams.
 - **ASR:** whisper.cpp via `whisper-rs`, Metal acceleration. Sliding-window partial transcripts: ring buffer, re-transcribe last ~10s every ~500ms, emit partials + finals.
 - **Prosody extraction:** pause lengths, interruptions, speech rate, talk-time ratio — emitted as annotations alongside transcript text.
 - **LLM provider layer:** hand-rolled abstraction over Anthropic / OpenAI / Google / OpenRouter / Ollama. `reqwest` + SSE streaming; speculative calls as tokio tasks with abort handles; prompt caching for static context. No heavy framework — this is ~500 lines we control.
-- **RAG:** `rusqlite` + sqlite-vec, embeddings via `fastembed-rs`. Battlecards, product docs, account notes, transcripts — all in one local SQLite file. Retrieval is in-process with the pipeline: zero IPC hops on the hot path.
+- **RAG:** `rusqlite` + sqlite-vec, embeddings via `fastembed-rs`. Battlecards, product docs, account notes, and past session timelines — all in one local SQLite file. Retrieval is in-process with the pipeline: zero IPC hops on the hot path.
 - **MCP client:** official Rust SDK (`rmcp`). It is younger than the TypeScript SDK — budget extra time for OAuth flows some servers need; isolate MCP behind our own trait so SDK churn doesn't leak.
 - **Key storage:** `keyring` crate → macOS Keychain / Windows Credential Manager.
 - **Auto-update:** no electron-updater equivalent exists — build a minimal updater: signed release manifest over HTTPS, download, verify signature, swap .app bundle, relaunch. Keep it boring and auditable.
-- **Screen context (later phase):** low-rate frame capture (0.1–0.2 fps or on-change) via the same ScreenCaptureKit session; local OCR via Apple Vision to extract on-screen text into RAG context; sending images to LLMs is opt-in per user (cost).
 
 ## Architecture principles
 
-- **Conveyor belt, not request/response.** Event-driven pipeline over tokio broadcast channels: `AudioFrame → VadSegment → PartialTranscript → Trigger → Suggestion`. Every stage is an independent task consuming upstream partials and emitting its own partials. No stage waits for the previous to "finish."
+- **Timeline as spine.** Every stage produces into or consumes from the session timeline. New capability = new event kind or new consumer, not new plumbing.
+- **Conveyor belt, not request/response.** Event-driven pipeline over tokio broadcast channels: `AudioFrame → VadSegment → PartialTranscript → Trigger → Suggestion`, all as timeline events. Every stage is an independent task consuming upstream partials and emitting its own partials. No stage waits for the previous to "finish."
 - **Speculative execution.** Start suggestion LLM calls on partial transcripts while the customer is still talking; cancel (abort handle) and re-fire if the final transcript changes meaning. Aggressiveness is a user setting (their tokens, their tradeoff).
 - **Two-tier models.** A cheap/fast watcher model classifies every partial ("suggestion warranted? trigger type?"); the larger model is called only on trigger, with battlecard context pre-retrieved in parallel.
-- **Quiet by default.** A copilot that fires constantly gets closed. The watcher should say "no suggestion" most of the time. Bias suggestions to fire during the *customer's* speaking turns (rep reads while listening); stay quiet during the rep's own turns.
-- **Latency budget:** pause detected → first suggestion tokens rendering within ~1s. Everything is designed backward from this.
+- **Quiet by default.** A copilot that fires constantly gets closed. The watcher should say "no suggestion" most of the time. Bias suggestions to fire during the *customer's* speaking turns (rep reads while listening); stay quiet during the rep's own turns. Visually: calm, stable, append-at-the-frontier rendering.
+- **Latency budget:** pause detected → first suggestion tokens rendering on the board within ~1s. Everything is designed backward from this.
 - **Text as the LLM payload, not audio.** Prosody is recovered via local annotations inline in the transcript, e.g. `[customer, hesitant, 2.5s pause] "sure, sounds fine"`. Audio-native realtime APIs are out of scope (cost, provider lock-in, privacy).
-- **Headless core.** The pipeline + intelligence layers compile and run without GPUI (feature flag / separate crate boundary). This gives us: a CLI test mode (WAV in → events out), CI without a display server, and a permanently open door to a different UI layer if GPUI ever becomes untenable. The UI depends on the core; the core never depends on the UI.
+- **Headless core.** Capture, pipeline, timeline, and intelligence layers compile and run without GPUI (crate boundary). This gives us: a CLI test mode (WAV in → timeline events out), CI without a display server, and a permanently open door to a different UI layer if GPUI ever becomes untenable. The UI depends on the core; the core never depends on the UI.
 
 ## Repo structure (cargo workspace)
 
 ```
-/crates/core           # pipeline orchestration, event bus, domain types
+/crates/core           # timeline model, event bus, pipeline orchestration, domain types
 /crates/capture        # capture trait + macOS impl (links Swift bridge) + future Windows impl
-/crates/capture/bridge-macos  # Swift package: ScreenCaptureKit, exposed via FFI
+/crates/capture/bridge-macos  # Swift package: ScreenCaptureKit (audio + frames), exposed via FFI
 /crates/asr            # whisper.cpp integration, ring buffer, sliding-window partials
 /crates/vad            # Silero/ONNX
 /crates/prosody        # annotation extraction
+/crates/screen         # frame sampling, Apple Vision OCR, screen.snapshot events
 /crates/providers      # LLM provider abstraction (streaming, cancellation, caching)
-/crates/rag            # rusqlite + sqlite-vec + fastembed
+/crates/advisor        # watcher/suggester loop, triggers, speculative execution
+/crates/rag            # rusqlite + sqlite-vec + fastembed; timeline persistence + ingestion
 /crates/mcp            # MCP client wrapper (isolates rmcp)
-/crates/app            # GPUI application: overlay panel, settings, tray, updater
-/crates/cli            # headless harness: WAV in → events out, bench + fixtures
+/crates/app            # GPUI application: board canvas, overlay lens, settings, tray, updater
+/crates/cli            # headless harness: WAV in → timeline events out, bench + fixtures
 /docs                  # ADRs, living version of this file
 ```
 
@@ -67,49 +108,62 @@ One language, one binary. No Electron, no webview, no sidecar/IPC boundary.
 
 ### Phase 0 — Two de-risk spikes (gating decisions, do before everything else)
 
-**Spike A — Capture (highest technical risk):** a throwaway, **signed and notarized** macOS binary that captures mic + system audio as two streams via the Swift/ScreenCaptureKit bridge for 60+ minutes without drift or dropout, and handles the Screen & System Audio Recording permission flow including detecting revoked permission and guiding re-grant. Success criterion: dual-stream WAVs on disk, correct and in sync. Set up code signing + notarization in CI **now** — capture bugs on unsigned builds waste days.
+**Spike A — Capture (highest technical risk):** a throwaway, **signed and notarized** macOS binary that captures mic + system audio as two streams (plus a low-rate screen frame every 10s) via the Swift/ScreenCaptureKit bridge for 60+ minutes without drift or dropout, and handles the Screen & System Audio Recording permission flow including detecting revoked permission and guiding re-grant. Success criterion: dual-stream WAVs + frame PNGs on disk, correct and in sync. Set up code signing + notarization in CI **now** — capture bugs on unsigned builds waste days.
 
-**Spike B — GPUI overlay (gates the UI decision):** a GPUI app that renders a small always-on-top, **non-activating** panel that (a) stays visible over full-screen Zoom/Meet, (b) never steals keyboard focus from the meeting app, (c) streams fake suggestion text token-by-token smoothly, (d) supports click-through toggling. Timebox: 5 days.
-- **Pass →** GPUI is confirmed for v1; proceed.
-- **Fail (fighting NSPanel behaviors GPUI doesn't expose) →** record an ADR and fall back to a thin Electron shell over the same headless core. The core architecture is identical either way — this spike only decides who draws pixels. Do not spend more than the timebox trying to force it.
+**Spike B — GPUI canvas (gates the UI decision):** a GPUI app proving the whiteboard is buildable:
+1. A zoomable/pannable canvas that appends fake utterance blocks continuously at 60fps for 30+ minutes (append-only layout, no reflow of existing content), with a suggestion card streaming token-by-token anchored to a block.
+2. The same content presented through a compact always-on-top, **non-activating** overlay window that (a) stays visible over full-screen Zoom/Meet, (b) never steals keyboard focus, (c) supports click-through toggling.
+Timebox: 7 days.
+- **Pass →** GPUI is confirmed; proceed.
+- **Fail (canvas perf or NSPanel behaviors GPUI doesn't expose) →** record an ADR and fall back to a thin Electron shell (canvas via WebGL/2D) over the same headless core. The core is identical either way — this spike only decides who draws pixels. Do not exceed the timebox.
 
-### Phase 1 — Pipeline core (headless)
-- `core` + `capture` + `vad` + `asr` + `prosody`: ring buffers, sliding-window partials, annotations, broadcast-channel event bus
-- `cli` harness: WAV fixtures in → transcript events out; latency measurements; CI integration tests
-- Minimal GPUI dev window rendering the raw live transcript (first real GPUI code beyond the spike)
+### Phase 1 — Pipeline core (headless) + timeline
+- `core`: timeline model (event kinds, append-only semantics, supersede references), broadcast-channel bus, SQLite persistence
+- `capture` + `vad` + `asr` + `prosody` + `screen`: ring buffers, sliding-window partials, annotations, OCR snapshots — all emitting timeline events
+- `cli` harness: WAV (+ frame fixtures) in → timeline events out; latency measurements; CI integration tests
+- Minimal GPUI dev window rendering the raw live timeline (first real GPUI code beyond the spike)
 
-### Phase 2 — Intelligence loop
+### Phase 2 — Internal note-taker milestone (dogfood gate — NOT shipped)
+- Board canvas v1: utterance blocks per speaker, prosody-as-space, screen thumbnails pinned to their interval
+- Post-call summarizer consumer (BYOK LLM) producing a structured recap from the timeline
+- Timeline → RAG ingestion (past calls become retrievable account memory)
+- **Gate:** record real calls; the fused timeline must be accurate and *readable* before any advising work begins. If the timeline isn't good enough to read, it isn't good enough to reason over — fix it here.
+
+### Phase 3 — Intelligence loop
 - `providers`: streaming + cancellation + keychain storage; GPUI settings screens for keys/model selection (use gpui-component)
-- Two-tier watcher/suggester loop with speculative calls
-- `rag`: battlecard/doc ingestion, sqlite-vec retrieval, prompt assembly with cached static prefix
-- Trigger types v1: competitor mention, pricing question, objection, discovery-gap
+- `advisor`: two-tier watcher/suggester loop with speculative calls; trigger types v1: competitor mention, pricing question, objection, discovery-gap
+- `rag`: battlecard/doc ingestion, sqlite-vec retrieval (docs + past timelines), prompt assembly with cached static prefix
+- Suggestions land on the board anchored to their triggering events; overlay lens shows the board's newest edge
 
-### Phase 3 — Product shell
-- Production overlay panel (from Spike B learnings): suggestion streaming UI, suggestion history, tray/menubar presence
+### Phase 4 — Product shell
+- Production overlay lens (from Spike B learnings), suggestion history, open-objection tracking, tray/menubar presence
 - Consent features: visible recording indicator, per-call on/off, configurable consent notice
 - Whisper model download on first run (do not bundle weights in installer) with integrity checks and progress UI
 - Minimal auto-updater (signed manifest → verify → swap → relaunch)
 
-### Phase 4 — Openness
+### Phase 5 — Openness
 - `mcp`: user-configured servers feed context into the suggestion prompt
-- Screen context via OCR (opt-in)
-- Windows: capture-trait implementation (WASAPI + Windows.Graphics.Capture); GPUI Windows support to be re-evaluated at that time
+- Opt-in image context to LLMs (screen frames, not just OCR text)
+- Windows: capture-trait implementation (WASAPI + Windows.Graphics.Capture); GPUI Windows support re-evaluated at that time
 
 ## Engineering conventions
 
 - Rust stable (latest, as GPUI requires), clippy-clean, `#![deny(warnings)]` in CI; no `unwrap()`/`expect()` outside tests and startup.
 - GPUI version pinned exactly; upgrades are deliberate PRs with an ADR noting breaking-change fallout.
 - Every pipeline stage gets unit tests; the headless core gets integration tests against WAV fixtures; latency assertions in CI where feasible.
+- Timeline schema changes are ADR-worthy: consumers depend on append-only semantics and event-kind stability.
 - ADRs in /docs for any deviation from decisions in this file.
-- Memory discipline: Whisper model loads lazily, unloads when idle. We share the machine with Zoom — profile regularly; the small-footprint claim is a feature.
+- Memory discipline: Whisper model loads lazily, unloads when idle. We share the machine with Zoom — profile regularly; the small-footprint claim is a feature. Screen frames are sampled, referenced, and pruned — never accumulate raw video.
 - The core must always build and run headless (`cli` crate is the proof and stays green in CI).
 
 ## Explicit non-goals (v1)
 
+- No standalone note-taker product — the note-taker is an internal milestone and dogfood gate only
 - No cloud backend, no accounts, no telemetry beyond opt-in crash reports
 - No meeting bots that join calls
 - No stealth/undetectability features — ever (see Core differentiators #4)
 - No audio-native LLM streaming
+- No freeform infinite-whiteboard editing (Miro-style) — the board is conversation-generated with light user annotation, not a drawing tool
 - No mobile app (if a companion app happens later, it talks to exported data, not the core)
 - No Windows in v1 (capture stays behind a platform trait; GPUI Windows maturity re-checked then)
 - No web version

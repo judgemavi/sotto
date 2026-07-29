@@ -1,10 +1,10 @@
 # T008 — RAG crate: sqlite-vec + fastembed local retrieval
 
-**Status:** todo (unblocked — T001 approved)
+**Status:** blocked (on T014 — emits timeline events)
 
 **Wave:** 1 — fully parallel
 
-**Depends on:** T001 (`Retriever`, `Chunk`, `RagError`)
+**Depends on:** T001 (`Retriever`, `Chunk`, `RagError`) · T014 (timeline SQLite schema)
 
 **Owns:** `crates/rag/**`
 
@@ -27,9 +27,28 @@ than the watcher model" — a few tens of milliseconds, not hundreds.
    - `documents` (id, kind, title, source_path, ingested_at, content_hash)
    - `chunks` (id, doc_id, ordinal, text, token_count, metadata JSON)
    - `vec_chunks` — sqlite-vec virtual table over the embedding
-   - `accounts` / `calls` — so account notes and past transcripts can scope retrieval
-   `kind` covers battlecard, product doc, account note, transcript. Battlecards are the
-   highest-value kind and may warrant retrieval boosting; leave a hook for it.
+   - `accounts` — so account notes and past calls can scope retrieval
+   - `sessions` / `events` — **the timeline tables, defined by T014.** Implement them
+     exactly as specified there; core owns the shape, you own the I/O.
+   `kind` covers battlecard, product doc, account note, and past-call recap. Battlecards
+   are the highest-value kind and may warrant retrieval boosting; leave a hook for it.
+
+2b. **Timeline persistence.** You own writing timeline events to SQLite and reading them
+   back. Two hard requirements from `AGENTS.md`:
+   - **Append-only on disk too.** Events are inserted, never updated; a correction is a
+     new row with `supersedes` set. No `UPDATE` on the events table.
+   - **Writes must never stall the live pipeline.** A call is in progress while you are
+     writing. Batch inserts on a background task off the hot path, and make a slow or
+     failed write degrade the recording, never the call.
+   Provide `load_session(session_id) -> Vec<TimelineEvent>` in timeline order — T016's
+   board replays it and asserts it reproduces the live board exactly.
+
+2c. **Past timelines become account memory.** `AGENTS.md`: *"every recorded call makes
+   future advising smarter about that account."* Ingest finished sessions into the vector
+   index — chunk by topic window rather than by raw utterance, since a single line out of
+   context retrieves badly. Scope chunks by account so *"what did they object to last
+   time?"* is answerable. T017's recaps ingest the same way and are probably the better
+   retrieval unit; support both and note which retrieves better.
 
 3. **Ingestion.** Plain text and Markdown first; PDF and DOCX only if a light pure-Rust
    crate exists — do not pull a heavyweight parser into a binary that claims to be
@@ -64,9 +83,10 @@ than the watcher model" — a few tens of milliseconds, not hundreds.
 
 ## Contract for downstream tasks
 
-`rag::Store::open(path)` → `Retriever` impl, plus `ingest(path_or_text, kind, metadata)`.
-T013 assembles prompts from `Chunk`s; `Chunk` carries enough metadata to cite a source
-in `Suggestion::citations`.
+`rag::Store::open(path)` → `Retriever` impl, plus `ingest(path_or_text, kind, metadata)`,
+`append_events(&[TimelineEvent])` and `load_session(session_id)`. T013 assembles prompts
+from `Chunk`s; `Chunk` carries enough metadata to cite a source in
+`Suggestion::citations`. T016 and T017 both read timelines back through you.
 
 ## Acceptance
 
@@ -74,8 +94,11 @@ in `Suggestion::citations`.
 - Hybrid retrieval measurably better than dense-only on competitor-name queries.
 - Re-ingesting unchanged documents does no embedding work.
 - Migration test proves an existing DB survives a schema bump.
+- A persisted session round-trips: `append_events` then `load_session` returns an
+  identical, identically-ordered event log including supersede chains.
+- Sustained event writes during a simulated live call do not stall the pipeline.
 
 ## Out of scope
 
-Prompt assembly (T013), MCP-sourced context (Phase 4), cloud sync (explicit non-goal),
-the ingestion UI (Phase 3).
+Prompt assembly (T013), MCP-sourced context (Phase 5), cloud sync (explicit non-goal),
+the ingestion UI (Phase 4).
