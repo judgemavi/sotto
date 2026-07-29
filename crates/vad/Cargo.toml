@@ -8,3 +8,14 @@ license.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+ndarray = "0.16.1"
+ort = { version = "=2.0.0-rc.10", features = ["download-binaries", "ndarray"] }
+sotto-core = { package = "core", path = "../core" }
+
+[dev-dependencies]
+criterion = "0.7.0"
+
+[[bench]]
+name = "push"
+harness = false

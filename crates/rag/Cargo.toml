@@ -8,3 +8,10 @@ license.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+fastembed = { version = "5.2.0", default-features = false, features = ["ort-download-binaries", "hf-hub-native-tls"] }
+rusqlite = { version = "0.37.0", features = ["bundled", "serde_json"] }
+serde.workspace = true
+serde_json.workspace = true
+sqlite-vec = "0.1.6"
+sotto_core = { package = "core", path = "../core", features = ["serde"] }

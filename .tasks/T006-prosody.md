@@ -1,6 +1,6 @@
 # T006 — Prosody crate: annotation extraction
 
-**Status:** todo (unblocked — T014 frozen)
+**Status:** done (approved at review round 1)
 
 **Wave:** 1 — fully parallel, pure computation over timings + text
 
@@ -83,3 +83,12 @@ selection changes as prompt changes.
 ## Out of scope
 
 Emotion classification, ML-based prosody models, anything requiring a network call.
+
+## Review round 1 — approved
+
+8 tests in `tests/annotator.rs` covering the adversarial cases the brief asked for. Echo
+suppression is present via a configurable `echo_overlap_ratio` rather than a hardcoded
+guess, and the drift-correction hook is in place — the module doc correctly notes it lets a
+measured correction land later "without changing event data or algorithms", which is
+precisely the tolerance T002's deferred soak requires. Renderer ownership respected: no
+second renderer, selection only.

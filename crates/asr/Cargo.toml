@@ -8,3 +8,7 @@ license.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+sotto_core = { package = "core", path = "../core" }
+tracing.workspace = true
+whisper-rs = { version = "0.15.1", features = ["metal"] }

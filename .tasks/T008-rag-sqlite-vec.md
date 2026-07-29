@@ -1,6 +1,6 @@
 # T008 — RAG crate: sqlite-vec + fastembed local retrieval
 
-**Status:** todo (unblocked — T014 frozen)
+**Status:** changes-requested (review round 1)
 
 **Wave:** 1 — fully parallel
 
@@ -102,3 +102,65 @@ from `Chunk`s; `Chunk` carries enough metadata to cite a source in
 
 Prompt assembly (T013), MCP-sourced context (Phase 5), cloud sync (explicit non-goal),
 the ingestion UI (Phase 4).
+
+## Review round 1 — changes requested
+
+The persistence half is right. `SQLITE_SCHEMA` is applied exactly as `core` defines it,
+`PRAGMA foreign_keys = ON` and WAL are set per connection, `append_events` is INSERT-only
+in a single transaction so duplicate identities fail rather than mutating the log, and both
+tests are well chosen — `every_connection_enforces_foreign_keys` in particular guards the
+exact footgun the schema comment warns about.
+
+Two things to fix.
+
+### R1. One mutex serializes reads against writes, on the hot path
+
+```rust
+pub struct Store {
+    connection: Mutex<Connection>,
+    ...
+}
+```
+
+Every operation takes the same lock — `append_events`, `ingest`, `search`, `load_session`.
+WAL mode exists precisely so readers and a writer can proceed concurrently, and this mutex
+throws that away.
+
+The failure is concrete and only appears live: during a call, T011 appends timeline events
+continuously while the advisor runs retrieval against a ~50 ms budget. A batched append
+transaction — or worse, an ingest holding the lock through an embedding batch — blocks
+retrieval for its full duration. Two requirements in this brief say that must not happen:
+*"Ingestion must not block reads — retrieval is on the hot path and a background ingest must
+never stall a live call"* and *"Writes must never stall the live pipeline."*
+
+Separate the read path from the write path — a dedicated write connection plus one or more
+read connections, or a small pool. SQLite in WAL mode supports exactly this; the Rust side
+just has to stop preventing it.
+
+Also document on `append_events` that it blocks and must be called off the live path.
+Nothing in the current signature or docs tells T011 that, and the natural reading of a
+plain synchronous method is that it is cheap.
+
+### R2. Four of six acceptance criteria are untested
+
+Two tests for 560 lines, both covering timeline persistence. The retrieval half — which is
+most of the crate — has none. Still unverified:
+
+- hybrid retrieval measurably better than dense-only on competitor-name queries (the
+  specific reason hybrid was required at all);
+- re-ingesting unchanged documents does no embedding work (`content_hash` path);
+- migration from an older schema preserves existing data;
+- query embed + hybrid search under ~50 ms on the fixture corpus.
+
+The first two are cheap and catch real regressions. The migration test matters most in the
+long run: users will have real timelines in this file and the schema *will* change.
+
+### Note
+
+`crates/rag/tests/persistence.rs` wraps its tests in `#[cfg(test)]`. That works, but the
+documented house idiom for integration files is the `#![expect(clippy::tests_outside_test_module, reason = "...")]`
+header in `.tasks/README.md` — worth matching so the codebase reads consistently.
+
+### Re-review
+
+R1 and R2 addressed, existing tests still green.

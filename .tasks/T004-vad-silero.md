@@ -1,6 +1,6 @@
 # T004 — VAD crate: Silero via ONNX Runtime
 
-**Status:** todo (unblocked — T014 frozen)
+**Status:** done (approved at review round 1)
 
 **Wave:** 1 — fully parallel, no platform dependencies
 
@@ -68,3 +68,15 @@ Consumers (T011 pipeline wiring) rely on `SpeechEnd` being emitted at most
 
 Speaker diarization (we get speaker identity for free from stream separation — mic is
 the rep, system is the customer), noise suppression, ASR.
+
+## Review round 1 — approved
+
+Real Silero v5.1 bundled (2.3 MiB `silero_vad_v5.1.onnx`, `include_bytes!`) with the
+upstream URL and version recorded in the module docs — exactly the provenance this needed,
+and it means VAD works on a clean clone with no download step. Per-`Source` instances,
+configurable hysteresis, steady-state push benchmark. Verified clean under strict clippy;
+3 tests.
+
+Three tests is lean for the crate, but the logic is mechanical and the hysteresis
+thresholds are the part that will actually need tuning against real audio rather than more
+unit tests. Revisit when T009's fixture corpus exists.

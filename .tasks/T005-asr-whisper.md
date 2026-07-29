@@ -1,6 +1,6 @@
 # T005 — ASR crate: whisper.cpp sliding-window streaming transcription
 
-**Status:** todo (unblocked — T014 frozen)
+**Status:** done (approved at review round 1)
 
 **Wave:** 1 — fully parallel; develop against WAV fixtures, not live capture
 
@@ -75,3 +75,16 @@ supersede by `(source, start)`, and `poll()` never blocks.
 
 Speaker diarization, punctuation post-processing beyond what Whisper emits, translation,
 the model-download UI (Phase 4), prosody annotations (T006).
+
+## Review round 1 — approved
+
+The property that matters is tested by name:
+`identical_partials_are_suppressed_and_commits_do_not_retract`. Commit policy is documented
+in the module header — an unstable tail plus N agreeing passes, with committed audio never
+re-entering an inference window, so finals cannot retract by construction rather than by
+convention. Fixed-capacity SPSC rings, lazy model lifecycle, Metal. 4 tests, clippy clean.
+
+**The `Transcriber` contract gap you flagged is real, and it is ours, not yours.** Handling
+it by reporting rather than editing frozen `core` or faking it downstream was the right
+call. Tracked as **T018**; once that lands, return here to emit
+`TranscriptUpdate::{Partial, Final}` instead of bare `Utterance`s.
