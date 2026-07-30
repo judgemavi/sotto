@@ -1,7 +1,7 @@
 //! macOS ScreenCaptureKit system-audio/frame capture plus a CPAL microphone.
 
 use std::{
-    ffi::{c_float, c_int, c_uchar, c_void},
+    ffi::{CStr, c_char, c_float, c_int, c_uchar, c_void},
     slice,
     sync::{
         Arc,
@@ -13,8 +13,10 @@ use std::{
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_queue::ArrayQueue;
-use sotto_core::{AudioFrame, CaptureBackend, CaptureError, PermissionStatus, Source};
-use tokio::sync::broadcast;
+use sotto_core::{
+    AudioFrame, CaptureBackend, CaptureError, CaptureTarget, PermissionStatus, Source, TargetKind,
+};
+use tokio::sync::{broadcast, oneshot};
 
 const OUTPUT_RATE: u32 = 16_000;
 const FRAME_POOL_SIZE: usize = 3;
@@ -26,6 +28,15 @@ type AudioCallback = unsafe extern "C" fn(*mut c_void, *const c_float, usize, u6
 type ErrorCallback = unsafe extern "C" fn(*mut c_void, c_int);
 type FrameCallback =
     unsafe extern "C" fn(*mut c_void, *const c_uchar, usize, u32, u32, u32, u32, u64, u64);
+type TargetCallback = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    *const c_char,
+    *const c_char,
+    *const c_char,
+    c_int,
+    bool,
+);
 
 #[repr(C)]
 struct BridgeConfig {
@@ -36,12 +47,46 @@ struct BridgeConfig {
 }
 
 unsafe extern "C" {
-    fn sotto_capture_start(config: *const BridgeConfig) -> *mut c_void;
+    fn sotto_capture_pick_target(callback: TargetCallback, context: *mut c_void);
+    fn sotto_capture_release_target(target: *mut c_void);
+    fn sotto_capture_start_with_target(
+        config: *const BridgeConfig,
+        target: *mut c_void,
+    ) -> *mut c_void;
     fn sotto_capture_stop(handle: *mut c_void);
     fn sotto_capture_permission_status() -> c_int;
     fn sotto_capture_request_permission() -> bool;
     fn sotto_capture_open_permission_settings() -> bool;
 }
+
+/// A picker-produced ScreenCaptureKit filter and its user-visible description.
+///
+/// The opaque native filter cannot be constructed by Rust. Owning this value is
+/// therefore the capability required to start a scoped capture.
+#[derive(Debug)]
+pub struct PickedTarget {
+    handle: *mut c_void,
+    description: CaptureTarget,
+}
+
+// SAFETY: Swift retains an immutable SCContentFilter behind the opaque handle.
+unsafe impl Send for PickedTarget {}
+
+impl PickedTarget {
+    #[must_use]
+    pub const fn description(&self) -> &CaptureTarget {
+        &self.description
+    }
+}
+
+impl Drop for PickedTarget {
+    fn drop(&mut self) {
+        // SAFETY: this is the sole Rust owner of the retained picker handle.
+        unsafe { sotto_capture_release_target(self.handle) };
+    }
+}
+
+struct TargetCallbackState(Option<oneshot::Sender<Option<PickedTarget>>>);
 
 /// An owned BGRA frame copied out of the callback-scoped CoreVideo buffer.
 #[derive(Debug)]
@@ -92,6 +137,8 @@ pub enum CaptureStatus {
     Running,
     Stopping,
     Failed,
+    /// The picker-selected window/application/display ceased to exist.
+    TargetEnded,
 }
 
 impl CaptureStatus {
@@ -102,6 +149,7 @@ impl CaptureStatus {
             Self::Running => 2,
             Self::Stopping => 3,
             Self::Failed => 4,
+            Self::TargetEnded => 5,
         }
     }
 
@@ -111,6 +159,7 @@ impl CaptureStatus {
             2 => Self::Running,
             3 => Self::Stopping,
             4 => Self::Failed,
+            5 => Self::TargetEnded,
             _ => Self::Stopped,
         }
     }
@@ -191,6 +240,16 @@ impl MacCapture {
     #[must_use]
     pub fn dropped_frame_count(&self) -> u64 {
         self.dropped_frames.load(Ordering::Relaxed)
+    }
+
+    /// Presents the system content picker. Cancellation returns `None` and does
+    /// not alter capture lifecycle state.
+    pub async fn pick_target() -> Option<PickedTarget> {
+        let (sender, receiver) = oneshot::channel();
+        let state = Box::into_raw(Box::new(TargetCallbackState(Some(sender))));
+        // SAFETY: the callback reclaims `state`; the bridge invokes it exactly once.
+        unsafe { sotto_capture_pick_target(target_callback, state.cast()) };
+        receiver.await.ok().flatten()
     }
 
     /// Prompts for Screen & System Audio Recording access.
@@ -276,6 +335,28 @@ impl MacCapture {
         self.mic_stream = Some(stream);
         Ok(())
     }
+
+    /// Starts capture using exactly the filter returned by the system picker.
+    pub fn start_with_target(
+        &mut self,
+        target: &PickedTarget,
+        sink: broadcast::Sender<AudioFrame>,
+    ) -> Result<(), CaptureError> {
+        self.start_scoped(target, sink)
+    }
+
+    fn start_scoped(
+        &mut self,
+        target: &PickedTarget,
+        sink: broadcast::Sender<AudioFrame>,
+    ) -> Result<(), CaptureError> {
+        if target.handle.is_null() {
+            return Err(CaptureError::StreamFailed(
+                "selected capture target is no longer available".to_owned(),
+            ));
+        }
+        self.start_inner(target, sink)
+    }
 }
 
 impl Default for MacCapture {
@@ -286,6 +367,31 @@ impl Default for MacCapture {
 
 impl CaptureBackend for MacCapture {
     fn start(&mut self, sink: broadcast::Sender<AudioFrame>) -> Result<(), CaptureError> {
+        drop(sink);
+        Err(CaptureError::Unsupported(
+            "macOS capture requires a target returned by MacCapture::pick_target".to_owned(),
+        ))
+    }
+
+    fn stop(&mut self) {
+        self.stop_inner();
+    }
+
+    fn permission_status(&self) -> PermissionStatus {
+        // SAFETY: no arguments or retained pointers cross this C ABI call.
+        match unsafe { sotto_capture_permission_status() } {
+            1 => PermissionStatus::Authorized,
+            _ => PermissionStatus::Denied,
+        }
+    }
+}
+
+impl MacCapture {
+    fn start_inner(
+        &mut self,
+        target: &PickedTarget,
+        sink: broadcast::Sender<AudioFrame>,
+    ) -> Result<(), CaptureError> {
         if self.status() != CaptureStatus::Stopped {
             return Err(CaptureError::StreamFailed(
                 "capture is already active".to_owned(),
@@ -360,7 +466,7 @@ impl CaptureBackend for MacCapture {
             context: state_ptr.cast(),
         };
         // SAFETY: config is read synchronously and state remains boxed until stop.
-        let handle = unsafe { sotto_capture_start(&raw const config) };
+        let handle = unsafe { sotto_capture_start_with_target(&raw const config, target.handle) };
         if handle.is_null() {
             // SAFETY: the bridge rejected the config synchronously and cannot retain the context.
             unsafe { drop(Box::from_raw(state_ptr)) };
@@ -378,12 +484,12 @@ impl CaptureBackend for MacCapture {
         Ok(())
     }
 
-    fn stop(&mut self) {
+    fn stop_inner(&mut self) {
         if !self.handle.is_null() {
             self.status
                 .store(CaptureStatus::Stopping.code(), Ordering::Release);
             let _ = self.status_tx.send(CaptureStatus::Stopping);
-            // SAFETY: the handle came from sotto_capture_start and is consumed once.
+            // SAFETY: the handle came from sotto_capture_start_with_target and is consumed once.
             unsafe { sotto_capture_stop(self.handle) };
             self.handle = std::ptr::null_mut();
         }
@@ -391,20 +497,75 @@ impl CaptureBackend for MacCapture {
         // The stopped callback owns context reclamation and terminates the audio worker.
         let _ = self.audio_worker.take();
     }
-
-    fn permission_status(&self) -> PermissionStatus {
-        // SAFETY: no arguments or retained pointers cross this C ABI call.
-        match unsafe { sotto_capture_permission_status() } {
-            1 => PermissionStatus::Authorized,
-            _ => PermissionStatus::Denied,
-        }
-    }
 }
 
 impl Drop for MacCapture {
     fn drop(&mut self) {
-        self.stop();
+        self.stop_inner();
     }
+}
+
+unsafe extern "C" fn target_callback(
+    context: *mut c_void,
+    handle: *mut c_void,
+    bundle_id: *const c_char,
+    display_name: *const c_char,
+    window_title: *const c_char,
+    kind: c_int,
+    audio_scoped: bool,
+) {
+    if context.is_null() {
+        if !handle.is_null() {
+            // SAFETY: without callback state there is no Rust owner for this retained handle.
+            unsafe { sotto_capture_release_target(handle) };
+        }
+        return;
+    }
+    // SAFETY: bridge calls exactly once with the Box pointer supplied to pick_target.
+    let mut state = unsafe { Box::from_raw(context.cast::<TargetCallbackState>()) };
+    let picked = if handle.is_null() {
+        None
+    } else {
+        let kind = match kind {
+            1 => TargetKind::Application,
+            2 => TargetKind::Window,
+            3 => TargetKind::Display,
+            _ => {
+                // SAFETY: an unknown kind cannot be represented truthfully, so release it.
+                unsafe { sotto_capture_release_target(handle) };
+                if let Some(sender) = state.0.take() {
+                    let _ = sender.send(None);
+                }
+                return;
+            }
+        };
+        Some(PickedTarget {
+            handle,
+            description: CaptureTarget {
+                bundle_id: copy_callback_string(bundle_id),
+                display_name: copy_callback_string(display_name)
+                    .unwrap_or_else(|| "Selected target".to_owned()),
+                window_title: copy_callback_string(window_title),
+                kind,
+                audio_scoped,
+            },
+        })
+    };
+    if let Some(sender) = state.0.take() {
+        let _ = sender.send(picked);
+    }
+}
+
+fn copy_callback_string(pointer: *const c_char) -> Option<String> {
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: Swift supplies a callback-scoped, NUL-terminated UTF-8 string.
+    Some(
+        unsafe { CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn queue_audio(
@@ -607,6 +768,7 @@ unsafe extern "C" fn error_callback(context: *mut c_void, code: c_int) {
             unsafe { drop(Box::from_raw(context.cast::<CallbackState>())) };
         }
         -3 => {
+            state.running.store(false, Ordering::Release);
             state
                 .status
                 .store(CaptureStatus::Failed.code(), Ordering::Release);
@@ -614,6 +776,7 @@ unsafe extern "C" fn error_callback(context: *mut c_void, code: c_int) {
             let _ = state.error_sink.send(CaptureError::PermissionRevoked);
         }
         -4 => {
+            state.running.store(false, Ordering::Release);
             state
                 .status
                 .store(CaptureStatus::Failed.code(), Ordering::Release);
@@ -622,7 +785,18 @@ unsafe extern "C" fn error_callback(context: *mut c_void, code: c_int) {
                 status: PermissionStatus::Denied,
             });
         }
+        -5 => {
+            state.running.store(false, Ordering::Release);
+            state
+                .status
+                .store(CaptureStatus::TargetEnded.code(), Ordering::Release);
+            let _ = state.status_sink.send(CaptureStatus::TargetEnded);
+            let _ = state.error_sink.send(CaptureError::StreamFailed(
+                "selected capture target disappeared".to_owned(),
+            ));
+        }
         _ => {
+            state.running.store(false, Ordering::Release);
             state
                 .status
                 .store(CaptureStatus::Failed.code(), Ordering::Release);
@@ -684,6 +858,7 @@ mod tests {
             CaptureStatus::Running,
             CaptureStatus::Stopping,
             CaptureStatus::Failed,
+            CaptureStatus::TargetEnded,
         ] {
             assert_eq!(
                 CaptureStatus::from_code(status.code()),

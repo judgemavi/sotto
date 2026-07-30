@@ -198,7 +198,11 @@ impl Store {
             [id.get().to_string()], |row| {
                 let kind: String = row.get(5)?;
                 let target = CaptureTarget { bundle_id: row.get(2)?, display_name: row.get(3)?,
-                    window_title: row.get(4)?, kind: if kind == "application" { TargetKind::Application } else { TargetKind::Window },
+                    window_title: row.get(4)?, kind: match kind.as_str() {
+                        "application" => TargetKind::Application,
+                        "display" => TargetKind::Display,
+                        _ => TargetKind::Window,
+                    },
                     audio_scoped: row.get(6)? };
                 let mut session = Session::new(id, target, row.get(0)?);
                 if let Some(ended) = row.get(1)? { session.end(ended); }
@@ -469,6 +473,7 @@ fn target_kind(kind: TargetKind) -> &'static str {
     match kind {
         TargetKind::Application => "application",
         TargetKind::Window => "window",
+        TargetKind::Display => "display",
     }
 }
 fn poisoned<T>(error: std::sync::PoisonError<T>) -> RagError {

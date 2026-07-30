@@ -28,7 +28,21 @@ typedef void (*sotto_frame_callback)(void *context, const uint8_t *bytes,
 
 typedef void (*sotto_error_callback)(void *context, int32_t code);
 
-/* Status/error codes: 1 running, 2 stopped, -2 start failed, -3 revoked, -4 denied. */
+/* Status/error codes: 1 running, 2 stopped, -2 start failed, -3 revoked,
+ * -4 denied, -5 selected target disappeared. */
+
+typedef enum {
+  SOTTO_CAPTURE_TARGET_APPLICATION = 1,
+  SOTTO_CAPTURE_TARGET_WINDOW = 2,
+  SOTTO_CAPTURE_TARGET_DISPLAY = 3,
+} sotto_capture_target_kind;
+
+/* Strings are UTF-8 and valid only for the duration of the callback. A null
+ * target is a normal cancellation (all description fields are then null/0). */
+typedef void (*sotto_target_callback)(
+    void *context, void *target, const char *bundle_id,
+    const char *display_name, const char *window_title,
+    sotto_capture_target_kind kind, bool audio_scoped);
 
 typedef struct {
   sotto_audio_callback audio;
@@ -37,7 +51,10 @@ typedef struct {
   void *context;
 } sotto_capture_config;
 
-void *sotto_capture_start(const sotto_capture_config *config);
+void sotto_capture_pick_target(sotto_target_callback on_choice, void *context);
+void sotto_capture_release_target(void *target);
+void *sotto_capture_start_with_target(const sotto_capture_config *config,
+                                      void *target);
 void sotto_capture_stop(void *handle);
 int32_t sotto_capture_permission_status(void);
 bool sotto_capture_request_permission(void);

@@ -98,3 +98,87 @@ out on day one than after the API work is done.
 The settings UI that calls this (T012), the recording indicator (exists), device enumeration
 for the microphone (T012), browser-tab-level scoping (`AGENTS.md` non-goal — ScreenCaptureKit
 sees windows).
+
+## Review round 1 — two must-fix, then this is ready for the manual run
+
+The shape is right. The picker is the only producer of a filter, `sotto_capture_start` is gone
+rather than left as a fallback, `PickedTarget` owns the retained handle and releases it on drop,
+frame sizing now comes from `filter.contentRect * pointPixelScale` instead of the display, and
+`error_callback` now clears `running` on every terminal path — that last one was a real bug
+nobody asked you to find.
+
+The macOS 15.2 availability claim checks out: `includedWindows`, `includedApplications` and
+`includedDisplays` are all `API_AVAILABLE(macos(15.2))` in the SDK. But note what that means in
+practice — the deployment target is 14.0, this machine runs macOS 26, so `#available` passes at
+runtime and real metadata *is* used here. Generic labels only affect users on 14.0–15.1. If the
+manual run shows "Selected window", that is a symptom of something else, not the expected result.
+
+### Must fix 1 — the fallback branch fabricates a display target
+
+`describe` maps both `.none` and `@unknown default` to `kind: 3` with `audioScoped: false`, so an
+unrecognised filter style is recorded in the timeline as *the user picked a display*, and capture
+starts from a filter whose scope we do not know. That is the hole this task exists to close,
+reintroduced through the branch nobody looks at.
+
+The Rust side already handles this correctly — an unknown kind releases the handle and returns
+`None` — but Swift never sends an unknown kind, so that guard is dead code. Send `0` for `.none`
+and `@unknown default` and the existing guard does exactly the right thing. Refusing to start is
+the only truthful response to a filter we cannot describe.
+
+### Must fix 2 — the type system should carry the guarantee, not an error string
+
+```rust
+impl CaptureBackend for MacCapture {
+    fn start(&mut self, sink: …) -> Result<(), CaptureError> {
+        drop(sink);
+        Err(CaptureError::Unsupported("… requires a target returned by pick_target"))
+    }
+```
+
+`Pipeline::capture(value: impl CaptureBackend)` will accept `MacCapture` happily, compile, and
+fail at runtime with a string. Acceptance here says *no code path can start a capture without a
+picker-produced filter*; right now the FFI enforces that and the Rust API does not.
+
+Don't implement `CaptureBackend` for `MacCapture`. Implement it for a value that can only be
+constructed from a `PickedTarget` — then "started without a picker selection" is a program that
+does not compile, which is the same argument as `PickedTarget` being unconstructible from Rust.
+I checked: nothing consumes this today (the CLI uses `FileCapture` and `MergedFileCapture`), so
+it is cheap now and expensive once the pipeline is wired.
+
+### Should fix
+
+- **`TargetPicker.finish` races.** `finished` is a plain `var`, and the callbacks are not
+  documented as arriving on one queue. Two of them racing gives a double
+  `Unmanaged.passUnretained(self).release()`, which is a crash. You already solved this exact
+  problem correctly one type over with `terminalLock` in `reportTerminal` — do the same here.
+- **`[-3815, -3817, -3821]` as bare integers.** Use `SCStreamError.Code.noCaptureSource`,
+  `.userStopped`, `.systemStoppedStream`. And `.userStopped` is the user hitting *Stop Sharing* —
+  a deliberate action, not the target disappearing. It probably deserves its own status; a user
+  who stopped sharing should not be told their window vanished.
+- **`pick_target()` needs a running AppKit main loop.** It awaits a oneshot fed from
+  `Task { @MainActor }`. The soak example builds a current-thread tokio runtime and `block_on`s
+  it, which is precisely the case where that task may never run — so `cargo run --example soak`
+  may hang at the picker instead of presenting it. Check this first; it is the same question as
+  the bundle risk and the answer shapes the manual run.
+- **`start_with_target` → `start_scoped` → `start_inner`** is three hops for one call, and
+  `start_scoped`'s null check is unreachable — `PickedTarget` cannot hold a null handle.
+- **`rag::store` maps unknown kind strings to `TargetKind::Window`.** Now that the kind carries a
+  claim about scope, an unrecognised value should be an error rather than silently becoming a
+  window.
+
+### On the core change
+
+Adding `TargetKind::Display` was the right call — the picker offers display selection and the
+enum could not express it, so the alternative was recording a display as a window. It is
+additive, it round-trips through SQLite, and the exhaustive matches were updated.
+
+But `crates/core` was frozen at T014 and is not in this task's `Owns` list. Changing it silently
+inside a task scoped to `crates/capture/**` is how the parallelism rule stops working. Making the
+change: right. Not saying so until the summary: not. Flag a frozen-contract change before you
+make it, so the planner can check nothing else in flight depends on the old shape.
+
+### Verification
+
+`--all-features` was omitted again, on both clippy and test. I ran the full form: clean, 78
+passed / 0 failed / 7 ignored. Please use it — serde-gated code, including the `CaptureTarget`
+serialization you just changed the shape of, is invisible without it.

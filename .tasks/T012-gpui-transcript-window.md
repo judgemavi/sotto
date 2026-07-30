@@ -233,3 +233,16 @@ One correction: `default_model` returns `claude-3-5-haiku-latest` for Anthropic.
 rather than the model selected for the role — so a key that lacks access to the selected model
 validates green and fails in real use. Either validate the selected model, or say in the UI that
 this checks the credential only.
+
+## Review of the four fixes — all four accepted
+
+`select_default_audio` is gone rather than papered over. `NoKey` now covers both the empty-input
+and `load_key` → `Ok(None)` paths. `CredentialStore(String)` carries the reason instead of
+asserting a lock, and `credential_store_label_does_not_guess_the_cause` pins that. The
+`Disconnected` arm ends the poll and restores the button. Frame validation is opt-in behind
+`SOTTO_FRAME_VALIDATION=1`, the schedule reaches 3600, and the exhaustion check now precedes the
+push so the vector stops growing. `max_ms` and `over_budget` are in the output, which is what
+makes the number readable given p50 pins to the refresh period.
+
+Remaining here is unchanged: start/stop (blocked on T021), audio device enumeration, and the
+one-hour and real-keychain manual runs.

@@ -14,6 +14,10 @@ private typealias ErrorCallback = @convention(c) (UnsafeMutableRawPointer?, Int3
 private typealias FrameCallback = @convention(c) (
     UnsafeMutableRawPointer?, UnsafePointer<UInt8>?, Int, UInt32, UInt32, UInt32, UInt32, UInt64, UInt64
 ) -> Void
+private typealias TargetCallback = @convention(c) (
+    UnsafeMutableRawPointer?, UnsafeMutableRawPointer?, UnsafePointer<CChar>?,
+    UnsafePointer<CChar>?, UnsafePointer<CChar>?, Int32, Bool
+) -> Void
 
 private struct BridgeConfig: @unchecked Sendable {
     let audio: AudioCallback
@@ -22,55 +26,181 @@ private struct BridgeConfig: @unchecked Sendable {
     let context: UnsafeMutableRawPointer?
 }
 
+private struct PickerRequest: @unchecked Sendable {
+    let callback: TargetCallback
+    let context: UnsafeMutableRawPointer?
+}
+
+private final class PickedTarget: @unchecked Sendable {
+    let filter: SCContentFilter
+    let bundleID: String?
+    let displayName: String
+    let windowTitle: String?
+    let kind: Int32
+    let audioScoped: Bool
+
+    init(
+        filter: SCContentFilter, bundleID: String?, displayName: String,
+        windowTitle: String?, kind: Int32, audioScoped: Bool
+    ) {
+        self.filter = filter
+        self.bundleID = bundleID
+        self.displayName = displayName
+        self.windowTitle = windowTitle
+        self.kind = kind
+        self.audioScoped = audioScoped
+    }
+}
+
+private final class TargetPicker: NSObject, SCContentSharingPickerObserver {
+    private let callback: TargetCallback
+    private let context: UnsafeMutableRawPointer?
+    private var finished = false
+
+    init(callback: @escaping TargetCallback, context: UnsafeMutableRawPointer?) {
+        self.callback = callback
+        self.context = context
+    }
+
+    func present() {
+        let picker = SCContentSharingPicker.shared
+        var configuration = SCContentSharingPickerConfiguration()
+        configuration.allowedPickerModes = [.singleWindow, .singleApplication, .singleDisplay]
+        configuration.allowsChangingSelectedContent = false
+        picker.configuration = configuration
+        picker.add(self)
+        picker.isActive = true
+        picker.present()
+    }
+
+    func contentSharingPicker(
+        _ picker: SCContentSharingPicker,
+        didUpdateWith filter: SCContentFilter,
+        for stream: SCStream?
+    ) {
+        finish(picker: picker, filter: filter)
+    }
+
+    func contentSharingPicker(_ picker: SCContentSharingPicker, didCancelFor stream: SCStream?) {
+        finish(picker: picker, filter: nil)
+    }
+
+    func contentSharingPickerStartDidFailWithError(_ error: any Error) {
+        finish(picker: SCContentSharingPicker.shared, filter: nil)
+    }
+
+    private func finish(picker: SCContentSharingPicker, filter: SCContentFilter?) {
+        guard !finished else { return }
+        finished = true
+        picker.remove(self)
+        picker.isActive = false
+        guard let filter else {
+            callback(context, nil, nil, nil, nil, 0, false)
+            Unmanaged.passUnretained(self).release()
+            return
+        }
+
+        let target = Self.describe(filter)
+        let opaque = Unmanaged.passRetained(target).toOpaque()
+        withOptionalCString(target.bundleID) { bundleID in
+            target.displayName.withCString { displayName in
+                withOptionalCString(target.windowTitle) { windowTitle in
+                    callback(
+                        context, opaque, bundleID, displayName, windowTitle,
+                        target.kind, target.audioScoped
+                    )
+                }
+            }
+        }
+        Unmanaged.passUnretained(self).release()
+    }
+
+    private static func describe(_ filter: SCContentFilter) -> PickedTarget {
+        switch filter.style {
+        case .window:
+            let window: SCWindow? = if #available(macOS 15.2, *) {
+                filter.includedWindows.first
+            } else {
+                nil
+            }
+            let application = window?.owningApplication
+            return PickedTarget(
+                filter: filter,
+                bundleID: application?.bundleIdentifier,
+                displayName: application?.applicationName ?? window?.title ?? "Selected window",
+                windowTitle: window?.title,
+                kind: 2,
+                audioScoped: true
+            )
+        case .application:
+            let application: SCRunningApplication? = if #available(macOS 15.2, *) {
+                filter.includedApplications.first
+            } else {
+                nil
+            }
+            return PickedTarget(
+                filter: filter,
+                bundleID: application?.bundleIdentifier,
+                displayName: application?.applicationName ?? "Selected application",
+                windowTitle: nil,
+                kind: 1,
+                audioScoped: true
+            )
+        case .display:
+            return PickedTarget(
+                filter: filter,
+                bundleID: nil,
+                displayName: "Selected display",
+                windowTitle: nil,
+                kind: 3,
+                audioScoped: false
+            )
+        case .none:
+            return PickedTarget(
+                filter: filter,
+                bundleID: nil,
+                displayName: "Selected target",
+                windowTitle: nil,
+                kind: 3,
+                audioScoped: false
+            )
+        @unknown default:
+            return PickedTarget(
+                filter: filter,
+                bundleID: nil,
+                displayName: "Selected target",
+                windowTitle: nil,
+                kind: 3,
+                audioScoped: false
+            )
+        }
+    }
+}
+
+private func withOptionalCString<Result>(
+    _ string: String?, _ body: (UnsafePointer<CChar>?) -> Result
+) -> Result {
+    guard let string else { return body(nil) }
+    return string.withCString(body)
+}
+
 private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     private let config: BridgeConfig
+    private let target: PickedTarget
     private let queue = DispatchQueue(label: "dev.sotto.capture.system-audio", qos: .userInteractive)
     private let videoQueue = DispatchQueue(label: "dev.sotto.capture.frames", qos: .utility)
     private var stream: SCStream?
     private var sequence: UInt64 = 0
     private var lastFrameTimeNs: UInt64 = 0
+    private let terminalLock = NSLock()
+    private var reportedTerminal = false
 
-    init(config: BridgeConfig) {
+    init(config: BridgeConfig, target: PickedTarget) {
         self.config = config
-    }
-
-    /// Backing-pixel size of a display, capped to the Rust frame-pool budget.
-    ///
-    /// `SCDisplay.width`/`height` are in points; OCR quality depends on real pixels, so
-    /// scale by the matching screen's `backingScaleFactor`. The cap keeps a single frame
-    /// within `MAX_FRAME_BYTES` (40 MiB) at 4 bytes per pixel, so an oversized or
-    /// multi-Retina display degrades resolution rather than being dropped by the Rust
-    /// side for exceeding the buffer.
-    private static func frameSize(for display: SCDisplay) -> (Int, Int) {
-        let scale = NSScreen.screens.first { screen in
-            (screen.deviceDescription[
-                NSDeviceDescriptionKey("NSScreenNumber")
-            ] as? CGDirectDisplayID) == display.displayID
-        }?.backingScaleFactor ?? 2.0
-
-        var width = Int((Double(display.width) * scale).rounded())
-        var height = Int((Double(display.height) * scale).rounded())
-        guard width > 0, height > 0 else { return (display.width, display.height) }
-
-        let maxPixels = (40 * 1024 * 1024) / 4
-        if width * height > maxPixels {
-            let shrink = (Double(maxPixels) / Double(width * height)).squareRoot()
-            width = max(1, Int(Double(width) * shrink))
-            height = max(1, Int(Double(height) * shrink))
-        }
-        return (width, height)
+        self.target = target
     }
 
     func start() async throws {
-        let content = try await SCShareableContent.excludingDesktopWindows(
-            false,
-            onScreenWindowsOnly: true
-        )
-        guard let display = content.displays.first else {
-            throw CaptureBridgeError.noDisplay
-        }
-
-        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let streamConfig = SCStreamConfiguration()
         streamConfig.capturesAudio = true
         streamConfig.excludesCurrentProcessAudio = true
@@ -82,14 +212,22 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, 
         // output even for audio-only capture, and 2x2 was the cheapest way to satisfy
         // that. Screen context is now a real timeline producer, so the placeholder has
         // to go — at 2x2 every captured frame was 16 bytes of nothing.
-        let (frameWidth, frameHeight) = Self.frameSize(for: display)
+        let scale = CGFloat(target.filter.pointPixelScale)
+        var frameWidth = max(1, Int(target.filter.contentRect.width * scale))
+        var frameHeight = max(1, Int(target.filter.contentRect.height * scale))
+        let maxPixels = (40 * 1024 * 1024) / 4
+        if frameWidth * frameHeight > maxPixels {
+            let shrink = (Double(maxPixels) / Double(frameWidth * frameHeight)).squareRoot()
+            frameWidth = max(1, Int(Double(frameWidth) * shrink))
+            frameHeight = max(1, Int(Double(frameHeight) * shrink))
+        }
         streamConfig.width = frameWidth
         streamConfig.height = frameHeight
         streamConfig.minimumFrameInterval = CMTime(seconds: 10, preferredTimescale: 600)
         streamConfig.queueDepth = 2
         streamConfig.pixelFormat = kCVPixelFormatType_32BGRA
 
-        let stream = SCStream(filter: filter, configuration: streamConfig, delegate: self)
+        let stream = SCStream(filter: target.filter, configuration: streamConfig, delegate: self)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQueue)
         self.stream = stream
@@ -103,7 +241,10 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, 
     }
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
-        config.error(config.context, -3)
+        let nsError = error as NSError
+        let targetEnded = nsError.domain == SCStreamErrorDomain
+            && [-3815, -3817, -3821].contains(nsError.code)
+        reportTerminal(targetEnded ? -5 : -3)
     }
 
     func stream(
@@ -139,6 +280,14 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, 
     }
 
     private func deliverFrame(_ sampleBuffer: CMSampleBuffer) {
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer, createIfNecessary: false
+        ) as? [[SCStreamFrameInfo: Any]],
+           let rawStatus = attachments.first?[.status] as? Int,
+           SCFrameStatus(rawValue: rawStatus) == .stopped {
+            reportTerminal(-5)
+            return
+        }
         let hostNs = Self.hostTimeNanoseconds()
         guard hostNs &- lastFrameTimeNs >= 10_000_000_000,
               let image = sampleBuffer.imageBuffer else { return }
@@ -168,6 +317,14 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, 
         )
     }
 
+    private func reportTerminal(_ code: Int32) {
+        terminalLock.lock()
+        defer { terminalLock.unlock() }
+        guard !reportedTerminal else { return }
+        reportedTerminal = true
+        config.error(config.context, code)
+    }
+
     private static func hostTimeNanoseconds() -> UInt64 {
         var info = mach_timebase_info_data_t()
         mach_timebase_info(&info)
@@ -180,7 +337,6 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, 
 
 private enum CaptureBridgeError: Error {
     case invalidConfig
-    case noDisplay
 }
 
 private actor CaptureLifecycle {
@@ -243,9 +399,33 @@ private final class HandleBox: @unchecked Sendable {
 }
 
 // Config memory layout mirrors include/SottoCaptureBridge.h.
-@_cdecl("sotto_capture_start")
-public func sottoCaptureStart(_ rawConfig: UnsafeRawPointer?) -> UnsafeMutableRawPointer? {
-    guard let rawConfig else { return nil }
+@_cdecl("sotto_capture_pick_target")
+public func sottoCapturePickTarget(
+    _ rawCallback: UnsafeRawPointer?, _ context: UnsafeMutableRawPointer?
+) {
+    guard let rawCallback else { return }
+    let request = PickerRequest(
+        callback: unsafeBitCast(rawCallback, to: TargetCallback.self),
+        context: context
+    )
+    Task { @MainActor in
+        let picker = TargetPicker(callback: request.callback, context: request.context)
+        _ = Unmanaged.passRetained(picker)
+        picker.present()
+    }
+}
+
+@_cdecl("sotto_capture_release_target")
+public func sottoCaptureReleaseTarget(_ target: UnsafeMutableRawPointer?) {
+    guard let target else { return }
+    Unmanaged<PickedTarget>.fromOpaque(target).release()
+}
+
+@_cdecl("sotto_capture_start_with_target")
+public func sottoCaptureStartWithTarget(
+    _ rawConfig: UnsafeRawPointer?, _ rawTarget: UnsafeMutableRawPointer?
+) -> UnsafeMutableRawPointer? {
+    guard let rawConfig, let rawTarget else { return nil }
     let words = rawConfig.bindMemory(to: UnsafeRawPointer?.self, capacity: 4)
     guard let audioRaw = words[0], let errorRaw = words[1], let frameRaw = words[2] else { return nil }
     let audio = unsafeBitCast(audioRaw, to: AudioCallback.self)
@@ -257,7 +437,8 @@ public func sottoCaptureStart(_ rawConfig: UnsafeRawPointer?) -> UnsafeMutableRa
         frame: frame,
         context: UnsafeMutableRawPointer(mutating: words[3])
     )
-    let session = CaptureSession(config: config)
+    let target = Unmanaged<PickedTarget>.fromOpaque(rawTarget).takeUnretainedValue()
+    let session = CaptureSession(config: config, target: target)
     let box = HandleBox(CaptureLifecycle(session: session, config: config))
     let retained = Unmanaged.passRetained(box)
     Task { await box.lifecycle.start() }

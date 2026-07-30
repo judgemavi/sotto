@@ -7,9 +7,10 @@ use super::{EventId, SessionId};
 pub enum TargetKind {
     Application,
     Window,
+    Display,
 }
 
-/// The application or window explicitly selected through the system picker.
+/// The application, window, or display explicitly selected through the system picker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct CaptureTarget {

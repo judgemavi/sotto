@@ -3,7 +3,7 @@
 use futures_util::StreamExt;
 use providers::{Provider, ProviderKind, Role};
 use secrecy::SecretString;
-use std::{collections::HashMap, time::Duration};
+use std::{borrow::Cow, collections::HashMap, sync::mpsc::TryRecvError, time::Duration};
 
 use gpui::{Context, Entity, IntoElement, Render, Timer, Window, div, prelude::*, rgb};
 use gpui_component::button::Button;
@@ -62,8 +62,9 @@ pub enum KeyValidationStatus {
     Idle,
     Validating,
     Valid,
+    NoKey,
     BadKey,
-    KeychainLocked,
+    CredentialStore(String),
     NetworkDown,
     RateLimited,
     Failed(String),
@@ -74,7 +75,7 @@ impl KeyValidationStatus {
     pub fn from_error(error: ProviderError) -> Self {
         match error {
             ProviderError::Auth => Self::BadKey,
-            ProviderError::CredentialStore(_) => Self::KeychainLocked,
+            ProviderError::CredentialStore(reason) => Self::CredentialStore(reason),
             ProviderError::Network(_) => Self::NetworkDown,
             ProviderError::RateLimit { .. } => Self::RateLimited,
             other => Self::Failed(other.to_string()),
@@ -82,16 +83,21 @@ impl KeyValidationStatus {
     }
 
     #[must_use]
-    pub fn label(&self) -> &str {
+    pub fn label(&self) -> Cow<'_, str> {
         match self {
-            Self::Idle => "No validation run",
-            Self::Validating => "Checking with provider…",
-            Self::Valid => "Key is valid",
-            Self::BadKey => "This key was rejected. Replace it and try again.",
-            Self::KeychainLocked => "Keychain is locked. Unlock it and try again.",
-            Self::NetworkDown => "Provider could not be reached. Check the network and retry.",
-            Self::RateLimited => "Provider rate limit reached. Retry later.",
-            Self::Failed(message) => message,
+            Self::Idle => Cow::Borrowed("No validation run"),
+            Self::Validating => Cow::Borrowed("Checking with provider…"),
+            Self::Valid => Cow::Borrowed("Key is valid"),
+            Self::NoKey => Cow::Borrowed("No key stored for this provider."),
+            Self::BadKey => Cow::Borrowed("This key was rejected. Replace it and try again."),
+            Self::CredentialStore(reason) => {
+                Cow::Owned(format!("Could not read the keychain: {reason}"))
+            }
+            Self::NetworkDown => {
+                Cow::Borrowed("Provider could not be reached. Check the network and retry.")
+            }
+            Self::RateLimited => Cow::Borrowed("Provider rate limit reached. Retry later."),
+            Self::Failed(message) => Cow::Borrowed(message),
         }
     }
 }
@@ -153,7 +159,7 @@ impl SettingsView {
         };
         let value = input.read(cx).value().to_string();
         let status = if value.is_empty() {
-            KeyValidationStatus::BadKey
+            KeyValidationStatus::NoKey
         } else {
             SettingsState::store_submitted_key(self.provider, SecretString::from(value))
                 .map_or_else(KeyValidationStatus::from_error, |()| {
@@ -196,12 +202,6 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn select_default_audio(&mut self, cx: &mut Context<Self>) {
-        self.state.mic_device = Some("System default microphone".to_owned());
-        self.state.target_audio_device = Some("Selected target audio".to_owned());
-        cx.notify();
-    }
-
     fn validate_selected_key(&mut self, cx: &mut Context<Self>) {
         if self.key_status == KeyValidationStatus::Validating {
             return;
@@ -225,12 +225,24 @@ impl SettingsView {
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
             loop {
-                if let Ok(status) = receiver.try_recv() {
-                    let _ = view.update(cx, |view, cx| {
-                        view.key_status = status;
-                        cx.notify();
-                    });
-                    return;
+                match receiver.try_recv() {
+                    Ok(status) => {
+                        let _ = view.update(cx, |view, cx| {
+                            view.key_status = status;
+                            cx.notify();
+                        });
+                        return;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => {
+                        let _ = view.update(cx, |view, cx| {
+                            view.key_status = KeyValidationStatus::Failed(
+                                "Validation stopped unexpectedly. Retry the check.".to_owned(),
+                            );
+                            cx.notify();
+                        });
+                        return;
+                    }
                 }
                 Timer::after(Duration::from_millis(50)).await;
             }
@@ -242,7 +254,7 @@ impl SettingsView {
 
 const fn default_model(provider: ProviderKind) -> &'static str {
     match provider {
-        ProviderKind::Anthropic => "claude-3-5-haiku-latest",
+        ProviderKind::Anthropic => "claude-haiku-4-5-20251001",
         ProviderKind::OpenAi => "gpt-4.1-nano",
         ProviderKind::Google => "gemini-2.0-flash-lite",
         ProviderKind::OpenRouter => "openai/gpt-4.1-nano",
@@ -298,7 +310,7 @@ impl Render for SettingsView {
                             })),
                     ),
             )
-            .child(self.key_status.label().to_owned())
+            .child(self.key_status.label().into_owned())
             .child(
                 div()
                     .flex()
@@ -326,9 +338,6 @@ impl Render for SettingsView {
                     self.mic_level.clamp(0.0, 1.0) * 100.0,
                     self.target_level.clamp(0.0, 1.0) * 100.0
                 ),
-            ))
-            .child(Button::new("audio-defaults").label("Use system audio defaults").on_click(
-                cx.listener(|this, _, _, cx| this.select_default_audio(cx)),
             ))
             .child(section(
                 "Session",
@@ -396,7 +405,7 @@ pub async fn validate_provider_key(
         ProviderKind::Ollama => None,
         _ => match providers::load_key(kind) {
             Ok(Some(key)) => Some(key),
-            Ok(None) => return KeyValidationStatus::BadKey,
+            Ok(None) => return KeyValidationStatus::NoKey,
             Err(error) => return KeyValidationStatus::from_error(error),
         },
     };
@@ -455,12 +464,23 @@ mod tests {
             KeyValidationStatus::BadKey
         );
         assert_eq!(
-            KeyValidationStatus::from_error(ProviderError::CredentialStore("locked".to_owned())),
-            KeyValidationStatus::KeychainLocked
+            KeyValidationStatus::from_error(ProviderError::CredentialStore("denied".to_owned())),
+            KeyValidationStatus::CredentialStore("denied".to_owned())
         );
         assert_eq!(
             KeyValidationStatus::from_error(ProviderError::Network("offline".to_owned())),
             KeyValidationStatus::NetworkDown
+        );
+    }
+
+    #[test]
+    fn credential_store_label_does_not_guess_the_cause() {
+        let status = KeyValidationStatus::from_error(ProviderError::CredentialStore(
+            "access was denied".to_owned(),
+        ));
+        assert_eq!(
+            status.label(),
+            "Could not read the keychain: access was denied"
         );
     }
 }

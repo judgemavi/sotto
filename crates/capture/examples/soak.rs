@@ -36,7 +36,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
-    capture.start(audio_tx)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let target = runtime
+        .block_on(MacCapture::pick_target())
+        .ok_or("target selection was cancelled")?;
+    println!("selected capture target: {:?}", target.description());
+    capture.start_with_target(&target, audio_tx)?;
     let frames = capture
         .take_frame_receiver()
         .ok_or("capture did not install its frame receiver")?;

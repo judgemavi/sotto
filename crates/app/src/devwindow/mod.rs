@@ -21,6 +21,7 @@ pub struct DevTimeline {
     last_frame: Option<Instant>,
     frame_intervals: Vec<Duration>,
     report_index: usize,
+    frame_validation: bool,
 }
 
 impl DevTimeline {
@@ -35,6 +36,7 @@ impl DevTimeline {
             last_frame: None,
             frame_intervals: Vec::new(),
             report_index: 0,
+            frame_validation: std::env::var("SOTTO_FRAME_VALIDATION").as_deref() == Ok("1"),
         }
     }
 
@@ -49,15 +51,15 @@ impl DevTimeline {
     }
 
     fn record_frame_interval(&mut self) {
+        const REPORT_SECONDS: [u64; 5] = [60, 600, 1_200, 1_800, 3_600];
+        let Some(report_at) = REPORT_SECONDS.get(self.report_index) else {
+            return;
+        };
         let now = Instant::now();
         if let Some(last) = self.last_frame.replace(now) {
             self.frame_intervals
                 .push(now.saturating_duration_since(last));
         }
-        const REPORT_SECONDS: [u64; 4] = [60, 600, 1_200, 1_800];
-        let Some(report_at) = REPORT_SECONDS.get(self.report_index) else {
-            return;
-        };
         if now.duration_since(self.validation_started).as_secs() < *report_at {
             return;
         }
@@ -68,11 +70,17 @@ impl DevTimeline {
             .get(sorted.len().saturating_mul(95) / 100)
             .copied()
             .unwrap_or_default();
+        let max = sorted.last().copied().unwrap_or_default();
+        let over_budget = sorted
+            .iter()
+            .filter(|interval| **interval > Duration::from_micros(16_667))
+            .count();
         eprintln!(
-            "T012_FRAME interval_end_s={report_at} samples={} p50_ms={:.3} p95_ms={:.3}",
+            "T012_FRAME interval_end_s={report_at} samples={} p50_ms={:.3} p95_ms={:.3} max_ms={:.3} over_budget={over_budget}",
             sorted.len(),
             p50.as_secs_f64() * 1_000.0,
-            p95.as_secs_f64() * 1_000.0
+            p95.as_secs_f64() * 1_000.0,
+            max.as_secs_f64() * 1_000.0
         );
         self.report_index = self.report_index.saturating_add(1);
     }
@@ -80,8 +88,10 @@ impl DevTimeline {
 
 impl Render for DevTimeline {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.request_animation_frame();
-        self.record_frame_interval();
+        if self.frame_validation {
+            window.request_animation_frame();
+            self.record_frame_interval();
+        }
         let state = self.timeline.read(cx);
         let rows: Vec<_> = state
             .events()

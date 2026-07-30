@@ -3,6 +3,7 @@ use std::{env, error::Error, path::PathBuf, process::Command};
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=bridge-macos/Package.swift");
     println!("cargo:rerun-if-changed=bridge-macos/Sources/SottoCaptureBridge/CaptureBridge.swift");
+    println!("cargo:rerun-if-changed=bridge-macos/include/SottoCaptureBridge.h");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return Ok(());
