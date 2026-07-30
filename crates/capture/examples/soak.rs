@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use capture::macos::{FrameReceiver, MacCapture, RawFrame};
+use capture::macos::{CaptureStatus, FrameReceiver, MacCapture, RawFrame};
 use sotto_core::{CaptureBackend, Source};
 use tokio::sync::broadcast;
 
@@ -41,6 +41,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let target = MacCapture::pick_target_blocking().ok_or("target selection was cancelled")?;
     println!("selected capture target: {:?}", target.description());
     let mut capture = target.into_capture();
+    // Subscribe before starting: these are broadcast channels, so a subscriber created
+    // afterwards misses the Running transition and anything that raced it.
+    let mut status_rx = capture.subscribe_status();
+    let mut error_rx = capture.subscribe_errors();
     capture.start(audio_tx)?;
     let frames = capture
         .take_frame_receiver()
@@ -70,7 +74,33 @@ fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let mut lagged_packets = 0_u64;
+    let mut terminal_status = None;
     while started.elapsed() < Duration::from_secs(seconds) {
+        while let Ok(error) = error_rx.try_recv() {
+            println!(
+                "[{:>6.1}s] capture error: {error}",
+                started.elapsed().as_secs_f64()
+            );
+        }
+        while let Ok(status) = status_rx.try_recv() {
+            println!(
+                "[{:>6.1}s] capture status: {status:?}",
+                started.elapsed().as_secs_f64()
+            );
+            // The whole point of the target-disappeared path is that the session ends
+            // when the thing being captured does. Running to the timer anyway would
+            // hide whether that ever fired.
+            if matches!(
+                status,
+                CaptureStatus::TargetEnded | CaptureStatus::UserStopped | CaptureStatus::Failed
+            ) {
+                terminal_status = Some(status);
+                break;
+            }
+        }
+        if terminal_status.is_some() {
+            break;
+        }
         loop {
             let frame = match audio_rx.try_recv() {
                 Ok(frame) => frame,
@@ -107,6 +137,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     capture.stop();
     mic.finalize()?;
     system.finalize()?;
+    match terminal_status {
+        Some(status) => println!(
+            "capture ended early after {:.1}s: {status:?}",
+            started.elapsed().as_secs_f64()
+        ),
+        None => println!("capture ran the full {seconds}s with no terminal status"),
+    }
     println!(
         "captured {frame_index} frames; {} frames dropped",
         capture.dropped_frame_count()
