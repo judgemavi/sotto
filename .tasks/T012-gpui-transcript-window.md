@@ -1,7 +1,7 @@
 # T012 — GPUI dev window: live timeline + settings screens
 
-**Status:** in-progress (timeline, filters, follow and key handling done; start/stop blocked on
-T021, four review fixes outstanding)
+**Status:** in-progress (timeline, filters, follow and key handling done and reviewed; start/stop
+blocked on T021; device enumeration and the manual runs outstanding)
 
 **Wave:** 2
 
