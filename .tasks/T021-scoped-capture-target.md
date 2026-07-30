@@ -419,3 +419,70 @@ guarantee this task exists to enforce. Preference order:
 
 Recommendation is 1 unless the diagnostic points at 2. Silently recording zeros is the only
 outcome that is actually unacceptable; the absence of whole-display audio is not.
+
+## Review — display audio fixed, but two changes were tested as one
+
+The audio extraction rewrite is a real correctness fix and almost certainly the one that
+mattered. The old path took `length / MemoryLayout<Float>.stride` samples straight out of
+`CMSampleBuffer.dataBuffer`, which only works if ScreenCaptureKit hands back contiguous
+interleaved Float32. `withAudioBufferList` + `AVAudioPCMBuffer.floatChannelData` reads what the
+buffer list actually describes, and the multi-channel downmix is right. Dropping the
+`CaptureError` from `TargetEnded` is also correct — it now matches `UserStopped`.
+
+Verified here: fmt clean, clippy `--all-targets --all-features` clean, 79 passed / 0 failed /
+7 ignored.
+
+### `excludesCurrentProcessAudio = target.audioScoped` is not established, and it has a cost
+
+Two things changed and one experiment ran, so we cannot say which fixed the silence. The comment
+hedges — *"it **can** result in silent audio buffers"* — which is the honest phrasing for
+something not tested in isolation. Apple's sample project shows a configuration; it is not
+evidence about the failure we hit.
+
+The cost is real. On a display pick this now records **our own process's audio**. Sotto emits
+none today, so nothing is visibly wrong. The first time it plays anything — a notification, a
+readback, any TTS — it captures itself, feeds that to ASR, and puts its own output on the
+timeline as if it were the conversation.
+
+The two concepts are also unrelated. `audio_scoped` describes whether audio is limited to the
+target application; `excludesCurrentProcessAudio` describes whether *we* are recorded. Coupling
+them means a later change to one silently changes the other.
+
+**Run the one experiment that separates them:** keep the extraction fix, set
+`excludesCurrentProcessAudio = true` unconditionally, and do a display capture. If audio still
+flows, delete the coupling — we get the fix without recording ourselves. If it goes silent, the
+coupling is earned; keep it with a comment saying it was measured, and note the feedback risk
+for when Sotto gains a voice.
+
+### `try?` swallows exactly the failure we just spent a day chasing
+
+```swift
+try? sampleBuffer.withAudioBufferList { … }
+```
+
+If extraction throws, audio stops with no error, no status, no log — silent buffers with a
+healthy-looking packet rate, which is the precise shape of the bug just fixed. Report it through
+the existing error callback, or at minimum behind `SOTTO_CAPTURE_DEBUG`.
+
+Related: `AVAudioFormat(standardFormatWithSampleRate:channels:)` is non-interleaved by
+definition, and `floatChannelData` misreads an interleaved buffer list. Guard on
+`kAudioFormatFlagIsNonInterleaved` in the format description so a layout change fails loudly
+rather than producing plausible garbage.
+
+### Two evidence gaps
+
+- **The scoping proof was measured on the old extraction path.** Filtering happens in
+  ScreenCaptureKit, not in our extraction, so the conclusion almost certainly survives — but the
+  code it was measured against no longer exists. Re-run the 1 kHz probe once against a window
+  pick; it is a few minutes and it keeps the strongest claim in this task honest.
+- **The `SOTTO_CAPTURE_DEBUG` diagnostic was never run.** Its `apps=N` counts would have said
+  directly whether display filters name zero applications, which is the mechanism question. Still
+  worth one run, together with the untested **application-style** pick — `audio_scoped: true` is
+  claimed for that kind on the strength of the window result generalising, which is an assumption.
+
+### Process note (planner's error)
+
+Commit `7c7e726`, titled "Add a filter diagnostic", also contains this audio work and the
+`TargetEnded` change. I ran `git add -A` while the agent was editing the same tree and swept its
+in-flight changes into my commit. The code is right; the message is wrong. Left as-is rather than
+rewriting history under a running agent. Use `git add <path>` in a shared tree.
