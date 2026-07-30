@@ -28,8 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&output)?;
 
     let (audio_tx, mut audio_rx) = broadcast::channel(256);
-    let mut capture = MacCapture::new();
-    if capture.permission_status() != sotto_core::PermissionStatus::Authorized {
+    if MacCapture::permission_status() != sotto_core::PermissionStatus::Authorized {
         let _ = MacCapture::request_permission();
         return Err(
             "Screen & System Audio Recording permission is required; re-run after granting it"
@@ -43,7 +42,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .block_on(MacCapture::pick_target())
         .ok_or("target selection was cancelled")?;
     println!("selected capture target: {:?}", target.description());
-    capture.start_with_target(&target, audio_tx)?;
+    let mut capture = target.into_capture();
+    capture.start(audio_tx)?;
     let frames = capture
         .take_frame_receiver()
         .ok_or("capture did not install its frame receiver")?;

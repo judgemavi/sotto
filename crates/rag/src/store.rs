@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     hash::{Hash, Hasher},
+    io,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -10,7 +11,7 @@ use std::{
 };
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, types::Type};
 use serde_json::{Value, json};
 use sotto_core::{
     BoxFuture, CaptureTarget, Chunk, PersistenceSink, RagError, Retriever, Session, SessionId,
@@ -198,11 +199,7 @@ impl Store {
             [id.get().to_string()], |row| {
                 let kind: String = row.get(5)?;
                 let target = CaptureTarget { bundle_id: row.get(2)?, display_name: row.get(3)?,
-                    window_title: row.get(4)?, kind: match kind.as_str() {
-                        "application" => TargetKind::Application,
-                        "display" => TargetKind::Display,
-                        _ => TargetKind::Window,
-                    },
+                    window_title: row.get(4)?, kind: parse_target_kind(&kind)?,
                     audio_scoped: row.get(6)? };
                 let mut session = Session::new(id, target, row.get(0)?);
                 if let Some(ended) = row.get(1)? { session.end(ended); }
@@ -476,6 +473,22 @@ fn target_kind(kind: TargetKind) -> &'static str {
         TargetKind::Display => "display",
     }
 }
+
+fn parse_target_kind(kind: &str) -> rusqlite::Result<TargetKind> {
+    match kind {
+        "application" => Ok(TargetKind::Application),
+        "window" => Ok(TargetKind::Window),
+        "display" => Ok(TargetKind::Display),
+        unknown => Err(rusqlite::Error::FromSqlConversionFailure(
+            5,
+            Type::Text,
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown capture target kind {unknown:?}"),
+            )),
+        )),
+    }
+}
 fn poisoned<T>(error: std::sync::PoisonError<T>) -> RagError {
     RagError::Storage(error.to_string())
 }
@@ -526,6 +539,14 @@ mod tests {
     use rusqlite::params;
 
     use super::*;
+
+    #[test]
+    fn unknown_capture_target_kind_is_rejected() {
+        assert!(
+            parse_target_kind("future_scope").is_err(),
+            "unknown persisted scope must not be fabricated as a window"
+        );
+    }
 
     fn insert_chunk(store: &Store, id: &str, text: &str, vector: &[f32]) -> Result<(), RagError> {
         let connection = store.writer.lock().map_err(poisoned)?;

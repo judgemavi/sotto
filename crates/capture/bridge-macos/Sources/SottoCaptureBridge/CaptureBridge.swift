@@ -55,6 +55,7 @@ private final class PickedTarget: @unchecked Sendable {
 private final class TargetPicker: NSObject, SCContentSharingPickerObserver {
     private let callback: TargetCallback
     private let context: UnsafeMutableRawPointer?
+    private let finishLock = NSLock()
     private var finished = false
 
     init(callback: @escaping TargetCallback, context: UnsafeMutableRawPointer?) {
@@ -90,8 +91,13 @@ private final class TargetPicker: NSObject, SCContentSharingPickerObserver {
     }
 
     private func finish(picker: SCContentSharingPicker, filter: SCContentFilter?) {
-        guard !finished else { return }
+        finishLock.lock()
+        guard !finished else {
+            finishLock.unlock()
+            return
+        }
         finished = true
+        finishLock.unlock()
         picker.remove(self)
         picker.isActive = false
         guard let filter else {
@@ -161,7 +167,7 @@ private final class TargetPicker: NSObject, SCContentSharingPickerObserver {
                 bundleID: nil,
                 displayName: "Selected target",
                 windowTitle: nil,
-                kind: 3,
+                kind: 0,
                 audioScoped: false
             )
         @unknown default:
@@ -170,7 +176,7 @@ private final class TargetPicker: NSObject, SCContentSharingPickerObserver {
                 bundleID: nil,
                 displayName: "Selected target",
                 windowTitle: nil,
-                kind: 3,
+                kind: 0,
                 audioScoped: false
             )
         }
@@ -242,9 +248,19 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, 
 
     func stream(_ stream: SCStream, didStopWithError error: any Error) {
         let nsError = error as NSError
-        let targetEnded = nsError.domain == SCStreamErrorDomain
-            && [-3815, -3817, -3821].contains(nsError.code)
-        reportTerminal(targetEnded ? -5 : -3)
+        guard nsError.domain == SCStreamErrorDomain,
+              let code = SCStreamError.Code(rawValue: nsError.code) else {
+            reportTerminal(-3)
+            return
+        }
+        switch code {
+        case .userStopped:
+            reportTerminal(-6)
+        case .noCaptureSource, .systemStoppedStream:
+            reportTerminal(-5)
+        default:
+            reportTerminal(-3)
+        }
     }
 
     func stream(
@@ -280,14 +296,6 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, 
     }
 
     private func deliverFrame(_ sampleBuffer: CMSampleBuffer) {
-        if let attachments = CMSampleBufferGetSampleAttachmentsArray(
-            sampleBuffer, createIfNecessary: false
-        ) as? [[SCStreamFrameInfo: Any]],
-           let rawStatus = attachments.first?[.status] as? Int,
-           SCFrameStatus(rawValue: rawStatus) == .stopped {
-            reportTerminal(-5)
-            return
-        }
         let hostNs = Self.hostTimeNanoseconds()
         guard hostNs &- lastFrameTimeNs >= 10_000_000_000,
               let image = sampleBuffer.imageBuffer else { return }

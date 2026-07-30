@@ -1,6 +1,7 @@
 # T021 — Scoped capture target selection
 
-**Status:** open — unblocks T012's start/stop flow
+**Status:** in-progress (implementation reviewed and accepted; dev app bundle and the manual
+acceptance run remain)
 
 **Wave:** Phase 2 — this is now the critical path to a usable tool
 
@@ -182,3 +183,52 @@ make it, so the planner can check nothing else in flight depends on the old shap
 `--all-features` was omitted again, on both clippy and test. I ran the full form: clean, 78
 passed / 0 failed / 7 ignored. Please use it — serde-gated code, including the `CaptureTarget`
 serialization you just changed the shape of, is invisible without it.
+
+## Review round 2 — code accepted; only the manual run and the dev bundle remain
+
+Both must-fix items are properly resolved, and the second one is resolved the strong way.
+`MacCapture::new` is private, the `Default` impl is gone, `PickedMacCapture` is the only type
+implementing `CaptureBackend`, and it can only be reached through
+`PickedTarget::into_capture`. `Pipeline::capture(MacCapture)` no longer compiles rather than
+failing at runtime — the guarantee now lives in the type system, which is where it belongs.
+`.none` and `@unknown default` send kind 0, so the Rust rejection path is live instead of dead.
+
+The should-fix list is done too: `finishLock`, named `SCStreamError.Code` cases, a distinct
+`UserStopped` status, one start path instead of three, and `parse_target_kind` rejecting
+unknown persisted scopes with a test that says why.
+
+Verified: clippy `--all-targets --all-features` clean, 79 passed / 0 failed / 7 ignored, Swift
+release build clean.
+
+### One unannounced change, and it matters for the manual run
+
+The `SCFrameStatus == .stopped` check in `deliverFrame` was deleted. It is not in the review
+list and was not mentioned, but it is the **right** deletion — `reportTerminal` latches the
+first code it sees, so a `.stopped` frame arriving ahead of `didStopWithError` would report −5
+and permanently mask the −6 that was just added, making every deliberate Stop Sharing look like
+the target had vanished. Keeping both paths would have defeated the distinction.
+
+The consequence is what to carry into the manual run: **target disappearance now has exactly one
+detection path**, `didStopWithError` with `.noCaptureSource` or `.systemStoppedStream`, and that
+path has never executed. Closing the picked window and confirming `TargetEnded` actually arrives
+is now a load-bearing check, not a formality. If ScreenCaptureKit simply stops delivering frames
+without raising an error, capture sits in `Running` forever and the session never ends — which
+is the failure mode a user would experience as "it silently stopped recording".
+
+Next time, say when you remove something. The reasoning was good; it should not have taken a
+diff read to find it.
+
+### Minor
+
+`MacCapture` is still `pub` with no way to construct one, so its inherent instance methods
+(`subscribe_errors`, `status`, `take_frame_receiver`, `dropped_frame_count`) are unreachable
+public surface, duplicated on `PickedMacCapture`. Make the type private and keep it as a
+namespace for the associated functions, or move those onto `PickedMacCapture`.
+
+### Still open
+
+The dev app bundle. My round-2 brief left it out, so its absence is not on you — but it is what
+stands between this code and its acceptance run. Screen-recording permission is granted per code
+identity, so an unsigned `cargo run` binary reads as a new app to TCC after every rebuild, and
+`SCContentSharingPicker` may not present from one at all. `scripts/Info.plist` already carries
+both usage descriptions.

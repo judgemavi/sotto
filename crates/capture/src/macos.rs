@@ -77,6 +77,16 @@ impl PickedTarget {
     pub const fn description(&self) -> &CaptureTarget {
         &self.description
     }
+
+    /// Consumes the picker capability and creates the only macOS value that can
+    /// implement `CaptureBackend`.
+    #[must_use]
+    pub fn into_capture(self) -> PickedMacCapture {
+        PickedMacCapture {
+            capture: MacCapture::new(),
+            target: self,
+        }
+    }
 }
 
 impl Drop for PickedTarget {
@@ -139,6 +149,8 @@ pub enum CaptureStatus {
     Failed,
     /// The picker-selected window/application/display ceased to exist.
     TargetEnded,
+    /// The user deliberately chose Stop Sharing in the system capture UI.
+    UserStopped,
 }
 
 impl CaptureStatus {
@@ -150,6 +162,7 @@ impl CaptureStatus {
             Self::Stopping => 3,
             Self::Failed => 4,
             Self::TargetEnded => 5,
+            Self::UserStopped => 6,
         }
     }
 
@@ -160,6 +173,7 @@ impl CaptureStatus {
             3 => Self::Stopping,
             4 => Self::Failed,
             5 => Self::TargetEnded,
+            6 => Self::UserStopped,
             _ => Self::Stopped,
         }
     }
@@ -197,13 +211,21 @@ pub struct MacCapture {
     audio_worker: Option<JoinHandle<()>>,
 }
 
+/// A macOS capture backend carrying proof of a system-picker selection.
+///
+/// This type has no public constructor other than `PickedTarget::into_capture`.
+pub struct PickedMacCapture {
+    capture: MacCapture,
+    target: PickedTarget,
+}
+
 // SAFETY: the native handle is only passed back to the bridge; callback state is synchronized.
 unsafe impl Send for MacCapture {}
 
 impl MacCapture {
     /// Creates an idle backend with bounded error and raw-frame subscriptions.
     #[must_use]
-    pub fn new() -> Self {
+    fn new() -> Self {
         let (error_tx, _) = broadcast::channel(16);
         let (status_tx, _) = broadcast::channel(16);
         Self {
@@ -250,6 +272,16 @@ impl MacCapture {
         // SAFETY: the callback reclaims `state`; the bridge invokes it exactly once.
         unsafe { sotto_capture_pick_target(target_callback, state.cast()) };
         receiver.await.ok().flatten()
+    }
+
+    /// Returns the current Screen & System Audio Recording permission state.
+    #[must_use]
+    pub fn permission_status() -> PermissionStatus {
+        // SAFETY: no arguments or retained pointers cross this C ABI call.
+        match unsafe { sotto_capture_permission_status() } {
+            1 => PermissionStatus::Authorized,
+            _ => PermissionStatus::Denied,
+        }
     }
 
     /// Prompts for Screen & System Audio Recording access.
@@ -336,58 +368,7 @@ impl MacCapture {
         Ok(())
     }
 
-    /// Starts capture using exactly the filter returned by the system picker.
-    pub fn start_with_target(
-        &mut self,
-        target: &PickedTarget,
-        sink: broadcast::Sender<AudioFrame>,
-    ) -> Result<(), CaptureError> {
-        self.start_scoped(target, sink)
-    }
-
-    fn start_scoped(
-        &mut self,
-        target: &PickedTarget,
-        sink: broadcast::Sender<AudioFrame>,
-    ) -> Result<(), CaptureError> {
-        if target.handle.is_null() {
-            return Err(CaptureError::StreamFailed(
-                "selected capture target is no longer available".to_owned(),
-            ));
-        }
-        self.start_inner(target, sink)
-    }
-}
-
-impl Default for MacCapture {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CaptureBackend for MacCapture {
-    fn start(&mut self, sink: broadcast::Sender<AudioFrame>) -> Result<(), CaptureError> {
-        drop(sink);
-        Err(CaptureError::Unsupported(
-            "macOS capture requires a target returned by MacCapture::pick_target".to_owned(),
-        ))
-    }
-
-    fn stop(&mut self) {
-        self.stop_inner();
-    }
-
-    fn permission_status(&self) -> PermissionStatus {
-        // SAFETY: no arguments or retained pointers cross this C ABI call.
-        match unsafe { sotto_capture_permission_status() } {
-            1 => PermissionStatus::Authorized,
-            _ => PermissionStatus::Denied,
-        }
-    }
-}
-
-impl MacCapture {
-    fn start_inner(
+    fn start(
         &mut self,
         target: &PickedTarget,
         sink: broadcast::Sender<AudioFrame>,
@@ -496,6 +477,44 @@ impl MacCapture {
         self.mic_stream = None;
         // The stopped callback owns context reclamation and terminates the audio worker.
         let _ = self.audio_worker.take();
+    }
+}
+
+impl PickedMacCapture {
+    pub fn subscribe_errors(&self) -> broadcast::Receiver<CaptureError> {
+        self.capture.subscribe_errors()
+    }
+
+    pub fn subscribe_status(&self) -> broadcast::Receiver<CaptureStatus> {
+        self.capture.subscribe_status()
+    }
+
+    #[must_use]
+    pub fn status(&self) -> CaptureStatus {
+        self.capture.status()
+    }
+
+    pub fn take_frame_receiver(&mut self) -> Option<FrameReceiver> {
+        self.capture.take_frame_receiver()
+    }
+
+    #[must_use]
+    pub fn dropped_frame_count(&self) -> u64 {
+        self.capture.dropped_frame_count()
+    }
+}
+
+impl CaptureBackend for PickedMacCapture {
+    fn start(&mut self, sink: broadcast::Sender<AudioFrame>) -> Result<(), CaptureError> {
+        self.capture.start(&self.target, sink)
+    }
+
+    fn stop(&mut self) {
+        self.capture.stop_inner();
+    }
+
+    fn permission_status(&self) -> PermissionStatus {
+        MacCapture::permission_status()
     }
 }
 
@@ -795,6 +814,13 @@ unsafe extern "C" fn error_callback(context: *mut c_void, code: c_int) {
                 "selected capture target disappeared".to_owned(),
             ));
         }
+        -6 => {
+            state.running.store(false, Ordering::Release);
+            state
+                .status
+                .store(CaptureStatus::UserStopped.code(), Ordering::Release);
+            let _ = state.status_sink.send(CaptureStatus::UserStopped);
+        }
         _ => {
             state.running.store(false, Ordering::Release);
             state
@@ -859,6 +885,7 @@ mod tests {
             CaptureStatus::Stopping,
             CaptureStatus::Failed,
             CaptureStatus::TargetEnded,
+            CaptureStatus::UserStopped,
         ] {
             assert_eq!(
                 CaptureStatus::from_code(status.code()),

@@ -29,7 +29,7 @@ typedef void (*sotto_frame_callback)(void *context, const uint8_t *bytes,
 typedef void (*sotto_error_callback)(void *context, int32_t code);
 
 /* Status/error codes: 1 running, 2 stopped, -2 start failed, -3 revoked,
- * -4 denied, -5 selected target disappeared. */
+ * -4 denied, -5 selected target disappeared, -6 user stopped sharing. */
 
 typedef enum {
   SOTTO_CAPTURE_TARGET_APPLICATION = 1,
