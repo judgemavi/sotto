@@ -486,3 +486,17 @@ Commit `7c7e726`, titled "Add a filter diagnostic", also contains this audio wor
 `TargetEnded` change. I ran `git add -A` while the agent was editing the same tree and swept its
 in-flight changes into my commit. The code is right; the message is wrong. Left as-is rather than
 rewriting history under a running agent. Use `git add <path>` in a shared tree.
+
+## Product decision: keep all three picker modes (2026-07-30)
+
+Window, application and display all stay in `allowedPickerModes`. Dropping `.singleDisplay`
+would have deleted the self-recording risk and the unscoped-audio question in one line, but
+whole-screen is a legitimate member of "turn Sotto on, then pick what it sees". The answer is to
+make display capture honest, not to remove it.
+
+Note the vocabulary gap this leaves. Users think in terms of *tab*, app or window; macOS offers
+window, application or display. A browser tab is not a window, so picking "a tab" means picking
+the browser window currently showing it. Video-wise the illusion mostly holds. If audio is scoped
+per application, it breaks precisely where it matters — the user picks the window holding their
+call and gets every other Chrome tab's audio too. That is what makes the granularity measurement
+the first thing to run.
