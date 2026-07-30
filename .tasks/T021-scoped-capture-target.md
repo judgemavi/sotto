@@ -232,3 +232,32 @@ stands between this code and its acceptance run. Screen-recording permission is 
 identity, so an unsigned `cargo run` binary reads as a new app to TCC after every rebuild, and
 `SCContentSharingPicker` may not present from one at all. `scripts/Info.plist` already carries
 both usage descriptions.
+
+## The dev bundle is done (2026-07-30, by the planner)
+
+`scripts/dev-bundle.sh` assembles and signs `target/Sotto.app` around any built binary,
+defaulting to `target/release/app`. It reads `CFBundleExecutable` and `CFBundleIdentifier`
+from the existing `scripts/Info.plist` and renames the binary to match, so the plist stays
+the single source of identity. Signing is delegated to `scripts/sign.sh`, ad-hoc unless
+`SOTTO_DEV_IDENTITY` names a certificate. Verified: `codesign -dv` reports
+`Identifier=com.sotto.app`, format `app bundle`, hardened runtime on, and the bundle
+satisfies its designated requirement. Documented under "Local development bundle" in
+`docs/signing.md`.
+
+Ad-hoc signing means TCC keys on the code hash, so each rebuild is a new identity and needs
+a fresh Screen & System Audio Recording grant. A self-signed code-signing certificate in the
+login keychain fixes that, and the script says so when it falls back to ad-hoc.
+
+The acceptance run is now unblocked:
+
+```sh
+cargo build --release -p capture --example soak
+scripts/dev-bundle.sh target/release/examples/soak
+./target/Sotto.app/Contents/MacOS/sotto 40
+```
+
+Frames land in `./capture-soak-output/` at one per ten seconds, alongside `mic.wav` and
+`system.wav`. Everything the acceptance criteria ask for is visible in those artifacts:
+whether a non-frontmost window captured cleanly, whether anything outside the target leaked
+into a frame, and — by closing the picked window mid-run — whether `TargetEnded` actually
+arrives on the single detection path that now carries it.

@@ -64,6 +64,32 @@ honest usage description in `Info.plist`. The audio-input entitlement enables th
 microphone. Sotto must still request both permissions at runtime and visibly reflect
 their state.
 
+## Local development bundle
+
+Signing a bare executable is not enough for capture work. `SCContentSharingPicker` is
+presented by the system on behalf of an *application*, and `Info.plist` — which carries
+the bundle identifier and both usage descriptions — is only read when the executable
+lives inside a bundle. `scripts/dev-bundle.sh` assembles one:
+
+```sh
+scripts/dev-bundle.sh target/release/examples/soak
+./target/Sotto.app/Contents/MacOS/sotto 40
+```
+
+With no argument it bundles `target/release/app`, building it if necessary. It reads
+`CFBundleExecutable` and `CFBundleIdentifier` from `scripts/Info.plist`, so the bundled
+binary is renamed to match rather than the plist being edited to match the crate.
+
+Run the executable from inside `Contents/MacOS` rather than via `open`: the main bundle
+still resolves to `Sotto.app`, and command-line arguments keep working.
+
+Signing is delegated to `sign.sh`, ad-hoc by default. Ad-hoc has no certificate, so TCC
+identifies the app by code hash and every rebuild is a new identity requiring a fresh
+Screen & System Audio Recording grant. To hold one grant across rebuilds, set
+`SOTTO_DEV_IDENTITY` to a code-signing certificate in the login keychain — a self-signed
+one from Keychain Access's Certificate Assistant is sufficient, since the requirement
+then pins the leaf certificate rather than the code hash.
+
 ## Manual release gate
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`. It builds an arm64 app,
