@@ -1,6 +1,7 @@
 # T016 — Board canvas v1: the timeline as a readable whiteboard
 
-**Status:** blocked (on T012 — GPUI retained per ADR-0003)
+**Status:** open — unblocked (T012's seam is stable and documented; consume
+`Entity<TimelineState>` via `devwindow::attach_ingress`)
 
 **Wave:** 3 — Phase 2, the note-taker dogfood gate
 
