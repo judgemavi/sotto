@@ -1,7 +1,7 @@
 # T021 — Scoped capture target selection
 
-**Status:** in-progress (implementation reviewed and accepted; dev app bundle and the manual
-acceptance run remain)
+**Status:** sufficient for the product path — window picks verified end to end. Remaining gaps
+are deferred (see "Deferred gaps"), not blocking.
 
 **Wave:** Phase 2 — this is now the critical path to a usable tool
 
@@ -500,3 +500,30 @@ the browser window currently showing it. Video-wise the illusion mostly holds. I
 per application, it breaks precisely where it matters — the user picks the window holding their
 call and gets every other Chrome tab's audio too. That is what makes the granularity measurement
 the first thing to run.
+
+## Deferred gaps (2026-07-30)
+
+Capture is good enough to build on: a window pick captures that window's pixels and that
+application's audio, both measured rather than asserted, and the session ends when the window
+does. The product path — transcribe, map, UI — is now the constraint, so these are parked
+deliberately rather than forgotten.
+
+1. **Audio granularity for window picks is unmeasured.** ScreenCaptureKit appears to scope audio
+   per application, so `audio_scoped: true` beside a window title may overclaim. Test: play the
+   1 kHz probe in a second window of the same application, capture the first, look for the tone.
+   If present, the description must name the application whose audio is captured.
+2. **Application-style picks have never been run.** `audio_scoped: true` is claimed for that kind
+   by generalising from windows.
+3. **`excludesCurrentProcessAudio` is coupled to `audio_scoped` without isolation.** A display
+   capture therefore records Sotto's own output — harmless until Sotto emits any sound, then a
+   feedback loop into ASR.
+4. **`try?` swallows audio-extraction failures**, reproducing the silent-buffer shape we just
+   fixed. Guard on `kAudioFormatFlagIsNonInterleaved` too.
+5. **Display picks are named "Selected display"** rather than the actual display.
+6. **The ten-minute drift measurement** — still the only way to turn drift into a number, and it
+   retires T002's deferred soak.
+7. **Re-run the 1 kHz scoping probe** against the new extraction path, which replaced the one the
+   original proof was measured on.
+
+Pick these up when the product path next touches capture, or before any release that claims
+scoped audio in the UI. Item 1 gates that claim specifically.
