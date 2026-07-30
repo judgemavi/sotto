@@ -214,8 +214,8 @@ fn main() {
     Application::new().run(|cx: &mut App| {
         gpui_component::init(cx);
         let (timeline_ingress, timeline) = devwindow::attach_ingress(cx, 1_024);
-        cx.spawn(async move |_| {
-            match session::pick_and_run(timeline_ingress).await {
+        cx.spawn(
+            async move |_| match session::pick_and_run(timeline_ingress).await {
                 Ok(session::StartOutcome::Cancelled) => {
                     eprintln!("Capture picker cancelled; no session started");
                 }
@@ -223,8 +223,8 @@ fn main() {
                     eprintln!("Live session ended: {status:?}");
                 }
                 Err(error) => eprintln!("Live session did not start: {error}"),
-            }
-        })
+            },
+        )
         .detach();
         let dev_bounds = Bounds::centered(None, size(px(1_000.0), px(620.0)), cx);
         let dev_timeline = timeline;

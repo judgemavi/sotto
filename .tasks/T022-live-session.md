@@ -140,3 +140,45 @@ integration.
 `AGENTS.md` promises `base.en` on first run; that was a decision, never an implementation. So a
 user cannot start a session without manually fetching weights. Refusing to start with a clear
 message is the right behaviour for now. Tracked separately as T023.
+
+## Review round 2 — accepted, with one regression to fix
+
+All three landed, and verification is real this time: fmt clean, clippy `--workspace
+--all-targets --all-features` clean, 79 passed / 0 failed / 7 ignored.
+
+The drain is better than what I asked for. Spawning `stop()` and draining concurrently means the
+drain is what *lets* shutdown make progress, rather than something attempted after it — a
+sequential version could have deadlocked against a full timeline channel. The application-support
+path handles an empty `HOME` and creates the directory.
+
+### `Stopped` is now silently ignored, which is worse than mislabelling it
+
+```rust
+Ok(CaptureStatus::Stopped | CaptureStatus::Starting | CaptureStatus::Running
+   | CaptureStatus::Stopping) => {}
+```
+
+My objection was to calling our own stop a *user* action. The fix removed the handling
+altogether, so a terminal state now falls through and the loop keeps waiting for events that
+will never arrive.
+
+That matters more than it looks, because `CaptureStatus::from_code` maps **every unrecognised
+code** to `Stopped`:
+
+```rust
+_ => Self::Stopped,
+```
+
+So any status the bridge grows later — or any value that arrives garbled — becomes `Stopped`,
+gets ignored here, and hangs the session with the indicator still claiming capture. That is
+exactly the failure mode point 4 of this task exists to prevent, reached through the fallback
+branch rather than the obvious path. It is also the same shape as the `.none` filter style and
+the `_ => TargetKind::Window` fallback: an unknown value quietly becoming a benign-looking one.
+
+Break on `Stopped` with its own outcome. Ending a session because capture stopped is correct and
+truthful; only the *label* was wrong.
+
+While there: the drain loop runs until the bus closes, which assumes every sender is dropped by
+`stop()`. If one ever leaks, the session never returns and the UI never learns it ended. A
+timeout around the drain, falling back to a `try_recv` sweep, turns a hang into a logged
+imperfection.

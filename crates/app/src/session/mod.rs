@@ -80,9 +80,7 @@ async fn run(
             SileroVad::new(Source::System, VadConfig::default())
                 .map_err(|error| error.to_string())?,
         )
-        .transcriber(
-            WhisperTranscriber::new(asr_config).map_err(|error| error.to_string())?,
-        )
+        .transcriber(WhisperTranscriber::new(asr_config).map_err(|error| error.to_string())?)
         .annotator(prosody::Annotator::default())
         .persistence(persistence)
         .start()
@@ -104,21 +102,30 @@ async fn run(
             status = statuses.recv() => {
                 match status {
                     Ok(status @ (CaptureStatus::TargetEnded | CaptureStatus::UserStopped | CaptureStatus::Failed)) => break status,
-                    Ok(CaptureStatus::Stopped) => break CaptureStatus::UserStopped,
-                    Ok(CaptureStatus::Starting | CaptureStatus::Running | CaptureStatus::Stopping) => {}
+                    Ok(CaptureStatus::Stopped | CaptureStatus::Starting | CaptureStatus::Running | CaptureStatus::Stopping) => {}
                     Err(_) => break CaptureStatus::Failed,
                 }
             }
         }
     };
-    pipeline.stop().await;
+    let stopping = tokio::spawn(pipeline.stop());
+    while let Ok(event) = events.recv().await {
+        if ingress.send(event).await.is_err() {
+            break;
+        }
+    }
+    stopping
+        .await
+        .map_err(|error| format!("session shutdown failed: {error}"))?;
     Ok(StartOutcome::Ended(terminal))
 }
 
 fn whisper_model_path() -> Result<PathBuf, String> {
     let path = std::env::var_os("SOTTO_WHISPER_MODEL")
         .map(PathBuf::from)
-        .ok_or_else(|| "Whisper model is missing. Set SOTTO_WHISPER_MODEL before starting capture.".to_owned())?;
+        .ok_or_else(|| {
+            "Whisper model is missing. Set SOTTO_WHISPER_MODEL before starting capture.".to_owned()
+        })?;
     if !path.is_file() {
         return Err(format!("Whisper model is missing: {}", path.display()));
     }
@@ -126,11 +133,30 @@ fn whisper_model_path() -> Result<PathBuf, String> {
 }
 
 fn persistence() -> Result<Arc<TimelinePersistence>, String> {
-    let path = std::env::var_os("SOTTO_DATABASE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("sotto.sqlite3"));
+    let path = match std::env::var_os("SOTTO_DATABASE") {
+        Some(path) => PathBuf::from(path),
+        None => {
+            let home = std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .ok_or_else(|| "could not locate the user's home directory".to_owned())?;
+            let directory = PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("Sotto");
+            std::fs::create_dir_all(&directory).map_err(|error| {
+                format!(
+                    "could not create application support directory {}: {error}",
+                    directory.display()
+                )
+            })?;
+            directory.join("sotto.sqlite3")
+        }
+    };
     let store = Store::open(&path).map_err(|error| {
-        format!("could not open session database {}: {error}", path.display())
+        format!(
+            "could not open session database {}: {error}",
+            path.display()
+        )
     })?;
     Ok(Arc::new(TimelinePersistence::new(Arc::new(store))))
 }
