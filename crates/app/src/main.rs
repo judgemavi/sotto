@@ -8,14 +8,13 @@ use gpui::{
     App, Application, Bounds, Context, Entity, Render, Timer, Window, WindowBounds, WindowKind,
     WindowOptions, div, prelude::*, px, rgb, size,
 };
-use sotto_core::{
-    CaptureTarget, EventPayload, Session, SessionId, Source, TargetKind, TimelineBuilder, Utterance,
-};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
+
+mod session;
 
 #[cfg(target_os = "macos")]
 fn set_click_through(window: &Window, enabled: bool) {
@@ -211,83 +210,22 @@ fn start_fake_pipeline() -> mpsc::Receiver<FakeEvent> {
     receiver
 }
 
-fn start_dev_timeline(ingress: devwindow::TimelineIngress) {
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build();
-        let Ok(runtime) = runtime else {
-            return;
-        };
-        runtime.block_on(async move {
-            let session = Session::new(
-                SessionId::new(1),
-                CaptureTarget {
-                    bundle_id: Some("dev.sotto.fixture".to_owned()),
-                    display_name: "Fixture call".to_owned(),
-                    window_title: Some("T012 live timeline".to_owned()),
-                    kind: TargetKind::Window,
-                    audio_scoped: true,
-                },
-                0,
-            );
-            let mut timeline = TimelineBuilder::new(session);
-            let mut index = 0_u64;
-            loop {
-                let start = Duration::from_millis(index.saturating_mul(600));
-                let partial = timeline.append(
-                    start,
-                    EventPayload::UtterancePartial(Utterance {
-                        source: if index.is_multiple_of(2) {
-                            Source::System
-                        } else {
-                            Source::Mic
-                        },
-                        start,
-                        end: start + Duration::from_millis(400),
-                        text: format!("fixture utterance {index}…"),
-                        avg_logprob: -0.2,
-                        annotations: Vec::new(),
-                    }),
-                );
-                if ingress.send(partial.clone()).await.is_err() {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(120)).await;
-                let final_event = timeline.supersede(
-                    start + Duration::from_millis(120),
-                    EventPayload::UtteranceFinal(Utterance {
-                        source: if index.is_multiple_of(2) {
-                            Source::System
-                        } else {
-                            Source::Mic
-                        },
-                        start,
-                        end: start + Duration::from_millis(400),
-                        text: format!("fixture utterance {index}"),
-                        avg_logprob: -0.1,
-                        annotations: Vec::new(),
-                    }),
-                    &partial,
-                );
-                let Ok(final_event) = final_event else {
-                    return;
-                };
-                if ingress.send(final_event).await.is_err() {
-                    return;
-                }
-                index = index.saturating_add(1);
-                tokio::time::sleep(Duration::from_millis(480)).await;
-            }
-        });
-    });
-}
-
 fn main() {
     Application::new().run(|cx: &mut App| {
         gpui_component::init(cx);
         let (timeline_ingress, timeline) = devwindow::attach_ingress(cx, 1_024);
-        start_dev_timeline(timeline_ingress);
+        cx.spawn(async move |_| {
+            match session::pick_and_run(timeline_ingress).await {
+                Ok(session::StartOutcome::Cancelled) => {
+                    eprintln!("Capture picker cancelled; no session started");
+                }
+                Ok(session::StartOutcome::Ended(status)) => {
+                    eprintln!("Live session ended: {status:?}");
+                }
+                Err(error) => eprintln!("Live session did not start: {error}"),
+            }
+        })
+        .detach();
         let dev_bounds = Bounds::centered(None, size(px(1_000.0), px(620.0)), cx);
         let dev_timeline = timeline;
         if cx

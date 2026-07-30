@@ -77,3 +77,66 @@ parked capture gaps in T021 — leave them parked.
 The ten-minute session from the acceptance list is the real recorded conversation that T019's
 validation, ADR-0006's OCR retest, and the Phase 2 gate have all been waiting on. One live
 session pays off three tasks.
+
+## Review round 1 — the wiring is right; three fixes before this can be run
+
+The shape is correct and several judgement calls are good ones. `CaptureTarget` is cloned from
+`PickedTarget::description()` rather than synthesized, so the timeline records what the OS
+actually scoped. `pick_target().await` on GPUI's foreground executor is exactly the case the
+async variant exists for — the run loop keeps turning, so the picker's main-queue task can run.
+`SessionId::new(now.as_nanos())` is safe: `SessionId` is a `u128`. The current-thread runtime
+matches `crates/cli/src/pipeline.rs`, so no new divergence. And disabling `vad_gating` with a
+comment explaining that Silero is a separate producer is the right call, explained.
+
+Clippy is clean workspace-wide with `--all-features`.
+
+### 1. The tail of every conversation is lost from the UI
+
+```rust
+let terminal = loop { tokio::select! { … } };
+pipeline.stop().await;
+```
+
+The loop breaks the moment a terminal status arrives, and nothing receives from `events` after
+that. Whatever `stop()` flushes — the final utterances, which is to say the end of the
+conversation — goes to a bus with no reader. Persistence is inside the pipeline and still records
+them, so the UI and the persisted timeline diverge precisely at the end of the session, which is
+the hardest kind of discrepancy to notice and the worst kind to have.
+
+Drain `events` after `stop()` and forward what is left before returning.
+
+### 2. The database path will not survive being a real app
+
+```rust
+.unwrap_or_else(|| PathBuf::from("sotto.sqlite3"))
+```
+
+Relative, so it resolves against the working directory. A bundled app's working directory is
+`/`, so the session fails to open the store — and when it does work, it scatters databases
+wherever the binary happened to be launched from. Use `~/Library/Application Support/Sotto/`,
+creating the directory if absent. `SOTTO_DATABASE` can stay as an override.
+
+### 3. `cargo fmt --all -- --check` fails
+
+Four files. The checklist listed `git diff --check`, which tests trailing whitespace, not
+formatting — they are not substitutes, and T010's CI runs the former. Verification was also
+per-crate again (`-p app`) rather than `--workspace --all-features`; that is the fourth round.
+The habit matters here more than usual, because this task touches five crates' worth of
+integration.
+
+### Smaller
+
+- `Ok(CaptureStatus::Stopped) => break CaptureStatus::UserStopped` labels our own stop as a user
+  action. Nothing reads it yet, but this is the same truthfulness category as the rest of the
+  session record.
+- The picker presenting at app launch is a defensible interim and the ownership reasoning behind
+  it was right. It must not survive: opening the app to change a setting should not demand you
+  choose a capture target. T012 needs to expose the start/stop action; that is now its highest
+  priority, since T022 is otherwise finished.
+
+### The Whisper model gap is real and is not this task's fault
+
+`SOTTO_WHISPER_MODEL` is required because **nothing in the workspace downloads a Whisper model**.
+`AGENTS.md` promises `base.en` on first run; that was a decision, never an implementation. So a
+user cannot start a session without manually fetching weights. Refusing to start with a clear
+message is the right behaviour for now. Tracked separately as T023.

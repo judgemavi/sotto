@@ -9,12 +9,17 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+asr = { path = "../asr" }
+capture = { path = "../capture" }
 gpui = "=0.2.2"
 gpui-component = "=0.5.1"
 futures-util = "0.3.32"
 objc2 = "=0.6.4"
 providers = { path = "../providers" }
+prosody = { path = "../prosody" }
+rag = { path = "../rag" }
 raw-window-handle = "=0.6.2"
 secrecy = "0.10.3"
 sotto-core = { package = "core", path = "../core" }
 tokio = { version = "=1.53.1", features = ["rt", "sync", "time"] }
+vad = { path = "../vad" }
