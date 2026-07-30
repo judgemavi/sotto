@@ -4,20 +4,37 @@ mod seam;
 
 pub use seam::{TimelineIngress, TimelineState, attach_ingress};
 
-use gpui::{Context, Entity, IntoElement, Render, Window, div, prelude::*, rgb, uniform_list};
+use gpui::{
+    Context, Entity, IntoElement, Render, ScrollStrategy, UniformListScrollHandle, Window, div,
+    prelude::*, rgb, uniform_list,
+};
+use gpui_component::button::Button;
 use sotto_core::{EventKind, EventPayload, TimelineEvent};
+use std::time::{Duration, Instant};
 
 pub struct DevTimeline {
     timeline: Entity<TimelineState>,
     filter: Option<EventKind>,
+    auto_scroll: bool,
+    scroll_handle: UniformListScrollHandle,
+    validation_started: Instant,
+    last_frame: Option<Instant>,
+    frame_intervals: Vec<Duration>,
+    report_index: usize,
 }
 
 impl DevTimeline {
     #[must_use]
-    pub const fn new(timeline: Entity<TimelineState>) -> Self {
+    pub fn new(timeline: Entity<TimelineState>) -> Self {
         Self {
             timeline,
             filter: None,
+            auto_scroll: true,
+            scroll_handle: UniformListScrollHandle::new(),
+            validation_started: Instant::now(),
+            last_frame: None,
+            frame_intervals: Vec::new(),
+            report_index: 0,
         }
     }
 
@@ -25,10 +42,46 @@ impl DevTimeline {
         self.filter = filter;
         cx.notify();
     }
+
+    fn choose_filter(&mut self, kind: Option<EventKind>, cx: &mut Context<Self>) {
+        self.set_filter(kind, cx);
+        self.auto_scroll = true;
+    }
+
+    fn record_frame_interval(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.last_frame.replace(now) {
+            self.frame_intervals
+                .push(now.saturating_duration_since(last));
+        }
+        const REPORT_SECONDS: [u64; 4] = [60, 600, 1_200, 1_800];
+        let Some(report_at) = REPORT_SECONDS.get(self.report_index) else {
+            return;
+        };
+        if now.duration_since(self.validation_started).as_secs() < *report_at {
+            return;
+        }
+        let mut sorted = std::mem::take(&mut self.frame_intervals);
+        sorted.sort_unstable();
+        let p50 = sorted.get(sorted.len() / 2).copied().unwrap_or_default();
+        let p95 = sorted
+            .get(sorted.len().saturating_mul(95) / 100)
+            .copied()
+            .unwrap_or_default();
+        eprintln!(
+            "T012_FRAME interval_end_s={report_at} samples={} p50_ms={:.3} p95_ms={:.3}",
+            sorted.len(),
+            p50.as_secs_f64() * 1_000.0,
+            p95.as_secs_f64() * 1_000.0
+        );
+        self.report_index = self.report_index.saturating_add(1);
+    }
 }
 
 impl Render for DevTimeline {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        window.request_animation_frame();
+        self.record_frame_interval();
         let state = self.timeline.read(cx);
         let rows: Vec<_> = state
             .events()
@@ -36,10 +89,57 @@ impl Render for DevTimeline {
             .filter(|event| self.filter.is_none_or(|kind| event.kind() == kind))
             .cloned()
             .collect();
+        if self.auto_scroll && !rows.is_empty() {
+            self.scroll_handle
+                .scroll_to_item(rows.len() - 1, ScrollStrategy::Bottom);
+        }
+        let status = if self.auto_scroll {
+            "Following newest events"
+        } else {
+            "Auto-scroll paused"
+        };
         div()
             .size_full()
             .bg(rgb(0x111318))
             .text_color(rgb(0xe6e8eb))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .p_2()
+                    .child(
+                        Button::new("filter-all")
+                            .label("All")
+                            .on_click(cx.listener(|this, _, _, cx| this.choose_filter(None, cx))),
+                    )
+                    .child(
+                        Button::new("filter-partials")
+                            .label("Partials")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.choose_filter(Some(EventKind::UtterancePartial), cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("filter-finals")
+                            .label("Finals")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.choose_filter(Some(EventKind::UtteranceFinal), cx);
+                            })),
+                    )
+                    .child(Button::new("filter-errors").label("Errors").on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.choose_filter(Some(EventKind::Error), cx)
+                        }),
+                    ))
+                    .child(
+                        Button::new("follow-newest")
+                            .label(status)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.auto_scroll = true;
+                                cx.notify();
+                            })),
+                    ),
+            )
             .child(
                 uniform_list("timeline-events", rows.len(), move |range, _, _| {
                     range
@@ -54,6 +154,11 @@ impl Render for DevTimeline {
                         })
                         .collect()
                 })
+                .track_scroll(self.scroll_handle.clone())
+                .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                    this.auto_scroll = false;
+                    cx.notify();
+                }))
                 .h_full(),
             )
     }

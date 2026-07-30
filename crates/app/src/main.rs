@@ -315,7 +315,7 @@ fn main() {
                     ..Default::default()
                 },
                 move |window, cx| {
-                    let view = cx.new(|_| settings::SettingsView::default());
+                    let view = cx.new(|cx| settings::SettingsView::new(window, cx));
                     cx.new(|cx| gpui_component::Root::new(view, window, cx))
                 },
             )

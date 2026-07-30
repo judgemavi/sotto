@@ -1,6 +1,7 @@
 # T002 — Spike A: dual-stream macOS audio capture + low-rate screen frames
 
-**Status:** in-progress (4 defects fixed; long-run validation deferred as accepted risk)
+**Status:** in-progress (4 defects fixed; only the long-run soak measurement remains — it edits
+no files, so `crates/capture/**` ownership has transferred to T021)
 
 **Wave:** 1 — start this one first, it has the longest tail and the highest technical risk
 

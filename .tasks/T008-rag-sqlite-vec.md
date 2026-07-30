@@ -209,3 +209,23 @@ Two things to tighten while this is fresh:
   `CREATE TABLE IF NOT EXISTS` in the migration block. They must stay byte-compatible forever, and
   nothing enforces that. Either derive the migration from the same constant, or add a test that
   opens a fresh database and a migrated one and asserts identical `PRAGMA table_info` output.
+
+## Follow-up implementation (2026-07-30)
+
+Added a v2→v3 migration test that starts from the schema existing users have, preserves a session,
+and exercises derived-view save/load after migration. Fresh creation and migration now execute the
+same `DERIVED_VIEWS_SCHEMA` constant, eliminating the duplicated table definition rather than
+merely testing two copies for equality.
+
+## Review of the follow-up — both gaps closed
+
+The v2 fixture is constructed correctly: v2 is `SQLITE_SCHEMA` + `RAG_SCHEMA` + the two v1→v2
+indexes, which is exactly what dropping `derived_views` and its index from a v3 database leaves
+behind. And the test does more than assert the table exists — preserving the session record and
+then round-tripping a derived view through the migrated database exercises the foreign key into
+`sessions`, which is the part that would actually break.
+
+Deriving both paths from one `DERIVED_VIEWS_SCHEMA` is better than the `PRAGMA table_info`
+comparison I suggested as the alternative: it removes the drift instead of detecting it. The
+`IF NOT EXISTS` now in the fresh-install path is marginally weaker than a bare `CREATE TABLE`,
+but on a fresh database there is nothing for it to skip over.

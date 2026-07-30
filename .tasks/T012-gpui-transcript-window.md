@@ -1,6 +1,7 @@
 # T012 — GPUI dev window: live timeline + settings screens
 
-**Status:** in-progress (dev timeline seam and settings shell implemented; manual flows remain)
+**Status:** in-progress (timeline, filters, follow and key handling done; start/stop blocked on
+T021, four review fixes outstanding)
 
 **Wave:** 2
 
@@ -125,3 +126,110 @@ Two things for the remaining work:
   distinction in the UI. "Your key is wrong" and "the keychain is locked" and "the network is
   down" are three different messages, and the taxonomy exists to make them distinguishable.
   Validate with a real cheap call, never render a key back after entry.
+
+## Notes — implementation pass 2 (2026-07-30)
+
+The dev timeline now has interactive kind filters and a follow control. Any user scroll pauses
+auto-scroll; choosing a filter or pressing the follow control resumes at the newest matching
+event. The virtualised list still consumes the original shared `TimelineState`; no second
+timeline ingress was introduced.
+
+The T012 harness now emits non-cumulative `T012_FRAME` intervals at 1/10/20/30 minutes, clearing
+the sample set after each report so results are directly comparable to T016/T020. Instrumentation
+is present, but the one-hour manual run has **not** been performed in this pass; no frame-time
+figures are claimed.
+
+Settings now provide a masked, write-only key field which is erased immediately after keychain
+storage, provider selection, deletion, and a real one-token validation call. Validation preserves
+T007's actionable distinction between rejected credentials, a locked/unavailable credential
+store, and an unreachable network (with rate limiting separate as well). Speculation level is an
+interactive cost choice.
+
+The scoped picker/start-stop flow remains blocked on the capture-side interface: the current
+macOS bridge exposes neither `SCContentSharingPicker` selection nor a selected target to the app,
+and its start path constructs an unscoped display filter. Wiring that path here would falsely
+present whole-display capture as user-scoped capture. Audio-device enumeration/selection and the
+manual real-key/keychain round-trip also remain validation gates.
+
+## Review of pass 2 — the refusal was right; four things to fix
+
+Stopping at the capture boundary rather than wiring "Turn on and choose target…" to
+`SCContentFilter(display:…)` is the single best decision in this pass. I verified it:
+`CaptureBridge.swift:73` builds a whole-display filter, `sotto_capture_start` takes no target,
+and nothing in `crates/capture` can express one. A start button on that path would have shipped
+unscoped capture behind a label promising the opposite. **T021 now owns that interface** and is
+the critical path; come back for start/stop when it lands.
+
+### 1. `select_default_audio` does the thing you refused to do everywhere else
+
+```rust
+self.state.mic_device = Some("System default microphone".to_owned());
+self.state.target_audio_device = Some("Selected target audio".to_owned());
+```
+
+Those are labels, not devices. Nothing was enumerated and nothing is bound, but the state now
+says a device is selected, and any indicator reading that state will report a selection that
+does not exist. This is the same class of untruth as the unscoped filter — a UI asserting a
+scope it does not have. Leave the control absent or disabled until enumeration exists. A missing
+button is honest; a button that writes a fake device name is not.
+
+### 2. "No key stored" is being reported as "This key was rejected"
+
+Two paths reach `BadKey` without a provider ever rejecting anything: an empty input in
+`save_input_key`, and `Ok(None)` from `load_key` in `validate_provider_key`. The user sees *"This
+key was rejected. Replace it and try again"* when in fact they have not entered one. That defeats
+the point of the taxonomy — the reason T007 distinguishes these is so the message tells you what
+to actually do. Add a `NoKey` variant: "No key stored for this provider."
+
+While there: `CredentialStore(_) => "Keychain is locked. Unlock it and try again."` asserts a
+cause we did not observe. That variant also covers denied access and missing items. Say "Could
+not read the keychain: {reason}" — still distinct from a bad key and from a network failure,
+without naming a cause we are guessing at.
+
+### 3. A dead validation thread locks the button out for the session
+
+`validate_selected_key` polls `receiver.try_recv()` and only exits on `Ok`. If the worker thread
+ever dies without sending, `try_recv` returns `Disconnected` forever: the task spins at 50 ms for
+the life of the process, the status stays `Validating`, and the `if self.key_status ==
+Validating { return; }` guard means the user can never retry. One match arm on
+`TryRecvError::Disconnected` fixes it. The 50 ms poll itself is fine — it is the same idiom as
+the seam.
+
+### 4. The instrumentation stops halfway through the run it was built for
+
+Acceptance here is *frame time stable over a one-hour synthetic session*, but `REPORT_SECONDS`
+ends at 1800. Minutes 30–60 produce no report at all, while `record_frame_interval` keeps
+pushing into `frame_intervals` — the push happens before the `report_index` exhaustion early
+return, so the vector grows unbounded for the rest of the process's life (~110k samples over
+that second half). Add a 3600 point, and stop pushing once the schedule is exhausted.
+
+Separately: `window.request_animation_frame()` is unconditional in `DevTimeline::render`. In
+T020's `Lens` that was a benchmark harness; here it is the window someone actually runs, so the
+dev window now redraws 60 times a second forever whether or not events arrive. That makes the
+idle-CPU figure meaningless and costs real battery for a measurement nobody is taking. Gate the
+raf and the instrumentation behind an env var — `SOTTO_FRAME_VALIDATION=1` — so the measured run
+is deliberate and the normal window is idle when idle.
+
+### What the frame numbers can and cannot show
+
+Worth naming before the one-hour run, because it changes how the result is read. This measures
+the interval *between renders* under raf, not the cost of a frame. T020's headline p50 of
+8.332 ms is 1/120 s — it is the ProMotion refresh period, not frame cost, and p50 will keep
+reading the refresh period no matter how expensive rendering gets until cost exceeds the frame
+budget. So the drift signal is p95 and any p50 rising off the refresh period; a frame getting
+three times more expensive inside the budget is invisible. Report a max and a count of intervals
+over budget per window alongside p50/p95 and the metric detects what T016 needs it to detect.
+
+### Accepted as-is
+
+Filters and the follow control read correctly — any user scroll pauses following, choosing a
+filter or pressing follow resumes at the newest matching event, and the virtualised list still
+consumes the one shared `TimelineState`. No second ingress was introduced; the seam T016 inherits
+is unchanged. The masked write-only key field cleared immediately after storage, never loaded
+back, with a real one-token validation call, is exactly right.
+
+One correction: `default_model` returns `claude-3-5-haiku-latest` for Anthropic. Use
+`claude-haiku-4-5-20251001`. And note that validation always calls the provider's default model
+rather than the model selected for the role — so a key that lacks access to the selected model
+validates green and fails in real use. Either validate the selected model, or say in the UI that
+this checks the credential only.

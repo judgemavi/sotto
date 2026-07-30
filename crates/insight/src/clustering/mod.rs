@@ -84,7 +84,9 @@ impl<'a> Clusterer<'a> {
     pub async fn cluster(&self, session_id: SessionId) -> Result<ClusterReport, ClusterError> {
         let events = self.store.load_session(session_id)?;
         let input = render_timeline(&events)?;
-        let content_hash = stable_hash(input.as_bytes());
+        // Prompt wording is part of the model input. Include it so ordinary in-place
+        // prompt iteration cannot silently reuse an artifact produced by older instructions.
+        let content_hash = clustering_content_hash(PROMPT, &input);
         let model = self.provider.model_id().to_owned();
         if let Some((artifact, usage)) =
             self.store
@@ -220,6 +222,13 @@ fn stable_hash(bytes: &[u8]) -> String {
     format!("{:016x}", hash.finish())
 }
 
+fn clustering_content_hash(prompt: &str, timeline: &str) -> String {
+    // Length-prefix the fields rather than relying on a separator that either input could
+    // contain. VIEW_KIND and model remain independent dimensions in the database key.
+    let material = format!("{}:{prompt}{}:{timeline}", prompt.len(), timeline.len());
+    stable_hash(material.as_bytes())
+}
+
 fn strip_fence(output: &str) -> &str {
     let trimmed = output.trim();
     trimmed
@@ -227,4 +236,18 @@ fn strip_fence(output: &str) -> &str {
         .and_then(|body| body.strip_suffix("```"))
         .map(str::trim)
         .unwrap_or(trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clustering_content_hash;
+
+    #[test]
+    fn editing_prompt_text_invalidates_content_hash() {
+        let timeline = "[event:1 at:0.0s] customer: pricing?";
+        assert_ne!(
+            clustering_content_hash("cluster conservatively", timeline),
+            clustering_content_hash("cluster very conservatively", timeline)
+        );
+    }
 }

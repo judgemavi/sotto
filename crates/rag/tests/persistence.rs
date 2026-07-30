@@ -109,4 +109,57 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn migrating_a_version_two_database_preserves_data_and_adds_derived_views()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("rag.sqlite3");
+        {
+            let store = Store::open(&path)?;
+            store.save_session(&session())?;
+        }
+        {
+            let connection = Connection::open(&path)?;
+            connection.execute_batch(
+                "DROP INDEX derived_views_session_kind_idx;\
+                 DROP TABLE derived_views;\
+                 PRAGMA user_version = 2;",
+            )?;
+        }
+
+        let migrated = Store::open(&path)?;
+        assert_eq!(
+            migrated
+                .load_session_record(SessionId::new(7))?
+                .capture_target(),
+            session().capture_target()
+        );
+        migrated.save_derived_view(
+            SessionId::new(7),
+            "topical_clusters.v1",
+            "test-model",
+            "timeline-and-prompt-hash",
+            r#"{"regions":[]}"#,
+            r#"{"input_tokens":1}"#,
+        )?;
+        assert_eq!(
+            migrated.load_derived_view(
+                SessionId::new(7),
+                "topical_clusters.v1",
+                "test-model",
+                "timeline-and-prompt-hash"
+            )?,
+            Some((
+                r#"{"regions":[]}"#.to_owned(),
+                r#"{"input_tokens":1}"#.to_owned()
+            ))
+        );
+        let connection = Connection::open(path)?;
+        assert_eq!(
+            connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+            3
+        );
+        Ok(())
+    }
 }

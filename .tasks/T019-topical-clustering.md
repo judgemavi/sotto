@@ -1,6 +1,7 @@
 # T019 — Topical clustering: the second organising axis
 
-**Status:** in-progress (implementation complete; real-call recognition gate remains)
+**Status:** blocked on a real recorded session (implementation and review complete; no
+implementer work remains)
 
 **Wave:** Phase 3 — the reasoning layer
 
@@ -121,3 +122,29 @@ prompt invalidates automatically and no one has to remember anything.
 Validation against a real recorded call. Worth pairing with the map-tier gate — `AGENTS.md` now
 says any two-party conversation qualifies, so a 1:1 with a colleague gives you a real session
 for both this and ADR-0006's OCR retest at once.
+
+## Follow-up implementation (2026-07-30)
+
+The cache content hash now length-prefixes and hashes both the exact prompt text and rendered
+timeline. Editing `prompts/clustering/v1.md` in place therefore misses artifacts produced by the
+old prompt automatically; a regression test proves prompt-only changes alter the hash.
+
+No real persisted session is present in the workspace (the available `call-01.jsonl` is the
+synthetic fixture), so the participant-recognition and cross-reference-reading acceptance gate
+remains blocked on Phase 2 dogfood. Synthetic output has deliberately not been reported as real
+validation.
+
+## Review — cache fix accepted; task is now blocked on a recording, not on code
+
+`clustering_content_hash` length-prefixes both fields, so no prompt text can be confused with
+timeline text at the boundary, and `editing_prompt_text_invalidates_content_hash` proves the
+property rather than the implementation. `VIEW_KIND` and `model` stay independent dimensions in
+the database key, which is what you want — the artifact version and the model are legitimately
+separate axes from the input content. Prompt iteration is now safe to do in place.
+
+Not presenting synthetic fixture output as validation is the right call and the thing I would
+have sent back if you had. The fixture is 30 seconds of TTS; it cannot answer whether a
+participant recognises the topic regions.
+
+**Status is blocked on a user action, not on implementation.** Nothing further to do here until
+a real recorded session exists.
