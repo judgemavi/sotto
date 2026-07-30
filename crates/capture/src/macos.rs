@@ -839,9 +839,6 @@ unsafe extern "C" fn error_callback(context: *mut c_void, code: c_int) {
                 .status
                 .store(CaptureStatus::TargetEnded.code(), Ordering::Release);
             let _ = state.status_sink.send(CaptureStatus::TargetEnded);
-            let _ = state.error_sink.send(CaptureError::StreamFailed(
-                "selected capture target disappeared".to_owned(),
-            ));
         }
         -6 => {
             state.running.store(false, Ordering::Release);

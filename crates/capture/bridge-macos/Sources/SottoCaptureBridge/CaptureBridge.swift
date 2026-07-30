@@ -121,7 +121,26 @@ private final class TargetPicker: NSObject, SCContentSharingPickerObserver {
         Unmanaged.passUnretained(self).release()
     }
 
+    /// Dumps what the picker actually handed back, under SOTTO_CAPTURE_DEBUG=1.
+    ///
+    /// A display pick delivers audio packets whose samples are all exactly zero. If
+    /// ScreenCaptureKit mixes audio from the applications named in the filter, a display
+    /// filter carrying no applications would explain that precisely.
+    private static func dumpFilter(_ filter: SCContentFilter) {
+        guard ProcessInfo.processInfo.environment["SOTTO_CAPTURE_DEBUG"] == "1" else { return }
+        var line = "filter style=\(filter.style.rawValue) rect=\(filter.contentRect) scale=\(filter.pointPixelScale)"
+        if #available(macOS 15.2, *) {
+            line += " apps=\(filter.includedApplications.count)"
+            line += " windows=\(filter.includedWindows.count)"
+            line += " displays=\(filter.includedDisplays.count)"
+            let names = filter.includedApplications.prefix(5).map(\.applicationName)
+            if !names.isEmpty { line += " [\(names.joined(separator: ", "))]" }
+        }
+        FileHandle.standardError.write(Data("\(line)\n".utf8))
+    }
+
     private static func describe(_ filter: SCContentFilter) -> PickedTarget {
+        dumpFilter(filter)
         switch filter.style {
         case .window:
             let window: SCWindow? = if #available(macOS 15.2, *) {
@@ -198,6 +217,7 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, 
     private var stream: SCStream?
     private var sequence: UInt64 = 0
     private var lastFrameTimeNs: UInt64 = 0
+    private var monoScratch = [Float]()
     private let terminalLock = NSLock()
     private var reportedTerminal = false
 
@@ -209,7 +229,10 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, 
     func start() async throws {
         let streamConfig = SCStreamConfiguration()
         streamConfig.capturesAudio = true
-        streamConfig.excludesCurrentProcessAudio = true
+        // Display capture is intentionally system-wide. Excluding this process is
+        // useful for application/window filters, but on display-style picker filters
+        // it can result in silent audio buffers on current macOS releases.
+        streamConfig.excludesCurrentProcessAudio = target.audioScoped
         streamConfig.sampleRate = 48_000
         streamConfig.channelCount = 1
         // Capture frames at the display's real backing resolution, capped so a frame
@@ -274,25 +297,46 @@ private final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, 
             return
         }
         guard outputType == .audio,
-              let block = sampleBuffer.dataBuffer else { return }
+              let description = sampleBuffer.formatDescription?.audioStreamBasicDescription,
+              let format = AVAudioFormat(
+                standardFormatWithSampleRate: description.mSampleRate,
+                channels: description.mChannelsPerFrame
+              ) else { return }
 
-        var length = 0
-        var pointer: UnsafeMutablePointer<Int8>?
-        guard CMBlockBufferGetDataPointer(
-            block,
-            atOffset: 0,
-            lengthAtOffsetOut: nil,
-            totalLengthOut: &length,
-            dataPointerOut: &pointer
-        ) == kCMBlockBufferNoErr, let pointer else { return }
+        try? sampleBuffer.withAudioBufferList { audioBufferList, _ in
+            guard let buffer = AVAudioPCMBuffer(
+                pcmFormat: format,
+                bufferListNoCopy: audioBufferList.unsafePointer
+            ), let channelData = buffer.floatChannelData else { return }
 
-        let count = length / MemoryLayout<Float>.stride
-        let timestamp = sampleBuffer.presentationTimeStamp
-        let timestampNs = timestamp.isValid ? UInt64(max(0, CMTimeGetSeconds(timestamp) * 1_000_000_000)) : 0
-        pointer.withMemoryRebound(to: Float.self, capacity: count) { samples in
-            config.audio(config.context, samples, count, sequence, timestampNs)
+            let frameCount = Int(buffer.frameLength)
+            let channelCount = Int(format.channelCount)
+            guard frameCount > 0, channelCount > 0 else { return }
+            let timestamp = sampleBuffer.presentationTimeStamp
+            let timestampNs = timestamp.isValid
+                ? UInt64(max(0, CMTimeGetSeconds(timestamp) * 1_000_000_000)) : 0
+
+            if channelCount == 1 {
+                config.audio(config.context, channelData[0], frameCount, sequence, timestampNs)
+            } else {
+                if monoScratch.count != frameCount {
+                    monoScratch = [Float](repeating: 0, count: frameCount)
+                }
+                for frame in 0..<frameCount {
+                    var sum: Float = 0
+                    for channel in 0..<channelCount {
+                        sum += channelData[channel][frame]
+                    }
+                    monoScratch[frame] = sum / Float(channelCount)
+                }
+                monoScratch.withUnsafeBufferPointer { samples in
+                    config.audio(
+                        config.context, samples.baseAddress, samples.count, sequence, timestampNs
+                    )
+                }
+            }
+            sequence &+= 1
         }
-        sequence &+= 1
     }
 
     private func deliverFrame(_ sampleBuffer: CMSampleBuffer) {

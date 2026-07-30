@@ -394,3 +394,28 @@ the `error_sink` send on `-5` and let the status carry it, exactly as `-6` does.
 Remaining: the display-audio defect, the `TargetEnded` error/status inconsistency, a capture of
 a window that is confirmed not frontmost, and the ten-minute drift measurement that also
 retires T002's deferred soak.
+
+### Diagnostic added for the display-audio defect (planner, uncoordinated — check before editing)
+
+`describe` now dumps the picker's filter under `SOTTO_CAPTURE_DEBUG=1`: style, contentRect,
+scale, and the counts of included applications/windows/displays. Run a display pick and a window
+pick and compare.
+
+Hypothesis it tests: ScreenCaptureKit mixes audio from the applications *named in the filter*.
+That fits every measurement — a window filter names Chrome, so Chrome's audio arrived and a
+separate process's did not. If a picker-produced display filter names zero applications, packets
+of silence with no error is exactly what you would expect.
+
+If confirmed, the fix is uncomfortable: naming applications means assembling the filter from
+`SCShareableContent` ourselves rather than using the one the picker returned, which erodes the
+guarantee this task exists to enforce. Preference order:
+
+1. Report display audio as unavailable in the target description, so the indicator can say
+   "audio: none" rather than implying system audio. Keeps the guarantee; costs a capability
+   nobody has asked for, since the product case is a call in a window.
+2. Fix it within the picker's own output if a configuration knob exists. Best outcome.
+3. Reconstruct the filter ourselves. Restores the capability, weakens the guarantee — needs a
+   strong reason.
+
+Recommendation is 1 unless the diagnostic points at 2. Silently recording zeros is the only
+outcome that is actually unacceptable; the absence of whole-display audio is not.
