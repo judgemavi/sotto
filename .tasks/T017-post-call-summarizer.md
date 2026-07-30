@@ -1,6 +1,6 @@
 # T017 — Post-call summarizer: structured recap from the timeline
 
-**Status:** in-review (ADR-0006 added for re-review)
+**Status:** done (approved at review round 2)
 
 **Wave:** 3 — Phase 2, the note-taker dogfood gate
 
