@@ -351,3 +351,46 @@ The tone was confirmed audible during playback, so `afplay` was genuinely render
 output device. That removes the one alternative explanation for its absence from the window
 capture. Audio scoping for a window pick is established, not merely indicated: a separate
 process's audio was excluded while the picked application's was captured.
+
+## Window-close detection verified (2026-07-30)
+
+```
+[   0.0s] capture status: Starting
+[   0.1s] capture status: Running
+[  28.3s] capture error: capture stream failed: selected capture target disappeared
+[  28.3s] capture status: TargetEnded
+capture ended early after 28.3s: TargetEnded
+```
+
+Closing the captured window ends the session with a status the app can render. The single
+detection path left after the `SCFrameStatus` removal — `didStopWithError` with
+`.noCaptureSource` or `.systemStoppedStream` — does fire. I expected this to be the check that
+failed; it is not.
+
+### But a closed window is not an error
+
+`TargetEnded` emits both a `CaptureStatus` and a `CaptureError::StreamFailed`. `UserStopped`,
+added in the same round, correctly emits only a status. The two should agree, and `UserStopped`
+has it right.
+
+A user closing the window they were capturing is a normal way for a session to end — as normal
+as pressing stop. Raising `capture stream failed` for it means T012's settings surface shows an
+error banner for an outcome the user deliberately caused, in a UI whose whole job is to
+distinguish real failures (bad key, locked keychain, network down) from ordinary states. Drop
+the `error_sink` send on `-5` and let the status carry it, exactly as `-6` does.
+
+## Acceptance status
+
+| Criterion | State |
+|---|---|
+| Picker presents; window captures | verified |
+| Nothing outside the target in any frame | verified from captured PNG |
+| Cancelling leaves no session and no error | verified |
+| `audio_scoped` true for a window pick | **proven** — a separate process's audio excluded while the target's was captured |
+| `audio_scoped` false for a display pick | **defect** — no audio at all, not unscoped audio |
+| Closing the window ends the session | verified |
+| No path starts capture without a picker filter | verified by construction |
+
+Remaining: the display-audio defect, the `TargetEnded` error/status inconsistency, a capture of
+a window that is confirmed not frontmost, and the ten-minute drift measurement that also
+retires T002's deferred soak.
