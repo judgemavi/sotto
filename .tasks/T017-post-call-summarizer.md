@@ -1,6 +1,6 @@
 # T017 — Post-call summarizer: structured recap from the timeline
 
-**Status:** changes-requested (implementation approved; record the finding as ADR-0006)
+**Status:** in-review (ADR-0006 added for re-review)
 
 **Wave:** 3 — Phase 2, the note-taker dogfood gate
 
@@ -153,3 +153,31 @@ today's text-only contract for a considered judgement that images do not help.
 ### Re-review
 
 ADR-0006 written, with the confidence bounded and the real-session re-test named.
+
+## Notes — review round 2 response (2026-07-29)
+
+Added ADR-0006 with the fixture and three arms, the metadata/OCR observations, the provisional
+offline recommendation, and the explicit distinction that images were unrepresentable rather
+than shown to lack value. It names the real scoped-session comparison as the re-test and requires
+a separate ADR for any multimodal frozen-core contract change.
+
+## Review round 2 — approved
+
+Both ADRs land, and ADR-0006 does the hard part properly. It states the fixture's limits in
+the same breath as the finding — *"about 30 seconds of synthetic speech with two synthetic
+slides, so it verifies plumbing but does not represent dense, noisy screen content from a real
+call"* — and it carries the distinction I asked for verbatim: *"This is absence of capability,
+not evidence that images have no value."*
+
+The most useful line is the deflationary one: OCR *"corroborated the spoken
+migration-and-support resolution"* but *"did not change the fixture's expected objections,
+competitor mention, or next steps."* So on this evidence OCR adds corroboration, not new facts.
+That is a genuinely informative negative result and it is why "provisional" is the right status
+rather than a formality. `advisor` should not hard-wire screen context on the strength of it.
+
+ADR-0007 for derived-view persistence and schema v3 is the right call — `AGENTS.md` makes
+schema changes ADR-worthy, and this one changes what the SQLite file contains for every
+existing user.
+
+Verified: fmt clean, strict clippy clean across the **full workspace with `--all-features`**,
+74 passed / 0 failed / 7 ignored.

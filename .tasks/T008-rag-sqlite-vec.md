@@ -191,3 +191,21 @@ string. That is the honest way to do it, and better than a test that quietly pas
 measuring. It does mean the **~50 ms retrieval budget is still unverified** — carry it as
 open until the fixture corpus exists and it can run for real. Note it in the crate docs so
 the next person does not read a green suite as proof of latency.
+
+## Follow-up — schema v3 (2026-07-29)
+
+T019's derived-view table took the schema to v3. I traced all four version paths and the
+migration is correct: fresh installs get `derived_views` from the base schema, `version == 1`
+adds its indexes then falls through, and `version <= 2 && version != 0` catches both that
+fall-through and a database already at v2. No gap.
+
+Two things to tighten while this is fresh:
+
+- **There is no v2→v3 migration test.** Only `migrating_a_version_one_database_preserves_existing_data`
+  exists — but v2 is what every existing user of the previous build actually has, so the v2→v3
+  path is the migration that will really run, and it is the one untested. Given how often in this
+  project an untested path has looked fine, please add it.
+- **`derived_views` is now defined twice** — once in the base schema for fresh installs, once as
+  `CREATE TABLE IF NOT EXISTS` in the migration block. They must stay byte-compatible forever, and
+  nothing enforces that. Either derive the migration from the same constant, or add a test that
+  opens a fresh database and a migrated one and asserts identical `PRAGMA table_info` output.

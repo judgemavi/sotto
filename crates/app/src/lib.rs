@@ -2,6 +2,9 @@
 
 #![deny(warnings)]
 
+pub mod devwindow;
+pub mod settings;
+
 use std::sync::Arc;
 
 /// Stable identifier for an object in the spike scene.

@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 use sotto_core::{RagError, SQLITE_SCHEMA};
 
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 const RAG_SCHEMA: &str = r#"
 CREATE TABLE documents (
@@ -24,6 +24,13 @@ CREATE TABLE accounts (id TEXT PRIMARY KEY, name TEXT NOT NULL, metadata TEXT NO
 CREATE VIRTUAL TABLE vec_chunks USING vec0(chunk_id TEXT PRIMARY KEY, embedding float[384]);
 CREATE INDEX documents_kind_account_idx ON documents(kind, account_id);
 CREATE INDEX chunks_doc_id_idx ON chunks(doc_id);
+CREATE TABLE derived_views (
+ session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+ kind TEXT NOT NULL, model TEXT NOT NULL, content_hash TEXT NOT NULL,
+ artifact TEXT NOT NULL, usage TEXT NOT NULL, created_at INTEGER NOT NULL,
+ PRIMARY KEY(session_id, kind, model, content_hash)
+);
+CREATE INDEX derived_views_session_kind_idx ON derived_views(session_id, kind);
 "#;
 
 pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
@@ -51,6 +58,23 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
             .execute_batch(
                 "CREATE INDEX IF NOT EXISTS documents_kind_account_idx ON documents(kind, account_id);\
                  CREATE INDEX IF NOT EXISTS chunks_doc_id_idx ON chunks(doc_id);",
+            )
+            .map_err(storage)?;
+        transaction
+            .pragma_update(None, "user_version", 2)
+            .map_err(storage)?;
+        transaction.commit().map_err(storage)?;
+    }
+    if version <= 2 && version != 0 {
+        let transaction = connection.transaction().map_err(storage)?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS derived_views (\
+             session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,\
+             kind TEXT NOT NULL, model TEXT NOT NULL, content_hash TEXT NOT NULL,\
+             artifact TEXT NOT NULL, usage TEXT NOT NULL, created_at INTEGER NOT NULL,\
+             PRIMARY KEY(session_id, kind, model, content_hash));\
+             CREATE INDEX IF NOT EXISTS derived_views_session_kind_idx ON derived_views(session_id, kind);",
             )
             .map_err(storage)?;
         transaction

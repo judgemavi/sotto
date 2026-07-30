@@ -206,6 +206,42 @@ impl Store {
             }).optional().map_err(storage)?.ok_or_else(|| RagError::NotFound { id: id.get().to_string() })
     }
 
+    /// Loads a model-derived artifact only when it matches the exact timeline content.
+    pub fn load_derived_view(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        model: &str,
+        content_hash: &str,
+    ) -> Result<Option<(String, String)>, RagError> {
+        self.reader.lock().map_err(poisoned)?.query_row(
+            "SELECT artifact,usage FROM derived_views WHERE session_id=?1 AND kind=?2 AND model=?3 AND content_hash=?4",
+            params![session_id.get().to_string(), kind, model, content_hash],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(storage)
+    }
+
+    /// Stores a derived view alongside, never inside, the append-only event log.
+    pub fn save_derived_view(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        model: &str,
+        content_hash: &str,
+        artifact: &str,
+        usage: &str,
+    ) -> Result<(), RagError> {
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(message)?
+            .as_secs();
+        self.writer.lock().map_err(poisoned)?.execute(
+            "INSERT INTO derived_views(session_id,kind,model,content_hash,artifact,usage,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(session_id,kind,model,content_hash) DO NOTHING",
+            params![session_id.get().to_string(), kind, model, content_hash, artifact, usage, created_at],
+        ).map_err(storage)?;
+        Ok(())
+    }
+
     pub fn ingest_text(
         &self,
         text: &str,

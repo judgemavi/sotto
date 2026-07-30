@@ -105,7 +105,7 @@ mod tests {
         let connection = Connection::open(path)?;
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            2
+            3
         );
         Ok(())
     }

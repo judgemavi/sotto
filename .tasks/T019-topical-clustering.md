@@ -1,6 +1,6 @@
 # T019 — Topical clustering: the second organising axis
 
-**Status:** todo (unblocked — crates/insight exists)
+**Status:** in-progress (implementation complete; real-call recognition gate remains)
 
 **Wave:** Phase 3 — the reasoning layer
 
@@ -77,3 +77,47 @@ falling back to pure chronology.
 
 Realtime suggestion (T013), editing the timeline, freeform user-drawn mind maps
 (`AGENTS.md` non-goal: the board is conversation-generated, not a drawing tool).
+
+## Notes — implementation pass 1 (2026-07-29)
+
+Added a versioned clustering prompt and `Clusterer::cluster`, returning regions,
+cross-timeline links, and conservative open threads keyed only by known `EventId`s. Invalid model
+citations and empty regions fail explicitly. Metadata and OCR follow ADR-0006.
+
+Derived artifacts and usage are stored in a dedicated SQLite table keyed by session, artifact
+version, model, and stable timeline-content hash. An unchanged rerun performs no provider call;
+the integration test also proves the serialized timeline is byte-identical before and after.
+Schema migration v3 and its rationale are recorded in ADR-0007.
+
+The real recorded-call recognition and cross-reference reading gates cannot be satisfied by the
+synthetic fixture. This task stays in progress until Phase 2 dogfood supplies that session.
+
+## Interim review — good foundation, one cache-key issue
+
+Not approving yet since real-call validation is outstanding, but the structure is right.
+
+**Derived views genuinely do not mutate the log** — `unchanged_timeline_is_cached_without_mutating_events`
+asserts exactly the `AGENTS.md` invariant that a model's opinion is not a fact about what
+happened. Caching on `(session_id, VIEW_KIND, model, content_hash)` with
+`VIEW_KIND = "topical_clusters.v1"` correctly separates artifact version from timeline content,
+and cached reruns avoiding provider calls is the behaviour that makes re-opening a call free.
+
+### The prompt is not in the cache key
+
+`PROMPT` is `include_str!("prompts/clustering/v1.md")`, and the key carries `.v1` through
+`VIEW_KIND` — so invalidation depends on someone remembering to bump *both* the filename and the
+constant whenever the prompt changes.
+
+That convention will break the first afternoon anyone iterates on this prompt. Editing `v1.md`
+in place is the natural thing to do, and the result is silently stale cached clusters that look
+like the new prompt did nothing. Prompt iteration is most of the work in both this task and
+T017, so this will cost real time.
+
+Fold the prompt text into `content_hash` (or hash it separately into the key). Then editing a
+prompt invalidates automatically and no one has to remember anything.
+
+### Outstanding, as you noted
+
+Validation against a real recorded call. Worth pairing with the map-tier gate — `AGENTS.md` now
+says any two-party conversation qualifies, so a 1:1 with a colleague gives you a real session
+for both this and ADR-0006's OCR retest at once.

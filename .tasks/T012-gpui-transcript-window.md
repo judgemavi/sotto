@@ -1,6 +1,6 @@
 # T012 — GPUI dev window: live timeline + settings screens
 
-**Status:** todo (unblocked — GPUI retained per ADR-0003)
+**Status:** in-progress (dev timeline seam and settings shell implemented; manual flows remain)
 
 **Wave:** 2
 
@@ -84,3 +84,44 @@ needs keys configurable before the note-taker gate can be dogfooded at all.
 
 The board canvas (T016), the production overlay lens (Phase 4), suggestion rendering
 (T013), tray/menubar, auto-updater.
+
+## Notes — implementation pass 1 (2026-07-29)
+
+Added the single bounded `TimelineEvent` ingress under `app::devwindow`; it batches into one
+shared GPUI `Entity<TimelineState>`, which is the interface T016 should consume. The diagnostic
+window uses a virtualised list and renders ids, timestamps, kinds, payload detail, and
+`supersedes` without mutating prior rows. The executable feeds it synthetic partial/final pairs
+so supersession is visible.
+
+Added settings state for write-only keychain operations, independent role/model choices,
+audio-device fields, speculation level, a truthful capture-scope indicator, and a
+`gpui-component` settings shell. The UI actions for entering/validating keys, selecting devices,
+opening the system picker, stop capture, filtering, and yielding auto-scroll are not wired yet.
+The one-hour frame run and real keychain round-trip also remain. This task stays in progress.
+
+## Interim review — the seam is the part that matters, and it looks right
+
+Not approving yet, given the outstanding list. Two notes so they land before the remaining work.
+
+**One bounded seam, as required.** A single `tokio::sync::mpsc` receiver drained on the GPUI
+foreground every 16 ms through `AsyncApp::update` is exactly what `AGENTS.md` asks for and what
+ADR-0003 prescribes. Keep it that way: T016's board consumes this same seam, so its shape is an
+interface, not an internal detail. Any second path from tokio into GPUI is the thing to refuse.
+
+**The diagnostic view showing ids, timestamps, kinds, payloads and supersessions** is the right
+call. It makes append-only behaviour directly observable — a partial being superseded reads as a
+*new event referencing an old one* rather than as an edit, which is precisely what someone
+debugging a wrong board needs to see.
+
+Two things for the remaining work:
+
+- **The one-hour performance validation should reuse T020's non-cumulative reporting.** T020
+  fixed the harness to report frame intervals at 1/10/20/30 minutes specifically so accumulation
+  drift cannot hide in an average. Report the same way here rather than a single figure — and
+  note that T016 now carries the 30-minute board measurement as an acceptance criterion, so
+  matching the format lets the two be compared.
+- **Key validation touches secrets.** T007 keeps credentials in `SecretString` end to end and
+  keychain failures report as `CredentialStore` rather than `Network` — so surface *that*
+  distinction in the UI. "Your key is wrong" and "the keychain is locked" and "the network is
+  down" are three different messages, and the taxonomy exists to make them distinguishable.
+  Validate with a real cheap call, never render a key back after entry.
