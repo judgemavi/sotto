@@ -308,3 +308,39 @@ the real acceptance run rather than dismissing it.
 Still outstanding, and all needing a person: capturing a non-frontmost window, confirming
 nothing outside the target leaks into a frame, and closing the picked window to prove
 `TargetEnded` arrives on its single untested path.
+
+## Capture evidence from the first real runs (2026-07-30)
+
+Measured from `capture-soak-output/` rather than inferred. Chrome playing a YouTube video was
+the target; a 1 kHz tone at −26 dBFS played from `afplay`, a separate process, throughout.
+
+**Screen scoping holds.** A captured frame contains the picked Chrome window and nothing else —
+no desktop, no other windows, no menu bar — at 3190×2168, the window's backing resolution,
+confirming the `contentRect * pointPixelScale` sizing. The BGRA→RGBA swizzle in the soak
+harness is correct.
+
+**Audio appears scoped to the picked application.** Window capture: YouTube present at −17 dBFS,
+99.8% non-zero samples, and the 1 kHz probe *absent* — 0.5 dB below its neighbouring bins, so no
+peak. A different process's audio was excluded while the target application's was captured.
+
+One control still missing before this is proof rather than strong evidence: nothing has shown
+the tone is capturable at all. Capturing an application that is itself playing the tone (a
+window-bearing one, since the picker cannot select `afplay`) would close it.
+
+**Defect: a display pick captures no audio.** Three runs, all with audio playing, all returning
+0.0% non-zero samples — 318,080 samples of exact zero. Packets are delivered, so the stream is
+producing silent buffers rather than failing. A user who picks a display gets a silent track,
+no error, and a recording indicator saying "audio: system" while nothing is recorded.
+
+`audio_scoped: false` is technically accurate and practically misleading here: it reads as
+"audio is not restricted to one app", not "there is no audio". Either make display capture
+deliver system audio, or make the absence explicit in the target description so the indicator
+can say so. Silently recording zeros is the worst of the three.
+
+**Drift is not yet measurable.** Relative drift across short runs: +13374 ppm (8 s), −728 ppm
+(40 s), −221 ppm (40 s), −651 ppm (20 s), −1170 ppm (20 s), −507 ppm (20 s). The sign flips and
+the magnitude tracks run length, which is the signature of startup transients rather than a
+rate. Nothing under ten minutes will answer this.
+
+Still untested: capturing a window that is not frontmost, and closing the picked window to prove
+`TargetEnded` arrives on the single path that now carries it.
