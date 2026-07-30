@@ -261,3 +261,50 @@ Frames land in `./capture-soak-output/` at one per ten seconds, alongside `mic.w
 whether a non-frontmost window captured cleanly, whether anything outside the target leaked
 into a frame, and — by closing the picked window mid-run — whether `TargetEnded` actually
 arrives on the single detection path that now carries it.
+
+## The main-run-loop deadlock, found and fixed (2026-07-30, by the planner)
+
+The first bundled run hung with no output. Sampled rather than guessed — the main thread was
+parked inside tokio:
+
+```
+DispatchQueue_1: com.apple.main-thread
+  tokio::runtime::Runtime::block_on … capture::macos::MacCapture::pick_target
+    current_thread::Context::park
+```
+
+`sotto_capture_pick_target` schedules `Task { @MainActor }` to present the picker, and the soak
+example was blocking the main thread awaiting the result. The thread that would deliver the
+choice was the thread waiting for it. This is the risk this task listed up front; it turned out
+to be about the event loop, not the bundle.
+
+`pick_target()` stays async and is correct for the GPUI app, which runs an AppKit event loop.
+Added `sotto_capture_pump_main_loop` and `MacCapture::pick_target_blocking()` for processes with
+no loop of their own, and documented on `pick_target` why awaiting it from such a process
+deadlocks. The soak example now uses the blocking form.
+
+### What the first successful run proved
+
+```
+selected capture target: CaptureTarget { bundle_id: Some("com.apple.Terminal"),
+  display_name: "Terminal", window_title: Some("sotto — -zsh — 88×39"),
+  kind: Window, audio_scoped: true }
+captured 1 frames; 0 frames dropped
+```
+
+The picker presents from the bundle, TCC accepts the bundle identity, and the macOS 15.2
+metadata path is live on this machine — real bundle id and window title, not the generic
+fallback labels. That settles the availability question in the round-1 review.
+
+### What it did not prove, and one number to watch
+
+Eight seconds is not a drift measurement. That run reported system audio at +13374 ppm against
+mic at −81 ppm — about 48 s of slip per hour if it were real. It almost certainly is not; a run
+that short is dominated by startup transients, and the mic figure looks healthy. But it is the
+same quantity T002's deferred long-run check exists to measure, and it is the one that would
+silently ruin an hour-long transcript by pulling the two streams apart. Measure it properly on
+the real acceptance run rather than dismissing it.
+
+Still outstanding, and all needing a person: capturing a non-frontmost window, confirming
+nothing outside the target leaks into a frame, and closing the picked window to prove
+`TargetEnded` arrives on its single untested path.

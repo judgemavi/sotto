@@ -57,6 +57,7 @@ unsafe extern "C" {
     fn sotto_capture_permission_status() -> c_int;
     fn sotto_capture_request_permission() -> bool;
     fn sotto_capture_open_permission_settings() -> bool;
+    fn sotto_capture_pump_main_loop(seconds: f64);
 }
 
 /// A picker-produced ScreenCaptureKit filter and its user-visible description.
@@ -266,12 +267,40 @@ impl MacCapture {
 
     /// Presents the system content picker. Cancellation returns `None` and does
     /// not alter capture lifecycle state.
+    ///
+    /// The picker is presented on the main queue, so this is only usable from a
+    /// process that already runs an AppKit event loop — the GPUI app does.
+    /// Anything else must use [`MacCapture::pick_target_blocking`]; awaiting this
+    /// on a runtime that owns the main thread deadlocks, because the thread that
+    /// would deliver the choice is the thread that is waiting for it.
     pub async fn pick_target() -> Option<PickedTarget> {
         let (sender, receiver) = oneshot::channel();
         let state = Box::into_raw(Box::new(TargetCallbackState(Some(sender))));
         // SAFETY: the callback reclaims `state`; the bridge invokes it exactly once.
         unsafe { sotto_capture_pick_target(target_callback, state.cast()) };
         receiver.await.ok().flatten()
+    }
+
+    /// Presents the picker and drives the main run loop until the user chooses or
+    /// cancels, for processes with no AppKit event loop of their own.
+    ///
+    /// Must be called on the main thread. Blocks until the picker resolves; there
+    /// is no timeout, because waiting on a person is not a stall.
+    #[must_use]
+    pub fn pick_target_blocking() -> Option<PickedTarget> {
+        let (sender, mut receiver) = oneshot::channel();
+        let state = Box::into_raw(Box::new(TargetCallbackState(Some(sender))));
+        // SAFETY: the callback reclaims `state`; the bridge invokes it exactly once.
+        unsafe { sotto_capture_pick_target(target_callback, state.cast()) };
+        loop {
+            // SAFETY: called on the main thread; the bridge takes no pointers.
+            unsafe { sotto_capture_pump_main_loop(0.05) };
+            match receiver.try_recv() {
+                Ok(picked) => return picked,
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) => return None,
+            }
+        }
     }
 
     /// Returns the current Screen & System Audio Recording permission state.

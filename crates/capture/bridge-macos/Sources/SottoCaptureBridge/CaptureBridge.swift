@@ -470,6 +470,19 @@ public func sottoCaptureRequestPermission() -> Bool {
     CGRequestScreenCaptureAccess()
 }
 
+@_cdecl("sotto_capture_pump_main_loop")
+public func sottoCapturePumpMainLoop(_ seconds: Double) {
+    // The picker is presented by the system on behalf of this process, which needs a
+    // window-server connection; touching NSApplication.shared establishes one. Running
+    // the main run loop then drains the main queue, where the picker task was scheduled.
+    // The GPUI app already runs an AppKit event loop and never calls this.
+    let application = NSApplication.shared
+    if application.activationPolicy() == .prohibited {
+        application.setActivationPolicy(.accessory)
+    }
+    RunLoop.main.run(until: Date(timeIntervalSinceNow: seconds))
+}
+
 @_cdecl("sotto_capture_open_permission_settings")
 public func sottoCaptureOpenPermissionSettings() -> Bool {
     guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else {

@@ -35,12 +35,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let target = runtime
-        .block_on(MacCapture::pick_target())
-        .ok_or("target selection was cancelled")?;
+    // This example has no AppKit event loop, so it drives the run loop itself
+    // rather than awaiting the async picker — see `pick_target_blocking`.
+    println!("choose a capture target in the system picker…");
+    let target = MacCapture::pick_target_blocking().ok_or("target selection was cancelled")?;
     println!("selected capture target: {:?}", target.description());
     let mut capture = target.into_capture();
     capture.start(audio_tx)?;
@@ -138,8 +136,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         "RELATIVE stream drift: {relative_ppm:+.1} ppm -> {slip_per_hour:+.3} s of slip per hour"
     );
     println!(
-        "sign before the real run: MACOS_SIGNING_IDENTITY=- scripts/sign.sh target/release/examples/soak"
+        "drift over a short run is dominated by startup transients; trust it only over 10+ minutes"
     );
+    println!("bundle before the real run: scripts/dev-bundle.sh target/release/examples/soak");
     Ok(())
 }
 

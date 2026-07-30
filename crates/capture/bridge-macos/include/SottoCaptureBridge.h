@@ -60,4 +60,14 @@ int32_t sotto_capture_permission_status(void);
 bool sotto_capture_request_permission(void);
 bool sotto_capture_open_permission_settings(void);
 
+/*
+ * Runs the main run loop for `seconds`, draining the main queue so the picker
+ * task scheduled by sotto_capture_pick_target can actually run.
+ *
+ * Must be called on the main thread, and only by processes that do not already
+ * run an AppKit event loop. A process that blocks its main thread waiting for
+ * the picker callback deadlocks: the callback is delivered on the main queue.
+ */
+void sotto_capture_pump_main_loop(double seconds);
+
 #endif
