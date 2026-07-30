@@ -344,3 +344,10 @@ rate. Nothing under ten minutes will answer this.
 
 Still untested: capturing a window that is not frontmost, and closing the picked window to prove
 `TargetEnded` arrives on the single path that now carries it.
+
+### Control closed: the probe was audible
+
+The tone was confirmed audible during playback, so `afplay` was genuinely rendering to the
+output device. That removes the one alternative explanation for its absence from the window
+capture. Audio scoping for a window pick is established, not merely indicated: a separate
+process's audio was excluded while the picked application's was captured.
