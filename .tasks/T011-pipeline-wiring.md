@@ -1,6 +1,6 @@
 # T011 — Core pipeline: wire the conveyor belt end to end
 
-**Status:** done (approved at review round 4)
+**Status:** done
 
 **Wave:** 2
 

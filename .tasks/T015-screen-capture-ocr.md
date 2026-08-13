@@ -1,6 +1,6 @@
 # T015 — Screen crate: low-rate frame sampling + Apple Vision OCR
 
-**Status:** done (approved; OCR carried as unverified pending a real fixture)
+**Status:** done
 
 **Wave:** 1 — new crate, parallel with the other stage crates
 

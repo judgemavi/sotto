@@ -1,6 +1,6 @@
 # T018 — Fix the `Transcriber` contract so it can express finality
 
-**Status:** done (approved at review round 1)
+**Status:** done
 
 **Wave:** blocking — T011 cannot wire ASR into the timeline correctly until this lands
 

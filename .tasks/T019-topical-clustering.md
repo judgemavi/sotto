@@ -1,150 +1,110 @@
-# T019 — Topical clustering: the second organising axis
+# T019 — Meeting topical clustering
 
-**Status:** blocked on a real recorded session (implementation and review complete; no
-implementer work remains)
+**Status:** blocked
 
-**Wave:** Phase 3 — the reasoning layer
+**Wave:** Phase 3 — optional derived meeting view
 
-**Depends on:** T017 (owns `crates/insight` and registers it; settles what timeline content
-a model actually uses) · T008 (persisted timelines) · T007 (providers)
+**Depends on:** T036; T008; T024/T028; T029 for live OpenAI evidence; T035 for participant
+validation
 
-**Owns:** `crates/insight/src/clustering/**`, `prompts/clustering/**`
+**Owns:** `crates/insight/src/clustering/**`, `crates/insight/tests/clustering.rs`,
+`prompts/clustering/**`, `.tasks/T019-topical-clustering.md`
 
 ## Goal
 
-This is what makes the board a *map* rather than a transcript. `AGENTS.md` draws the line
-precisely: chronological structure is deterministic and local; **topical structure requires
-meaning and is therefore the model's job**. Add a model and the board gains a second
-organising axis — pricing discussion accumulates as a region, an objection links back to
-the one it echoes from forty minutes earlier. Remove the model and the board is still
-correct, just chronological.
+Provide the optional second organizing axis over a meeting: a small set of participant-recognized
+topic regions, cross-time links, and conservative open threads. This is a derived artifact and
+never changes the append-only meeting record.
 
-That degradation path is the requirement, not a nicety. Everything you produce is a
-**derived view**: stored alongside the timeline, recomputable from it, and switchable off.
+ADR-0011 supersedes the original sales-only examples and `Objection`-only open-thread taxonomy.
+Pricing or sales objections remain possible meeting content, not privileged product schema.
 
 ## Plan
 
-1. **Derived views never mutate the log.** Emit a separate artifact keyed by `EventId`s —
-   clusters, links, labels — persisted in its own table, not as timeline events and never
-   as edits. `AGENTS.md` is explicit: a model's opinion is not a fact about what happened,
-   and the record has to survive being reinterpreted by a different model or none.
-   Recomputing must be idempotent and must not disturb the original.
-
-2. **Cluster utterances into topic regions.** A sales call has recognisable movements —
-   discovery, demo, pricing, objections, next steps. Produce regions with a label, a span,
-   and the `EventId`s they cover. Regions may be discontiguous: pricing comes up twice.
-   Prefer few confident regions over many speculative ones; a board cluttered with weak
-   clusters is worse than a plain chronological one.
-
-3. **Link related moments across time.** "This objection echoes the one at 00:12." "This
-   commitment answers that question." These cross-references are the highest-value thing
-   here and the hardest to get right — they are also what a rep cannot see for themselves
-   while talking. Every link carries both endpoints as `EventId`s and a short reason.
-
-4. **Track open threads.** A question asked and never answered; an objection raised and
-   never resolved. `AGENTS.md` wants unresolved objections to remain visually *open* on the
-   board. Detecting non-resolution is harder than detecting the objection — be conservative
-   and say "unresolved" only when nothing plausibly answers it.
-
-5. **No latency budget, so use it.** This runs after the call, or on demand mid-call at the
-   user's request — never speculatively on every partial. That freedom is why the screen
-   context and prompt-shape questions get settled here first (T017), and why map-reduce over
-   long sessions is affordable.
-
-6. **Cost transparency and cheap recompute.** Report tokens per run via `Usage`. Cache by
-   timeline content hash so re-opening a call does not re-spend. The user pays for this
-   with their own key.
-
-7. **Degrade honestly.** With no model configured, the board shows chronology and says so —
-   not an empty "clusters" panel implying something failed. The absence of the reasoning
-   tier is a normal state, not an error.
+1. Preserve the existing persistence, prompt/timeline/backend fingerprint cache identity,
+   citation validation, and byte-identical timeline guarantees.
+2. Generalize open-thread kinds and prompt language to question, decision, action item, and risk.
+   Prefer few confident regions over speculative clutter.
+3. Keep regions and cross-time links keyed only by known `EventId`s. Empty regions, unknown ids,
+   and unsupported relationship claims fail closed.
+4. Use transcript-first context and T028's optional typed screen inspection; no eager OCR/image.
+5. Degrade normally to chronology with no model. Report cached state and provider usage.
+6. After deterministic migration is reviewed, return to `blocked` until T035/T029 provide the real
+   participant-recognized validation input.
 
 ## Contract for downstream tasks
 
-`insight::cluster(session_id) -> DerivedView` with regions, links and open threads, all
-keyed by `EventId`. T016's board renders it as an optional overlay that can be toggled off,
-falling back to pure chronology.
+`Clusterer::cluster(session_id) -> ClusterReport` yields cached derived regions, links, and open
+threads with meeting-general kinds and valid citations. T038 may render it as an optional overlay
+after Notes/Board UI acceptance.
 
 ## Acceptance
 
-- A real recorded call produces topic regions a participant recognises as correct.
-- Cross-references are precise: no fabricated links, verified by reading them against the
-  timeline.
-- Re-running on an unchanged timeline is idempotent and cheap.
-- The timeline is byte-identical before and after clustering — proven by test.
-- With no provider configured, the board renders chronologically with no error state.
+- Production clustering types/prompts contain no required sales roles or objection-only schema.
+- Existing cache, backend separation, citation, idempotency, and timeline-immutability tests pass.
+- No-backend mode leaves the chronological board complete and truthful.
+- A T035-accepted real meeting later produces regions/links/open threads a participant recognizes;
+  that manual gate is not satisfied by fixtures.
 
 ## Out of scope
 
-Realtime suggestion (T013), editing the timeline, freeform user-drawn mind maps
-(`AGENTS.md` non-goal: the board is conversation-generated, not a drawing tool).
+Meeting notes (T037), MCP enrichment, realtime proposals (T013), and board rendering.
 
-## Notes — implementation pass 1 (2026-07-29)
+## Historical evidence
 
-Added a versioned clustering prompt and `Clusterer::cluster`, returning regions,
-cross-timeline links, and conservative open threads keyed only by known `EventId`s. Invalid model
-citations and empty regions fail explicitly. Metadata and OCR follow ADR-0006.
+The earlier implementation established a sound derived-view table, prompt-aware content hash,
+backend fingerprint, known-event validation, and byte-identical timeline tests. Its sales-shaped
+`Objection` vocabulary is the only deterministic migration now requested; real-call recognition
+was never claimed.
 
-Derived artifacts and usage are stored in a dedicated SQLite table keyed by session, artifact
-version, model, and stable timeline-content hash. An unchanged rerun performs no provider call;
-the integration test also proves the serialized timeline is byte-identical before and after.
-Schema migration v3 and its rationale are recorded in ADR-0007.
+## Notes — meeting-general migration complete (2026-08-12)
 
-The real recorded-call recognition and cross-reference reading gates cannot be satisfied by the
-synthetic fixture. This task stays in progress until Phase 2 dogfood supplies that session.
+The deterministic migration is complete. `OpenThreadKind` is now a one-way meeting taxonomy of
+`Question`, `Decision`, `ActionItem`, and `Risk`; no legacy `Objection` alias remains. The versioned
+prompt uses the same four kinds, assumes no participant role or meeting domain, and keeps screen
+inspection optional and derived. The derived-view kind advanced to `topical_clusters.v2`, while
+the existing prompt/timeline/backend fingerprint cache dimensions, known-event validation,
+idempotency, and byte-identical timeline guarantees remain intact.
 
-## Interim review — good foundation, one cache-key issue
+Regression coverage proves all four kinds serialize and deserialize, the legacy objection value
+fails closed, unchanged input is cached without mutating timeline bytes, and identical model names
+under different backend fingerprints do not share artifacts. The focused clustering tests pass
+3/3; the full insight suite passes 18/18; strict insight Clippy, insight formatting, and scoped
+diff checks pass.
 
-Not approving yet since real-call validation is outstanding, but the structure is right.
+No real meeting, live OpenAI request, or participant review ran. T019 is blocked only on T035's
+accepted real meeting and T029's live backend evidence for participant-recognized regions, links,
+and open threads. Synthetic fixtures do not satisfy that manual acceptance.
 
-**Derived views genuinely do not mutate the log** — `unchanged_timeline_is_cached_without_mutating_events`
-asserts exactly the `AGENTS.md` invariant that a model's opinion is not a fact about what
-happened. Caching on `(session_id, VIEW_KIND, model, content_hash)` with
-`VIEW_KIND = "topical_clusters.v1"` correctly separates artifact version from timeline content,
-and cached reruns avoiding provider calls is the behaviour that makes re-opening a call free.
+## Review response — rendered-evidence citation boundary (2026-08-12)
 
-### The prompt is not in the cache key
+Citation validation now admits only `utterance.final` ids, matching the evidence rendered into the
+initial clustering request. A persisted event being known to the session is no longer sufficient:
+partial utterance, VAD, prosody, screen snapshot, and system-output ids fail closed. Inspection-only
+ids remain outside the allowed set until an explicit inspection-provenance citation contract exists.
 
-`PROMPT` is `include_str!("prompts/clustering/v1.md")`, and the key carries `.v1` through
-`VIEW_KIND` — so invalidation depends on someone remembering to bump *both* the filename and the
-constant whenever the prompt changes.
+`DerivedView`, `TopicRegion`, `TopicLink`, and `OpenThread` now deny unknown JSON fields. Regression
+tests reject both the legacy root `objections` field and the legacy `objection` kind, reject an
+unknown nested field, and prove that a known VAD id omitted from the transcript prompt cannot be
+cited.
 
-That convention will break the first afternoon anyone iterates on this prompt. Editing `v1.md`
-in place is the natural thing to do, and the result is silently stale cached clusters that look
-like the new prompt did nothing. Prompt iteration is most of the work in both this task and
-T017, so this will cost real time.
+Verification after the fix: focused clustering tests pass 6/6; the full insight suite passes 21/21;
+strict insight Clippy, insight formatting, and scoped diff checks pass. No real meeting, live OpenAI
+request, screen-inspection citation, or participant validation ran. The only remaining gate is the
+T035/T029-backed participant review already recorded above.
 
-Fold the prompt text into `content_hash` (or hash it separately into the key). Then editing a
-prompt invalidates automatically and no one has to remember anything.
+## Independent deterministic-slice review — 2026-08-12
 
-### Outstanding, as you noted
+Accepted. The `topical_clusters.v2` namespace makes the migration one-way at the artifact boundary;
+the meeting-general enum has no legacy alias, and strict serde contracts reject the old root field
+plus unknown nested fields. Production types and prompt contain no privileged sales taxonomy.
 
-Validation against a real recorded call. Worth pairing with the map-tier gate — `AGENTS.md` now
-says any two-party conversation qualifies, so a 1:1 with a colleague gives you a real session
-for both this and ADR-0006's OCR retest at once.
+Citation validation now matches the evidence actually rendered: only final-utterance ids are
+admitted, so a session-known VAD or other non-transcript event cannot pass merely because it exists
+in the timeline. Screen-inspection ids remain fail closed until the shared helper exposes explicit
+inspection provenance. Cache hits remain zero-call and backend-separated, prompt text remains in
+the content hash, and clustering leaves serialized timeline bytes unchanged.
 
-## Follow-up implementation (2026-07-30)
-
-The cache content hash now length-prefixes and hashes both the exact prompt text and rendered
-timeline. Editing `prompts/clustering/v1.md` in place therefore misses artifacts produced by the
-old prompt automatically; a regression test proves prompt-only changes alter the hash.
-
-No real persisted session is present in the workspace (the available `call-01.jsonl` is the
-synthetic fixture), so the participant-recognition and cross-reference-reading acceptance gate
-remains blocked on Phase 2 dogfood. Synthetic output has deliberately not been reported as real
-validation.
-
-## Review — cache fix accepted; task is now blocked on a recording, not on code
-
-`clustering_content_hash` length-prefixes both fields, so no prompt text can be confused with
-timeline text at the boundary, and `editing_prompt_text_invalidates_content_hash` proves the
-property rather than the implementation. `VIEW_KIND` and `model` stay independent dimensions in
-the database key, which is what you want — the artifact version and the model are legitimately
-separate axes from the input content. Prompt iteration is now safe to do in place.
-
-Not presenting synthetic fixture output as validation is the right call and the thing I would
-have sent back if you had. The fixture is 30 seconds of TTS; it cannot answer whether a
-participant recognises the topic regions.
-
-**Status is blocked on a user action, not on implementation.** Nothing further to do here until
-a real recorded session exists.
+Independent gates passed: focused clustering tests 6/6, full insight tests 21/21, strict all-target
+insight Clippy, package formatting, and scoped diff-check. Status correctly remains `blocked`: no
+T035-accepted real meeting, live T029 OpenAI evidence, or participant recognition review ran.

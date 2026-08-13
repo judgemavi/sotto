@@ -1,13 +1,15 @@
 # T022 — Live session: picker to transcript
 
-**Status:** open — this is the critical path
+**Status:** done
 
 **Wave:** Phase 2 — the first end-to-end use of the product
 
 **Depends on:** T021 (`PickedMacCapture` implements `CaptureBackend`) · T011 (the pipeline) ·
 T012 (the timeline seam, `attach_ingress`)
 
-**Owns:** `crates/app/src/session/**` (new), `crates/app/src/main.rs`
+**Owns:** `crates/app/src/session/**` (new), `crates/app/src/main.rs`, and the minimal
+`crates/app/src/lib.rs` session-module registration needed to compile the controller once for
+both the library tests and executable
 
 Disjoint from T012 (`devwindow/**`, `settings/**`) and T016 (`board/**`), so all three can run
 at once. Do not edit `crates/capture` — its remaining gaps are parked in T021.
@@ -182,3 +184,75 @@ While there: the drain loop runs until the bus closes, which assumes every sende
 `stop()`. If one ever leaks, the session never returns and the UI never learns it ended. A
 timeout around the drain, falling back to a `try_recv` sweep, turns a hang into a logged
 imperfection.
+
+## Transcript-first acceptance clarification (2026-08-11)
+
+The real session still unlocks the board and reasoning validation, but it no longer exists
+primarily to justify eager OCR. It must preserve timestamped utterances, speaker/prosody,
+capture-target metadata, and bounded frame intervals so T028 can request screen evidence later.
+The default reasoning canary is transcript-only.
+
+## Notes — changes-requested fix (2026-08-11)
+
+- `CaptureStatus::Stopped` now ends the session as `Stopped`; it is neither ignored nor
+  relabelled as a user action. Focused unit coverage pins that outcome and keeps the three
+  transitional statuses non-terminal.
+- Shutdown event draining and the pipeline stop join are independently bounded to two seconds;
+  the ready-event fallback is bounded to 100 ms as well. If a leaked sender or a full UI ingress
+  prevents progress, the app reports the timeout and completes shutdown instead of leaving the
+  recording indicator hung. `EventReceiver` exposes no `try_recv`, so the final sweep uses a
+  one-poll `now_or_never` equivalent through its public API.
+- `rustfmt --edition 2024 --check crates/app/src/session/mod.rs` and scoped `git diff --check`
+  passed. The first focused app test attempt stopped in `gpui`'s build script because this machine
+  lacks the Xcode Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`), before reaching
+  the app crate; a later workspace-format retry was also blocked by T023's concurrently incomplete
+  `crates/asr/src/model` module. Focused test and Clippy execution therefore remain environment- and
+  concurrent-work-blocked, not reported green.
+
+## Product-integration handoff
+
+T022 now owns only the picker-to-pipeline session controller and truthful terminal/shutdown
+semantics. Its review may close that component once the focused verification can run. The
+historical acceptance wording about pressing a visible Start button, first-run model readiness,
+recording indication, and removing the launch-time picker is transferred to T032, which owns the
+necessary `main.rs`, `session/**`, and `settings/**` surfaces together after their sequential
+handoffs. T022 must not grow a second UI lifecycle while T032 is pending.
+
+## Independent controller review (2026-08-11)
+
+- Re-traced startup, terminal handling, event forwarding, persistence path, and shutdown against
+  `PipelineHandle::stop` and `EventReceiver`. `Stopped`, `Failed`, `TargetEnded`, and
+  `UserStopped` preserve their causes; only Starting/Running/Stopping remain transitional.
+- The stop future starts concurrently with event draining. The ordinary drain is bounded, its
+  final public-API ready sweep is separately bounded even if UI ingress is full, and the stop
+  join is bounded and aborted on timeout. No new queue or T032 lifecycle surface was introduced.
+- Added focused regressions covering every terminal cause, a leaked event sender during the
+  ordinary bounded drain, and a nonblocking ready sweep while a sender remains alive. The test
+  ingress factory is `cfg(test)` and preserves the production one-seam contract.
+- Formatting succeeds, but the new tests did not reach a completed execution. The normal focused
+  app test is blocked before Sotto code by generated Whisper bindings and the missing GPUI Metal
+  Toolchain. A fresh runtime-shader/bundled-bindings run reached the Swift capture bridge, then
+  stopped on the sandboxed Clang module cache; its escalated rerun was interrupted before a
+  result. No green test or Clippy claim is made.
+
+No further in-scope controller defect was found, but T022 remains `in-review` because its new
+regressions have not completed a typecheck/test run. `crates/app/src/session/**` and
+`crates/app/src/main.rs` are therefore **not yet released to T032**. Rerun the focused app tests
+after T033/toolchain access and, if green, the reviewer may change T022 to `done` and record the
+handoff without another implementation pass.
+
+## Final review and T032 handoff (2026-08-11)
+
+- Registered `session` once through the app library instead of compiling a second copy in the
+  binary test target. This let the controller tests share the single diagnostic ingress without
+  exposing a second production channel.
+- The first clean-target run reached Sotto and found that one regression constructed
+  `tokio::time::timeout` before entering its runtime. Moving that construction into the
+  `block_on` future fixed the test rather than weakening it.
+- With T033's declared bundled bindings and GPUI runtime shaders, a fresh target completed
+  `cargo test -p app --locked --features gpui/runtime_shaders`: 21 passed, 0 failed; binary and
+  doc tests also passed. The runtime-shader feature is a test-machine workaround for the missing
+  local Metal compiler, not a product feature change.
+
+The narrowed picker-to-pipeline controller and truthful bounded shutdown contract are accepted.
+`crates/app/src/session/**` and `crates/app/src/main.rs` are released to T032.

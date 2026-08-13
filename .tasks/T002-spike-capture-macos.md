@@ -1,7 +1,6 @@
 # T002 — Spike A: dual-stream macOS audio capture + low-rate screen frames
 
-**Status:** in-progress (4 defects fixed; only the long-run soak measurement remains — it edits
-no files, so `crates/capture/**` ownership has transferred to T021)
+**Status:** in-progress
 
 **Wave:** 1 — start this one first, it has the longest tail and the highest technical risk
 
@@ -425,3 +424,57 @@ not touch live capture. What they must **not** do is assume cross-stream timesta
 directly comparable. Until the system rate is characterised, treat that as unproven:
 T006 in particular should keep its interruption detection tolerant of a drift correction
 being introduced later.
+
+## Automated residual audit — 2026-08-11
+
+Two deterministic gaps described earlier in this task were still present and are now fixed:
+
+- System-audio extraction no longer uses `try?` or synthesizes a non-interleaved format. The
+  bridge uses the buffer's `CMAudioFormatDescription`, converts both Float32 interleaved and
+  non-interleaved layouts, and reports an unsupported/unreadable buffer as bridge code `-7`.
+  Rust maps that to `CaptureStatus::Failed` plus a typed `CaptureError::StreamFailed`, with a
+  regression proving it clears Running rather than writing a healthy-looking silent track.
+- The soak harness now installs a SIGINT handler. A single interrupt exits through the ordinary
+  drain/stop path, joins and drains the PNG writer, finalizes both WAV headers, and labels the
+  evidence interrupted. Deterministic regressions cover the handler and independently readable
+  finalized mic/system WAVs.
+
+The task remains `in-progress`: no automated test establishes OS picker behavior, real-device
+scope, signing/notarization identity, permission revocation latency, hour-long drift/dropout,
+thermal/frame-pool stability, or audible alignment. ADR-0002 now contains the concrete signed
+acceptance runbook and the 62.5 ppm relative-drift threshold. None of its manual steps ran in
+this audit.
+
+Focused verification:
+
+- `swift build -c debug`: passed against Xcode 26.6/SDK 26.4; the existing AppKit main-actor
+  diagnostics in the C run-loop pump remain warnings.
+- `CARGO_TARGET_DIR=/tmp/sotto-t002-capture cargo test -p capture --all-targets
+  --all-features --locked`: passed, capture library 5/5 and soak example 2/2.
+- `CARGO_TARGET_DIR=/tmp/sotto-t002-capture cargo check -p capture --all-targets
+  --all-features --locked`: passed.
+- `CARGO_TARGET_DIR=/tmp/sotto-t002-capture cargo clippy -p capture --all-targets
+  --all-features --locked -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+
+## Independent deterministic-fix review — 2026-08-12
+
+The automated residual slice is accepted after two additional fail-closed corrections:
+
+- Audio output now reports bridge code `-7` for an invalid sample, missing actual format
+  description, unsupported layout, zero channels, or an actual sample rate other than 48 kHz.
+  The compact FFI does not carry sample-rate metadata, so accepting a different rate while Rust
+  labels it 48 kHz would corrupt resampling and drift evidence. Invalid screen samples remain a
+  permitted dropped frame. The C and Rust sides now document this boundary explicitly.
+- Shutdown now requests capture stop before draining evidence. It continues bounded audio drains
+  while waiting up to two seconds for `Stopped`, performs a final audio drain, then signals and
+  joins the PNG writer for its final drain, and finally closes both WAV headers. This closes the
+  prior producer-before-final-drain ordering bug. Because Swift stop is asynchronous, the bounded
+  wait is intentionally not presented as proof of callback quiescence; the signed manual SIGINT
+  run remains authoritative.
+
+Independent verification passed: Swift debug build (with the already-recorded AppKit actor
+warnings), capture library tests 5/5, soak example tests 2/2, strict all-target/all-feature capture
+Clippy, package-scoped formatting, and scoped diff-check. No picker, real call, permission mutation,
+signing/notarization, or long soak ran. Status remains `in-progress` pending the manual acceptance
+contract above.

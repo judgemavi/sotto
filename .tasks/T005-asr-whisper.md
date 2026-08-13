@@ -1,6 +1,6 @@
 # T005 — ASR crate: whisper.cpp sliding-window streaming transcription
 
-**Status:** done (approved at review round 1)
+**Status:** done
 
 **Wave:** 1 — fully parallel; develop against WAV fixtures, not live capture
 

@@ -1,6 +1,6 @@
 # T004 — VAD crate: Silero via ONNX Runtime
 
-**Status:** done (approved at review round 1)
+**Status:** done
 
 **Wave:** 1 — fully parallel, no platform dependencies
 

@@ -1,111 +1,68 @@
-# T013 — Intelligence loop: two-tier watcher/suggester with speculative execution
+# T013 — Realtime meeting proposal loop
 
-**Status:** blocked (on the Phase 2 note-taker gate: T016 + T017; plus T007, T008, T011)
+**Status:** blocked
 
-**Wave:** 4 — Phase 3, the highest-judgement task in the project
+**Wave:** P1 — optional realtime copilot
 
-**Depends on:** **the note-taker gate must pass first** — `AGENTS.md` now requires that
-the fused timeline be accurate and readable before any advising work begins (T016, T017).
-Then: T007 (providers) · T008 (RAG) · T011 (timeline + session state) · T015 (screen
-context) · T017's findings on what timeline content a model actually uses well.
+**Depends on:** T035/T016 map acceptance; T029 live OpenAI evidence; T039 read-only MCP
+context; T041 durable grounded evidence; T042 generic proposal events. T045 is optional: T013 may
+ship with meeting plus MCP grounding but must not use historical sales-only RAG kinds. T045 local
+retrieval is not authorized for proposal output until a later core schema task adds a citation type
+distinct from T041/MCP `ExternalEvidenceRef`; local chunk ids must never be placed in that field.
 
-**Owns:** `crates/advisor/**`, `prompts/advisor/**`
-
-> Moved out of `core` into its own crate per the `AGENTS.md` repo-structure change. This
-> is a real improvement for parallelism: the advisor no longer edits `core` at all, so it
-> is fully file-disjoint from T011. The crate is registered in the workspace root by
-> T014's owner, not by you.
+**Owns:** `crates/advisor/**`, `prompts/advisor/**`,
+`.tasks/T013-watcher-suggester-loop.md`
 
 ## Goal
 
-The product. Everything upstream exists to feed this: decide *when* to speak, and *what*
-to say. `AGENTS.md` is unambiguous that the hard part is restraint — "a copilot that
-fires constantly gets closed" — so the watcher saying "no suggestion" is the common
-case and the default behaviour, not a fallback.
+Build a quiet, optional watcher/proposer loop for general meetings. Proposals are off by default,
+and `no proposal` is the common result. Every displayed proposal is anchored to the meeting moment
+that justified it and cites every external assertion.
 
-You start with an advantage the earlier plan did not have: a working timeline, real
-recorded sessions to replay through `sotto-cli replay`, and T017's evidence about which
-timeline content helps a model and which is noise. Use it rather than re-deriving it.
+This contract supersedes T013's 2026-08-11 sales-only watcher/suggester plan. ADR-0011 and T042
+define the current product and event vocabulary.
 
 ## Plan
 
-1. **Watcher tier.** A cheap/fast model classifying every partial: suggestion warranted,
-   and if so which `TriggerKind`. Constraints: single call per partial, tight token
-   budget, cached static prefix (T007's cache hints), structured output that is cheap
-   to parse and hard to get wrong. It runs constantly on the user's own key — cost per
-   call is a design constraint, not an afterthought.
+1. Watch timestamped partial/final transcript from either stream. Do not assume rep/customer roles
+   and do not hard-gate one speaker. Schedule display for a natural pause when possible.
+2. Use a cheap, tightly bounded first pass to decide whether an assist is warranted and select one
+   generic proposal kind: clarifying question, decision check, next step, follow-up, or relevant
+   context. Missing required backend capabilities fails before transport.
+3. Start bounded MCP retrieval only after the watcher finds potential value. Use only the immutable
+   T039/T041 session grant and context bundle; never pass MCP tools or credentials to the model.
+   Local T045 retrieval waits for a distinct core local-evidence citation schema and is not part of
+   this task.
+4. Assemble a transcript-first proposer request. Optional screen evidence follows T028/T031's
+   one-inspection, capability, provenance, and image-consent contract.
+5. Stream T042 proposal partial/final events with same-session anchors, meeting citations, external
+   evidence ids, backend fingerprint, usage, and cancellation state. Supersession is append-only.
+6. Cancel and re-fire when a final transcript materially changes a speculative proposal. Track
+   cancelled usage and never let a stale completion attach to a newer event.
+7. Reject unknown/uncited evidence, unavailable sources, malicious resource instructions, invalid
+   schema, and rate limits honestly. No path executes an MCP action or implies user acceptance.
+8. Replay accepted meetings and annotated fixtures. Measure false-positive rate, quiet rate,
+   missed-useful rate, cancellation, and pause-to-first-token latency; weight annoying false
+   positives heavily.
 
-2. **Bias toward the customer's turns.** Per `AGENTS.md`, suggestions fire during
-   *customer* speech so the rep reads while listening; stay quiet during the rep's own
-   turns. Implement this as a hard gate before the watcher call, not as prompt advice —
-   it also cuts watcher spend roughly in half.
+## Contract for downstream tasks
 
-3. **Speculative execution.** On a promising partial, start the suggester call
-   immediately with a tokio task and an abort handle. If the final transcript changes
-   the meaning, abort and re-fire. Aggressiveness is a user setting (T012). Track and
-   expose the wasted-token rate — the user is paying for speculation and deserves to
-   see what it costs.
-
-4. **Parallel retrieval.** RAG retrieval (T008) starts *concurrently with* the watcher
-   classification, not after it, so battlecard context is already in hand when the
-   trigger fires. This is the main structural trick for the ~1s budget. Retrieve
-   against the last customer turn; discard the result if the watcher says no.
-
-5. **Prompt assembly** (`prompts/advisor/`, versioned files not string literals in code,
-   so prompts can be diffed and reviewed):
-   - static cached prefix: company/product context, battlecard corpus summary, role
-     instructions;
-   - dynamic: the recent timeline window rendered via core's `Utterance::render_inline`
-     with T006-selected annotations, **plus current screen context** (the OCR text and
-     app metadata from the snapshot visible right now), retrieved chunks, and account
-     context including what this account objected to on past calls (T008);
-   - trigger-specific instructions per `TriggerKind`.
-   Keep the static/dynamic boundary aligned exactly with the provider cache breakpoint —
-   a misplaced boundary silently voids caching and multiplies cost.
-
-   Screen context is a genuine edge here: the customer saying *"this is more than we
-   budgeted"* while a pricing slide is on screen is a materially different situation from
-   the same words with a contract on screen. Start from T017's findings on what actually
-   helped rather than assuming all of it does.
-
-6. **Trigger types v1** — competitor mention, pricing question, objection,
-   discovery-gap. Each gets its own retrieval strategy and output shape. Discovery-gap
-   is the different one: it fires on what the rep *hasn't* asked, so it needs session
-   state (T011) rather than the current turn.
-
-7. **Suggestions are timeline events, anchored.** Emit `SuggestionPartial` /
-   `SuggestionFinal` carrying the `EventId`s that triggered them — `AGENTS.md`
-   differentiator #6 is "the board, not a toast", and the anchor is what lets a card bud
-   off the utterance that caused it so the rep sees *why* it exists. A suggestion without
-   a valid anchor is a bug, not a degraded case.
-
-   Supersession follows the append-only rule: a newer suggestion is a **new event with
-   `supersedes` set**, never an edit. Define whether an in-flight suggestion is killed or
-   allowed to finish and be consistent — text mutating under the rep's eyes mid-read is
-   worse than a slightly stale card.
-
-8. **Quiet by default, measurably.** Build an evaluation harness over recorded timelines
-   (`sotto-cli replay`, T009): annotate where a suggestion *should* fire, then measure
-   precision and recall — weighting false positives heavily, since they are what gets the
-   app closed. Do not ship a watcher prompt without a measured false-positive rate.
-   Replaying real recorded sessions rather than synthetic fixtures is the point of having
-   done the note-taker milestone first — by now we have them.
-
-9. **Latency measurement** end to end: customer pause → first suggestion token, against
-   the ~1s budget. Report the breakdown per stage so regressions are attributable.
+The advisor consumes the append-only meeting timeline plus an immutable context-bundle snapshot
+and emits typed proposal output events. It never mutates captured meeting facts, app state, MCP
+servers, or local knowledge.
 
 ## Acceptance
 
-- Recorded session with a competitor mention produces a grounded, cited suggestion within
-  ~1s of the pause.
-- Watcher false-positive rate measured and documented on the eval set.
-- Speculative aborts verified to cancel in-flight provider calls (no token leak).
-- Prompt caching verified working — cached-token counts reported from a live run.
-- Suggestions cite the chunks they came from and anchor to valid trigger `EventId`s.
-- Screen context measurably changes suggestion quality — or is documented as not worth
-  its tokens, which is an equally useful finding for the prompt budget.
+- A low-value meeting fixture produces no proposal and no MCP request.
+- Useful proposal fixtures produce the expected generic kind, a valid same-session anchor, and
+  known meeting/external citations.
+- Unavailable or injected external sources fail closed without disclosure or action.
+- Speculative cancellation stops the pinned provider and prevents stale output.
+- Replay evidence records precision, quietness, missed-useful rate, and stage latency; live
+  pause-to-first-token targets approximately one second without weakening correctness.
+- No-provider, proposals-off, and sources-off are normal zero-network states.
 
 ## Out of scope
 
-MCP context (Phase 5), opt-in image context to LLMs (Phase 5), the board's suggestion
-card rendering and the production overlay lens (Phase 4), open-objection tracking.
+Sales-only triggers, battlecards, model-visible MCP tools, external action execution, board
+rendering (T043), overlay productionization, and AI product acceptance (T044).

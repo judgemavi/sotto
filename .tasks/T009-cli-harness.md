@@ -1,6 +1,6 @@
 # T009 — CLI harness: WAV + frames in → timeline events out, fixtures, latency bench
 
-**Status:** done (approved at review round 2)
+**Status:** done
 
 **Wave:** 1 — fully parallel; builds against traits, stubs where crates are unfinished
 

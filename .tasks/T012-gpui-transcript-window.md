@@ -1,15 +1,13 @@
 # T012 — GPUI dev window: live timeline + settings screens
 
-**Status:** in-progress (timeline, filters, follow and key handling done and reviewed; start/stop
-blocked on T021; device enumeration and the manual runs outstanding)
+**Status:** done
 
 **Wave:** 2
 
-**Depends on:** T003 (GPUI verdict and pinned version — **do not start until the spike
-passes**; if it fails, this task is rewritten against the Electron fallback) ·
-T011 (timeline events) · T007 (provider registry, for the settings screens)
+**Depends on:** T003 (GPUI verdict and pinned version) · T011 (timeline events)
 
-**Owns:** `crates/app/src/devwindow/**`, `crates/app/src/settings/**`
+**Owns:** `crates/app/src/devwindow/**`, `crates/app/src/settings/**` until the explicit
+T032 handoff
 
 ## Goal
 
@@ -244,5 +242,54 @@ asserting a lock, and `credential_store_label_does_not_guess_the_cause` pins tha
 push so the vector stops growing. `max_ms` and `over_budget` are in the output, which is what
 makes the number readable given p50 pins to the refresh period.
 
-Remaining here is unchanged: start/stop (blocked on T021), audio device enumeration, and the
-one-hour and real-keychain manual runs.
+At that review point, the remaining list was start/stop (then blocked on T021), audio device
+enumeration, and the one-hour and real-keychain manual runs. The current-contract amendment below
+supersedes the ownership and acceptance implications of that historical list.
+
+## OpenAI-first alignment — current contract and ownership handoff (2026-08-11)
+
+The five-provider/key-first settings direction, provider/key acceptance above, and the old
+T021 start/stop blocker are superseded by T024–T032. Preserve the reviewed code until its
+sequential replacement, but do not add provider, key, model, Ollama, capture lifecycle, or
+Whisper-provisioning behavior in this task.
+
+T012's remaining scope is only:
+
+- keep the one bounded timeline-to-GPUI seam and diagnostic filters/follow behavior stable;
+- complete the one-hour non-cumulative dev-window performance run, or record the exact
+  owner-only environment gate without claiming it passed;
+- make audio-device controls truthful: enumerate and bind real devices, or leave the
+  unavailable controls disabled/absent; and
+- record the `crates/app/src/settings/**` handoff to T032.
+
+The historical real-key/keychain run is no longer a T012 gate because T027 replaces that
+product surface with Codex readiness and optional OpenAI Keychain configuration. Product
+Start/Stop, the recording indicator, picker cancellation, and managed Whisper progress now
+belong together in T032; splitting them across T012 and T022 would leave two UI lifecycle
+owners. T032 releases `settings/**` to T027 after the map-tier controls land.
+
+Current acceptance is the stable documented seam, truthful audio controls, honest one-hour
+performance evidence, and the explicit T032 ownership handoff. The earlier settings and
+capture acceptance remains historical evidence, not unfinished authority to edit those paths.
+
+## Final handoff to T032 (2026-08-11)
+
+- Removed the unbound microphone/target `0%` meters and their fake device state. The diagnostic
+  settings pane now states that audio device selection and live meters are unavailable; it does
+  not imply a device or measurement source that does not exist. T032 may replace that message
+  only when its live lifecycle owns real capture state.
+- Re-reviewed the diagnostic harness: validation is opt-in through
+  `SOTTO_FRAME_VALIDATION=1`, reports non-cumulative 1/10/20/30/60-minute windows, includes
+  p50/p95/max/over-budget counts, stops retaining samples after the last report, and does not
+  force idle redraws outside validation mode.
+- The one-hour run was not performed and no frame numbers are claimed. A normal
+  `cargo test -p app --locked` attempt failed before Sotto code in both the generated
+  `whisper-rs-sys` size assertion (tracked by T033) and GPUI's missing Metal Toolchain. A fresh
+  runtime-shader/bundled-bindings attempt passed those two gates but stopped while SwiftPM could
+  not write the sandboxed Clang module cache; the escalated rerun was interrupted before a result.
+- Formatting was applied to the scoped app files. The stable seam and reviewed filters/follow
+  behavior were not changed.
+
+T012's narrowed contract is complete under its explicit owner-environment gate.
+`crates/app/src/settings/**` ownership is released to T032 now. T012 retains no authority over
+that directory; T032 must preserve the one `TimelineState` seam and later hand settings to T027.

@@ -1,6 +1,6 @@
 # T006 — Prosody crate: annotation extraction
 
-**Status:** done (approved at review round 1)
+**Status:** done
 
 **Wave:** 1 — fully parallel, pure computation over timings + text
 

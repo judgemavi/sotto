@@ -1,6 +1,6 @@
 # T010 — CI: build, lint, test, and macOS code signing + notarization
 
-**Status:** done (approved at review round 1)
+**Status:** done
 
 **Wave:** 1 — fully parallel; touches only `.github/` and `scripts/`
 

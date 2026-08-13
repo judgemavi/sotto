@@ -1,6 +1,6 @@
 # T020 — Close out the GPUI canvas verdict
 
-**Status:** done (approved at review round 1)
+**Status:** done
 
 **Wave:** blocking — T012 and T016 cannot start without this verdict
 

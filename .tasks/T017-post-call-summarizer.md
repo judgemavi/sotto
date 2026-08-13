@@ -1,6 +1,6 @@
 # T017 — Post-call summarizer: structured recap from the timeline
 
-**Status:** done (approved at review round 2)
+**Status:** done
 
 **Wave:** 3 — Phase 2, the note-taker dogfood gate
 

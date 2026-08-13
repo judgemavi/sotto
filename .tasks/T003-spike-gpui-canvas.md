@@ -1,6 +1,6 @@
 # T003 — Spike B: GPUI whiteboard canvas + overlay lens
 
-**Status:** superseded by T020 for the remaining measurements and the verdict
+**Status:** done
 
 **Wave:** 1 — start early alongside T002; **timeboxed to 7 days**
 

@@ -1,7 +1,6 @@
 # T016 — Board canvas v1: the timeline as a readable whiteboard
 
-**Status:** open — unblocked (T012's seam is stable and documented; consume
-`Entity<TimelineState>` via `devwindow::attach_ingress`)
+**Status:** done
 
 **Wave:** 3 — Phase 2, the note-taker dogfood gate
 
@@ -9,7 +8,7 @@
 rewritten against the Electron fallback) · T011 (live timeline) · T012 (the tokio↔GPUI
 seam and the dev window it establishes) · T015 (screen snapshots to pin)
 
-**Owns:** `crates/app/src/board/**`
+**Owns:** `crates/app/src/board/**`, `crates/app/src/lib.rs`
 
 ## Goal
 
@@ -126,3 +125,124 @@ Board frame time at scale is this task's problem, so it lands here:
 
 If long-run frame time does degrade, that reopens ADR-0003 rather than being worked around
 here — say so and stop, do not paper over it.
+
+## Transcript-first reasoning clarification (2026-08-11)
+
+Local thumbnails remain part of the board and post-call artifact. Their presence does not
+put OCR text or image bytes into model context. T028 owns that separate, opt-in,
+timestamp-addressed reasoning path. Do not couple board thumbnail loading to whether a
+reasoning backend is configured.
+
+## Implementation notes — stable projection/layout slice (2026-08-11)
+
+- Added a deterministic `BoardProjection` over the shared append-only timeline. Partial-to-final
+  supersession replaces card content under one stable board identity and preserves the original
+  rectangle; live append and persisted replay take the same projection path.
+- Utterance placement uses event time on a fixed horizontal scale and separate speaker lanes, so
+  pauses remain gaps and simultaneous turns overlap. Viewport queries use timestamp-sorted
+  culling rather than scanning the full call.
+- Screen cards retain only the local `FrameRef`, capture label, and visible interval. OCR and
+  reasoning state are deliberately absent, keeping board thumbnails independent from T028's
+  opt-in inspection path.
+- Added the minimal `pub mod board` registration and a `BoardState` adapter that consumes unseen
+  events from T012's existing `Entity<TimelineState>` seam. No second Tokio channel was added.
+- Five focused projection tests pass when compiled directly against `sotto_core`: stable
+  supersession, time-axis gaps/overlap, local screen-card isolation, live/replay equivalence, and
+  bounded viewport density after 10,000 events.
+- `cargo test -p app --lib board::projection::tests --no-fail-fast` remains environment-blocked
+  before the app crate is compiled: GPUI's build script cannot run `metal` because the Xcode Metal
+  Toolchain is not installed. The GPUI-backed `BoardState` therefore still needs a normal app
+  compile once that owner-managed prerequisite is available.
+
+This task remains `in-progress`. The visual GPUI renderer, lazy frame loading/eviction, pan/zoom
+and follow-frontier interaction, real-call/long-run performance measurements, and owner dogfood
+judgement remain pending. Runtime mounting belongs in the existing app shell integration files and
+requires planner ownership rather than expanding this task's file boundary.
+
+## Implementation notes — GPUI board-lens slice (2026-08-11)
+
+This slice supersedes the renderer/navigation items in the preceding residual list:
+
+- Added `BoardCanvas` over the existing `Entity<TimelineState>` → `BoardState` seam. Each render
+  consumes only the unseen timeline suffix, computes a world-space viewport, and asks the stable
+  projection for visible cards only; the renderer does not introduce a second channel or rebuild
+  placement.
+- Added quiet manual pan/zoom plus explicit follow-frontier state. Manual panning yields follow
+  immediately, zoom is bounded and centre-preserving away from the live edge, and one visible
+  `Follow newest` control restores frontier tracking.
+- Added speaker-lane utterance rendering and local screen thumbnails. GPUI receives a local
+  `FrameRef` only when its card is visible, supplies loading/unavailable placeholders, and evicts
+  the image asset after it leaves the viewport. OCR, reasoning output, and provider state remain
+  outside the board.
+- Verification passed with the host-compatible feature/toolchain substitutions:
+  - `cargo test -p app --lib board:: --locked --features gpui/runtime_shaders` with
+    `WHISPER_DONT_GENERATE_BINDINGS=1`: 9 passed, 0 failed.
+  - `cargo check -p app --lib --locked --features gpui/runtime_shaders` with the same Whisper
+    substitution: passed.
+  - `cargo clippy -p app --lib --locked --features gpui/runtime_shaders -- -D warnings` with the
+    same substitution: passed.
+  - `cargo fmt -p app -- --check`: passed.
+
+This task remains `in-progress`. T032 owns mounting this lens into the product shell and wiring
+explicit live/post-call surface selection; T016 does not cross that ownership seam. A real
+conversation/post-call review, visual-calm judgement, and the required 1/10/20/30-minute frame,
+CPU, RSS, and GPU measurements remain owner/manual acceptance gates. The default embedded-shader
+build also still requires the missing Xcode Metal Toolchain; focused verification used GPUI runtime
+shaders instead. No long-run stability or readability claim is made from the automated checks.
+
+## Measurement-harness readiness (2026-08-11)
+
+- Restored the opt-in board-owned interval harness needed by the inherited T020 gates. With
+  `SOTTO_BOARD_METRICS=1`, measurement begins at the first projected board item, continuously
+  requests animation frames, and emits separate non-cumulative 1/10/20/30-minute scheduling
+  intervals plus total/visible/load-eligible-thumbnail-path counts. The latter records visible
+  paths admitted to GPUI's loader, not confirmed decoded or cached image residency. The harness
+  remains inert by default.
+- `docs/experiments/map-tier-manual-acceptance.md` gives the signed-app launch, process sampling,
+  GPU caveat, evidence schema, and board-readability rubric. T035 may provide overlapping real-call
+  evidence without changing this task's status.
+- No signed app, picker, capture, real call, or performance observation was run for this note.
+  Readability, no-reflow, real-call idle/append CPU, RSS/GPU, 20/30-minute data, and two-hour
+  stability therefore remain manual acceptance gates.
+- Focused readiness verification passed with `WHISPER_DONT_GENERATE_BINDINGS=1`, a fresh target
+  directory, and `gpui/runtime_shaders`: board tests 15 passed; app library check passed; strict
+  app library clippy passed. Formatting and scoped diff checks also passed. The initial sandboxed
+  attempt was environment-blocked by Swift's unwritable module cache; the identical outside-sandbox
+  run passed.
+
+## Independent measurement/runbook review — 2026-08-11
+
+- Confirmed the harness is inert unless `SOTTO_BOARD_METRICS=1`, starts at the first projected
+  item, uses nearest-rank percentile selection, clears intervals after every checkpoint, and
+  disables itself after the final checkpoint so it neither retains samples nor requests animation
+  frames indefinitely. Its output is explicitly a scheduling interval, never render duration or
+  inferred FPS.
+- Renamed the thumbnail field to `eligible_thumbnail_paths`. The board can observe paths that are
+  visible and admitted to GPUI's image loader, but not whether asynchronous decode/cache loading
+  succeeded; the prior residency label overstated that evidence.
+- T016 remains `in-progress`. No signed-app performance observation, visual judgement, GPU/process
+  attribution, no-reflow observation, or two-hour stability gate was inferred by this review.
+
+## Notes/Board workspace ownership handoff — 2026-08-12
+
+The deterministic board code slice and its focused automated review are settled. T016 releases
+`crates/app/src/board/**` and the required app integration seam to T038 for the sequential
+Notes/Board workspace implementation. T016 remains `in-progress` solely for its signed real-call
+readability, no-reflow, resource, GPU, and long-run manual gates. T038 may integrate the board but
+must not claim or alter those manual acceptance results.
+
+## Owner zoom-usability correction — 2026-08-12
+
+An owner screenshot showed the canvas at its 20% overview zoom, where transcript text is
+intentionally too small to read, but the UI exposed no zoom state or recovery control. The Board
+now renders explicit Zoom out, current-percent/reset, Zoom in, and Follow controls. Reset restores
+100%, the top lanes, and frontier following. The focused reset regression and the full 80-test app
+library suite pass; strict app Clippy passes. Signed visual/readability acceptance remains open.
+
+## Product-surface retirement — 2026-08-12
+
+ADR-0015/T048 supersedes the Board as a product surface after owner smoke testing found the spatial
+canvas less readable than ordinary text. The implemented canvas remains historical code and
+automated evidence, but the app no longer mounts it. Its unrun visual, zoom, GPU, and long-run
+canvas gates are deliberately retired rather than claimed; T035 now validates the top-down live
+transcript and persisted review instead.

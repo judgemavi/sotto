@@ -1,6 +1,8 @@
 # T021 — Scoped capture target selection
 
-**Status:** sufficient for the product path — window picks verified end to end. Remaining gaps
+**Status:** done
+
+Window picks are sufficient for the product path and verified end to end. Remaining gaps
 are deferred (see "Deferred gaps"), not blocking.
 
 **Wave:** Phase 2 — this is now the critical path to a usable tool

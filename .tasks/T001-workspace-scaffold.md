@@ -1,6 +1,10 @@
 # T001 — Cargo workspace scaffold, frozen domain contracts, ADR skeleton
 
-**Status:** done (approved at review round 2)
+**Status:** done
+
+> Planner amendment (2026-08-12): T042 is authorized to make the exact frozen-core timeline/type
+> migration listed in its `Owns` section after T016, T029, and T038 release their call-site paths.
+> This does not reopen T001 or authorize any `core -> providers|mcp|insight|advisor|app` edge.
 
 **Wave:** 0 (blocks all other tasks — nothing else starts until this is merged)
 

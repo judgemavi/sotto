@@ -1,6 +1,6 @@
 # T014 — Session timeline: the canonical event model in core
 
-**Status:** done (approved at review round 4 — contract frozen)
+**Status:** done
 
 **Wave:** 0.5 — blocks every crate that emits or consumes events (T004, T005, T006,
 T008, T009, T011, T015). T002, T003, T007 and T010 are unaffected and continue.

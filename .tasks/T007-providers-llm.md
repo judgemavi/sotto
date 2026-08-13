@@ -1,6 +1,6 @@
 # T007 — Providers crate: BYOK LLM abstraction with streaming, cancellation, caching
 
-**Status:** done (approved at review round 2)
+**Status:** done
 
 **Wave:** 1 — fully parallel
 
