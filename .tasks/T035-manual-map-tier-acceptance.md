@@ -106,3 +106,24 @@ overwriting user data. Evidence labels now say `eligible_thumbnail_paths`, not r
 
 T035 remains `todo`. This review ran no signed app, picker, model download, network transition,
 real call, Keychain mutation, performance measurement, or manual acceptance scenario.
+
+## Inherited from T002 — 2026-08-13
+
+T002 closed and released `crates/capture/**`; these two observations moved here because they need a
+real signed app and a real capture, not code.
+
+10. **Window-level audio granularity.** With a single window selected through the picker, play
+    audio from a second window of the *same* application and record whether it reaches the
+    transcript. ADR-0002 establishes application scoping and explicitly leaves window granularity
+    open. Record the honest answer; it decides the session-bar scope copy for window picks, and
+    under ADR-0018 it decides what lands in the retained recording. Do not treat
+    `capture_target_audio_scoped` as evidence — it carries `excludesCurrentProcessAudio`.
+11. **Chosen window closed mid-session.** Close the captured window while recording. Record whether
+    the session errors, pauses, falls back to the application, or silently dies. A silent dead
+    stream is a FAIL.
+
+## Known divergence carried from T055 — 2026-08-13
+
+Session rail titles preserve their beginning and clip at the end with no visible ellipsis character.
+Deferred deliberately after three attempts; root cause and fix are recorded in T055. Judge it under
+the readability rubric as a known cosmetic divergence rather than filing it as a new defect.

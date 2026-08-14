@@ -66,3 +66,13 @@ servers, or local knowledge.
 
 Sales-only triggers, battlecards, model-visible MCP tools, external action execution, board
 rendering (T043), overlay productionization, and AI product acceptance (T044).
+
+## Planner note — 2026-08-14
+
+Plan step 2's "cheap, tightly bounded first pass" must be **local and keyless** when this task
+unblocks, not a backend call: Whisper punctuation and interrogative heuristics, the compound
+two-stream trigger (a question on the remote stream followed by silence on both — Silero already
+emits the events), and, if evidence justifies it, a question head added to the small ONNX
+utterance classifier T093 introduces below the `providers` boundary. A backend is consulted only
+after a local trigger fires. T093 deliberately excludes question detection so this task's scope
+is not built twice; take its classifier infrastructure, do not duplicate it.

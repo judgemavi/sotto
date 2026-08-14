@@ -1,6 +1,6 @@
 # T048 — Top-down transcript and notes workspace
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N3 — product UI simplification
 
@@ -42,3 +42,12 @@ diarization, live proposal generation, or claiming signed-app visual acceptance.
   `gpui/runtime_shaders`; the app compile check and strict all-target Clippy passed; workspace
   formatting and diff checks passed. The current binary was not launched for a visual acceptance
   claim; T035 still owns the signed real-session verdict.
+
+### Closure — 2026-08-13 (planner)
+
+Closed as superseded rather than re-reviewed. T049 deleted `notes/view.rs` and rewrote `main.rs`, so
+this task's owned slice no longer exists as shipped code. What survives and remains binding is
+ADR-0015 plus the behaviours T049 carried forward as a move: citation focus by exact `EventId`, one
+live partial per stream, follow-live pausing on manual scroll, and exact-session replay. Its unrun
+signed-app acceptance was never claimed and passes to T035.
+

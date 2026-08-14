@@ -1,6 +1,6 @@
 # T002 — Spike A: dual-stream macOS audio capture + low-rate screen frames
 
-**Status:** in-progress
+**Status:** done
 
 **Wave:** 1 — start this one first, it has the longest tail and the highest technical risk
 
@@ -478,3 +478,25 @@ warnings), capture library tests 5/5, soak example tests 2/2, strict all-target/
 Clippy, package-scoped formatting, and scoped diff-check. No picker, real call, permission mutation,
 signing/notarization, or long soak ran. Status remains `in-progress` pending the manual acceptance
 contract above.
+
+### Closure — 2026-08-13 (planner, narrowed)
+
+Closed so `crates/capture/**` and ADR-0002 release to T057. The build work has been complete for
+some time: Swift ScreenCaptureKit bridge, CPAL microphone path, preallocated lock-free handoffs,
+permission and error reporting, and the drift-reporting soak harness are all built and verified,
+and ADR-0002 records the architecture.
+
+Two spike questions remain unanswered, and both are manual observations rather than code. They move
+to T035, which already runs real signed-app capture scenarios:
+
+- **Window-level audio granularity.** ADR-0002 establishes application scoping with evidence — an
+  out-of-scope process's probe was excluded while the selected application's audio was present —
+  but explicitly does not establish window-level granularity. The probe is: select one window, play
+  audio from a second window of the same application, and record whether it reaches the transcript.
+  Note that `capture_target_audio_scoped` is not evidence either way; it carries
+  `excludesCurrentProcessAudio` and is hardcoded true.
+- **Chosen window closed mid-session.** Define and observe the behaviour; it must not be a silent
+  dead stream.
+
+Both now also determine what lands in the retained recording under ADR-0018, so they matter more
+than when this spike was written.
