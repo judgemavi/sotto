@@ -126,24 +126,24 @@ that is live: `todo`, `blocked`, `in-progress`, `in-review`, or `changes-request
 is authoritative; this table records the intended handoff order so a blocked task is not mistaken
 for unowned work.
 
+Reorganized 2026-08-14 after the ADR-0021 planning pass: T002, T025, T048–T049, T051–T060, T063
+and T067 closed and pruned (snapshot commit precedes the prune). T053/T054 shipped the Ask surface,
+T051/T056 shipped annotations, T057–T059 shipped the recording spine. The maintainer has deferred
+the T035 manual gate to the end of the current waves; it remains the ship blocker it always was.
+
 | Wave | Track | Tasks | Current state and handoff |
 |---|---|---|---|
-| M0 | capture spike | T002 | In progress. The Swift ScreenCaptureKit bridge, CPAL microphone path, and soak harness are built; the later T061/T050 handoffs have released and completed their scoped edits in `crates/capture/**` and ADR-0002. |
-| M2 | record acceptance | T035 | Todo and blocking ship: real signed-app picker, provisioning, scoped audio/transcript, terminal/persistence, no-key transcript review, and 10-minute resource observations. T052 adds its scroll and reflow observations to this gate. |
-| M4 | recording | T062 → T064, T065 | T058, T059, T060 and T063 closed 2026-08-13. T062 holds the app-side recording seam; its first slice — the reference persisted before capture starts — is accepted, with the rail refresh and re-transcription gesture outstanding. T063's benchmark was accepted but its conclusion was not: an 11-second studio sample could not separate the models, so T065 re-runs it on real meeting audio. T064 is the maintainer-run signed acceptance gate. |
-| M3 | capture | T050 | In review: microphone-only capture, audio-only recording, explicit persisted scope, v10 migration, and single-source transcription are implemented with focused automated evidence. Fresh-profile signed capture, physical-microphone speech, and mounted-control acceptance remain manual `NOT RUN` gates. |
-| MV | map validation | T019 | Blocked: meeting-general migration is implemented with focused automated evidence; no independent or participant acceptance is claimed, and real validation awaits T035/T029. |
-| R1a | reasoning | T025 | Done 2026-08-13: the explicit experimental path disables hosted web search, accepts declared-but-read-only-denied `apply_patch`, passes the live inventory and injection sentinel, and works with the default model without pinning deprecated `gpt-5.4`. T030's empty-built-in-tools verdict remains FAIL and disclosed. |
-| R1b | reasoning | T067 | Done 2026-08-13: backend capabilities now govern centralized, observable request normalization; Codex remains fail-closed at its connector and OpenAI retains supported controls. |
-| R3 | reasoning | T029 | In review: automated CLI cutover/privacy/provenance/eval slice accepted; live Keychain-backed OpenAI evidence still pending T035. |
-| N5 | workspace finish | T055 | Done 2026-08-13. T060 subsequently closed the deferred rail-title ellipsis and terminal-control clipping defect. T048-T054 closed 2026-08-13 with visual acceptance narrowed and handed here. One window, session bar, design tokens, and the inherited per-frame render cost. `docs/design/workspace-mock.html` is normative for the shipped look. Planner review on 2026-08-13 filed five defects against it, including an empty transcript when reopening a past meeting. |
-| N7 | v2 workspace | T072, T073, T074, T075 | Aligning the built UI with `docs/design/workspace-v2-mock.html` under ADR-0019: recording-centric vocabulary, two title bars with a tabbed stopped-session stage, three equal entry points, source-attributed transcript rows, and an adaptive summary. Split by file so all four run concurrently; T072 owns `mod.rs` and registers modules for the others. |
-| N6 | UI primitives | T060 | Done 2026-08-13. The control-row primitive makes essential, ellipsizing, and expendable roles explicit; the 680 px regression keeps the clock and clickable Stop in bounds and closes T055's deferred rail-title ellipsis. |
-| N5 | workspace finish | T056 | Blocked on T055: annotate a meeting after it ends, anchored to a chosen transcript row. Reverses a T051 contract choice, not a defect. |
+| M2 | ship gate | T035 | Todo, **deferred to the end of the current waves by the maintainer (2026-08-14)** — deliberately last, not forgotten. Still the map-tier ship blocker; collects every manual `NOT RUN` residual from closed tasks. The maintainer's daily use pre-answers much of the happy path; the signed fresh-profile build, terminal paths, and measurements remain unproven. |
+| M3 | capture | T050 | In review: microphone-only capture, audio-only recording, explicit persisted scope, and single-source transcription with focused automated evidence. Fresh-profile signed capture and mounted-control acceptance remain manual `NOT RUN` gates (→ T035). |
+| M4 | recording | T061, T062, T064, T065, T066, T068, T071, T079 | T061 in-progress (recording durability/fragmentation). T062 in-review (live meeting invisible to the app's own surfaces). T066 in-review (reasoning pulls frames through the app's own runtime; its open gaps are T092's charter). T064 todo: the maintainer-run signed recording acceptance gate, paired with T035. T065 blocked (model benchmark on real meeting audio). T068, T071, T079 todo: finalization tolerance, media import, pause. |
+| MV | map validation | T019 | Blocked: real validation awaits T035/T029. |
+| R3 | reasoning | T029, T070 | T029 in-review: automated cutover/privacy/provenance/eval slice accepted; live Keychain-backed OpenAI evidence pending T035. T070 todo: the adaptive summary schema — now also carries ADR-0021's block-identity requirement that T087/T088 stand on, so it is the first dispatch of the D1/V1 chain. |
+| N6 | UI primitives | T069 | In review: Settings and Ask stop looking like debug panels. Releases `ask.rs` to T091 on close. |
+| N7 | v2 workspace | T072–T078, T080–T085 | All in-review (T084 normalized from a malformed "done — awaiting hand check" status; the hand check is the review). Closing this wave releases the workspace files T089 and T091 need. `docs/design/workspace-v2-mock.html` stays normative for this wave; the v3 mock takes over at N8. |
 | P1 | proposal engine | T013 | Blocked on T035/T029 live gates; T039/T041 evidence and T042 proposal-event contracts are accepted. Planner note 2026-08-14: the watcher's first pass must be local and keyless, reusing T093's classifier infrastructure. |
 | P2 | proposal UI | T043 | Blocked on T013/T040/T042: anchored cards and source receipts. |
 | E0 | AI acceptance | T044 | Blocked on T035/T029 and the Notes/MCP/Proposal product slices. |
-| N8 | entry workspace | T086 → T089 | ADR-0021. T086 (todo) puts the entry above the recording in `core`/`rag` — data model only, no UI. T089 (blocked on T086 + N7 close) cuts the workspace over to entries: prepared entries before capture, record-again into an entry, `docs/design/workspace-v3-mock.html` normative. |
+| N8 | entry workspace | T086 → T089 | ADR-0021. T086 (todo, **dispatchable now**) puts the entry above the recording in `core`/`rag` — data model only, no UI. T089 (blocked on T086 + N7 close) cuts the workspace over to entries: prepared entries before capture, record-again into an entry, `docs/design/workspace-v3-mock.html` normative. |
 | D1 | living notes | T087, T092 | Blocked on T070/T086 and T066/T070 respectively. T087 makes the summary an editable two-layer document with deterministic regeneration merge over T070's block ids. T092 finishes screen consultation: an inspection budget, Ask's inspector seam, and a disclosure that survives caching. |
 | V1 | vault | T088 | Blocked on T086/T087: the markdown vault projection — one `.md` per entry, `^blockid` anchors, `sotto://` deep links; notes two-way through the overlay, the record one-way. |
 | B1 | preparation | T090 → T093 | Blocked on the N8/D1 chain. T090 is the pre-meeting brief into a prepared entry (cited, one-shot, deterministic open-items section works keyless). T093 closes the loop: local ONNX commitment/decision detection, suggested action blocks, open items resurfacing in the brief. |
@@ -152,7 +152,12 @@ for unowned work.
 ## Standing decisions from closed work
 
 The scaffold, capture, VAD, ASR, prosody, timeline, pipeline, persistence, notes, MCP and reasoning
-waves are accepted and their task files pruned. What still binds current work:
+waves are accepted and their task files pruned — as are, since 2026-08-14: the capture spike (T002),
+the Codex backend and request normalization (T025/T067), the v1 workspaces and visual system
+(T048/T049/T055), annotations live and post-meeting (T051/T056), smooth transcript presentation
+(T052), the Ask surface single- and cross-session (T053/T054), the recording spine — persistence,
+lagged transcription, on-demand frames, the ASR benchmark (T057–T059/T063) — and the control-row
+primitive (T060). What still binds current work:
 
 - The evaluated v1 reasoning target was Codex CLI plus the OpenAI Responses API. T030 returned FAIL
   because the installed supported protocol cannot guarantee an empty model-visible built-in tool
