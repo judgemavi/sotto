@@ -145,19 +145,42 @@ impl Annotator {
         if is_hesitant(&utterance.text) {
             annotations.push(Annotation::Hesitant);
         }
-        if old_baseline.is_some_and(|baseline| {
-            baseline > 0.0
-                && ((rate - baseline) / baseline).abs() >= self.config.rate_change_threshold
-        }) {
+        // A words-per-minute rate is only meaningful once there's enough signal to
+        // measure a pace from. Two thresholds guard against boundary fragments
+        // (see T005/T018 finality contract: short segments recur at ASR window
+        // cuts even after trough alignment):
+        //   - fewer than MIN_WORDS_FOR_RATE words isn't a "rate" at all, it's one
+        //     token's duration extrapolated to a minute ("of" alone yielding 500
+        //     wpm);
+        //   - under MIN_RATE_DURATION, ASR window-boundary timestamp jitter
+        //     (order ~100-150ms) is a large fraction of the measured span, so the
+        //     rate is dominated by measurement error rather than speech pace
+        //     ("your current." at 0.32s -> 375 wpm, "Now what" at 1.0s -> 120
+        //     wpm are both boundary artifacts, not slow or normal speech). A
+        //     2-word utterance spanning 3s is a plausible slow rate; the same
+        //     2 words spanning 0.2s is not — duration, not word count alone,
+        //     is what makes a rate trustworthy, so both must clear their floor.
+        const MIN_WORDS_FOR_RATE: usize = 2;
+        const MIN_RATE_DURATION: f32 = 1.5;
+        let rate_is_meaningful = words >= MIN_WORDS_FOR_RATE && (end - start) >= MIN_RATE_DURATION;
+
+        if rate_is_meaningful
+            && old_baseline.is_some_and(|baseline| {
+                baseline > 0.0
+                    && ((rate - baseline) / baseline).abs() >= self.config.rate_change_threshold
+            })
+        {
             annotations.push(Annotation::SpeechRate(rate));
         }
 
-        self.baselines[index] = Some(old_baseline.map_or(rate, |old| {
-            old.mul_add(
-                1.0 - self.config.baseline_alpha,
-                rate * self.config.baseline_alpha,
-            )
-        }));
+        if rate_is_meaningful {
+            self.baselines[index] = Some(old_baseline.map_or(rate, |old| {
+                old.mul_add(
+                    1.0 - self.config.baseline_alpha,
+                    rate * self.config.baseline_alpha,
+                )
+            }));
+        }
         self.utterances.push_back(Observation {
             source: utterance.source,
             start,

@@ -11,17 +11,20 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use asr::{Config as AsrConfig, WhisperTranscriber};
+use asr::{Config as AsrConfig, FinalWhisperTranscriber};
 use serde::Serialize;
 use sotto_core::{
     AudioFrame, CaptureBackend, CaptureError, CaptureTarget, EventPayload, PermissionStatus,
     Pipeline, PipelineConfig, Session, SessionId, Source, SpeechState, TargetKind, TimelineEvent,
-    Transcriber, TranscriptUpdate, Utterance, VadSegment, VoiceActivityDetector,
+    Transcriber, TranscriptUpdate,
 };
 use tokio::sync::{Notify, broadcast};
 use vad::{SileroVad, VadConfig};
 
 use crate::file_capture::{FileCapture, FileCaptureMode, TimestampedFrames};
+
+/// Generic kind used for user-supplied UTF-8/Markdown files.
+pub const FILE_INGEST_KIND: rag::DocumentKind = rag::DocumentKind::ResourceDocument;
 
 #[derive(Clone, Debug)]
 pub struct PipelineOptions {
@@ -45,7 +48,7 @@ pub struct LatencyReport {
     pub frame_to_vad: Percentiles,
     pub speech_end_to_partial: Percentiles,
     pub speech_end_to_final: Percentiles,
-    pub speech_end_to_suggestion: Option<Percentiles>,
+    pub speech_end_to_proposal: Option<Percentiles>,
 }
 
 pub struct PipelineRun {
@@ -73,26 +76,12 @@ async fn run_files_async(options: &PipelineOptions) -> Result<PipelineRun> {
         mode,
         Arc::clone(&metrics),
     )?;
-    let speech = Arc::new(Mutex::new(Vec::<VadSegment>::new()));
     let transcriber = if let Some(path) = &options.model {
-        let mut config = AsrConfig::new(path);
-        // The pipeline's VAD stage is an independent timeline producer; it does not
-        // drive Whisper's optional concrete-type gate through the object-safe trait.
-        config.vad_gating = false;
-        // Fixture pacing must not alter ASR semantics. Five-second audio windows keep
-        // complete TTS utterances together, while audio-driven wakeups make fast and
-        // realtime modes execute the identical window sequence.
-        config.agreement_passes = 1;
-        config.unstable_tail = Duration::ZERO;
-        config.cadence = Duration::from_secs(5);
-        // Offline capture is allowed to outrun inference. Retain the complete
-        // 30-second corpus while the worker advances through it in FIFO order.
-        config.ring_capacity = Duration::from_secs(60);
-        HarnessTranscriber::Real(DrainingTranscriber::new(
-            WhisperTranscriber::new(config)?,
+        let config = AsrConfig::new(path);
+        HarnessTranscriber::Real(Box::new(DrainingTranscriber::new(
+            FinalWhisperTranscriber::new(config)?,
             frame_count,
-            Arc::clone(&speech),
-        ))
+        )))
     } else {
         HarnessTranscriber::Noop
     };
@@ -118,14 +107,8 @@ async fn run_files_async(options: &PipelineOptions) -> Result<PipelineRun> {
     let pipeline = Pipeline::builder(session)
         .capture(capture)
         .vad(
-            RecordingVad::new(
-                SileroVad::new(Source::Mic, VadConfig::default())?,
-                Arc::clone(&speech),
-            ),
-            RecordingVad::new(
-                SileroVad::new(Source::System, VadConfig::default())?,
-                Arc::clone(&speech),
-            ),
+            SileroVad::new(Source::Mic, VadConfig::default())?,
+            SileroVad::new(Source::System, VadConfig::default())?,
         )
         .transcriber(transcriber)
         .annotator(prosody::Annotator::default())
@@ -292,35 +275,8 @@ impl Drop for MergedFileCapture {
 }
 
 enum HarnessTranscriber {
-    Real(DrainingTranscriber),
+    Real(Box<DrainingTranscriber>),
     Noop,
-}
-
-struct RecordingVad {
-    inner: SileroVad,
-    speech: Arc<Mutex<Vec<VadSegment>>>,
-}
-
-impl RecordingVad {
-    fn new(inner: SileroVad, speech: Arc<Mutex<Vec<VadSegment>>>) -> Self {
-        Self { inner, speech }
-    }
-}
-
-impl VoiceActivityDetector for RecordingVad {
-    fn push(&mut self, frame: &AudioFrame) -> Option<VadSegment> {
-        let segment = self.inner.push(frame);
-        if let Some(segment) = &segment
-            && let Ok(mut speech) = self.speech.lock()
-        {
-            speech.push(segment.clone());
-        }
-        segment
-    }
-
-    fn reset(&mut self) {
-        self.inner.reset();
-    }
 }
 
 impl Transcriber for HarnessTranscriber {
@@ -336,66 +292,29 @@ impl Transcriber for HarnessTranscriber {
             Self::Noop => Vec::new(),
         }
     }
+
+    fn finish(&mut self) {
+        if let Self::Real(inner) = self {
+            inner.finish();
+        }
+    }
 }
 
 struct DrainingTranscriber {
-    inner: WhisperTranscriber,
+    inner: FinalWhisperTranscriber,
     expected_frames: usize,
     pushed_frames: usize,
     drained: bool,
-    speech: Arc<Mutex<Vec<VadSegment>>>,
-    candidates: HashMap<(Source, Duration), Utterance>,
-    raw_updates: Vec<TranscriptUpdate>,
 }
 
 impl DrainingTranscriber {
-    fn new(
-        inner: WhisperTranscriber,
-        expected_frames: usize,
-        speech: Arc<Mutex<Vec<VadSegment>>>,
-    ) -> Self {
+    fn new(inner: FinalWhisperTranscriber, expected_frames: usize) -> Self {
         Self {
             inner,
             expected_frames,
             pushed_frames: 0,
             drained: false,
-            speech,
-            candidates: HashMap::new(),
-            raw_updates: Vec::new(),
         }
-    }
-
-    fn revise(&mut self, updates: Vec<TranscriptUpdate>) -> Vec<TranscriptUpdate> {
-        let speech = self.speech.lock().map_or_else(
-            |poisoned| poisoned.into_inner().clone(),
-            |segments| segments.clone(),
-        );
-        let mut revisions = Vec::new();
-        for update in updates {
-            let mut utterance = update.into_utterance();
-            let midpoint = utterance.start + utterance.end.saturating_sub(utterance.start) / 2;
-            let Some(segment) = speech
-                .iter()
-                .filter(|segment| segment.source == utterance.source && segment.end.is_some())
-                .min_by_key(|segment| segment.start.abs_diff(midpoint))
-            else {
-                continue;
-            };
-            utterance.start = segment.start;
-            if let Some(end) = segment.end {
-                utterance.end = end;
-            }
-            let key = (utterance.source, utterance.start);
-            let replace = self
-                .candidates
-                .get(&key)
-                .is_none_or(|current| word_count(&utterance.text) >= word_count(&current.text));
-            if replace {
-                self.candidates.insert(key, utterance.clone());
-            }
-            revisions.push(TranscriptUpdate::Partial(utterance));
-        }
-        revisions
     }
 }
 
@@ -406,28 +325,19 @@ impl Transcriber for DrainingTranscriber {
     }
 
     fn poll(&mut self) -> Vec<TranscriptUpdate> {
-        self.raw_updates.extend(self.inner.poll());
-        if self.drained || self.pushed_frames < self.expected_frames {
-            return Vec::new();
+        let mut updates = self.inner.poll();
+        if !self.drained && self.pushed_frames >= self.expected_frames {
+            self.drained = true;
+            self.inner.finish();
+            updates.extend(self.inner.poll());
         }
-        self.drained = true;
-        self.inner.drain();
-        self.raw_updates.extend(self.inner.poll());
-        let raw_updates = std::mem::take(&mut self.raw_updates);
-        let mut updates = self.revise(raw_updates);
-        let mut finals = self
-            .candidates
-            .drain()
-            .map(|(_, value)| value)
-            .collect::<Vec<_>>();
-        finals.sort_by_key(|value| (value.start, value.source == Source::Mic));
-        updates.extend(finals.into_iter().map(TranscriptUpdate::Final));
         updates
     }
-}
 
-fn word_count(text: &str) -> usize {
-    text.split_whitespace().count()
+    fn finish(&mut self) {
+        self.drained = true;
+        self.inner.finish();
+    }
 }
 
 struct LatencyCollector {
@@ -476,7 +386,7 @@ impl LatencyCollector {
             frame_to_vad: percentiles(&mut self.frame_vad),
             speech_end_to_partial: percentiles(&mut self.partial),
             speech_end_to_final: percentiles(&mut self.final_updates),
-            speech_end_to_suggestion: None,
+            speech_end_to_proposal: None,
         }
     }
 }
@@ -616,6 +526,6 @@ pub fn ingest_file(store_path: &Path, input: &Path) -> Result<bool> {
         ..rag::IngestMetadata::default()
     };
     store
-        .ingest_text(&text, rag::DocumentKind::ProductDocument, metadata)
+        .ingest_text(&text, FILE_INGEST_KIND, metadata)
         .map_err(Into::into)
 }

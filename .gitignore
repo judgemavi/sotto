@@ -5,4 +5,16 @@
 .idea/
 .vscode/
 
+# Swift Package Manager output for the three macOS bridges (asr, capture, screen). Not anchored,
+# because each bridge builds into its own directory; `crates/capture/bridge-macos/.gitignore`
+# covered exactly one of them and is now redundant.
+.build/
+
+# Downloaded ONNX embedding weights. Fetched on demand and verified on use, never authored here.
+.fastembed_cache/
+
 capture-soak-output/
+
+# Local ASR benchmark fixtures: maintainer-supplied reference transcripts and audio.
+# Third-party material; kept out of the repository deliberately.
+benchmarks/

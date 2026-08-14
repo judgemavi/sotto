@@ -8,4 +8,8 @@
 mod schema;
 mod store;
 
-pub use store::{DocumentKind, IngestMetadata, SearchFilter, Store, TimelinePersistence};
+pub use store::{
+    DEFAULT_RECORDING_BUDGET_BYTES, DerivedTranscript, DocumentKind, GroundedDerivedArtifact,
+    GroundedDerivedView, IngestMetadata, LocalEvidenceReceipt, LocalProvenance, RecordingReference,
+    RecordingUsage, SearchFilter, SessionSummary, Store, TimelinePersistence,
+};

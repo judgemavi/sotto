@@ -133,6 +133,80 @@ mod tests {
     }
 
     #[test]
+    fn short_fragment_produces_no_speech_rate_annotation() {
+        let mut value = Annotator::default();
+        value.observe(Event::Utterance(&utterance(
+            Source::System,
+            0,
+            10_000,
+            "one two three four five six seven eight nine ten",
+        )));
+        // A single word over 0.12s ("of" at 500 wpm in the reported defect):
+        // fails both the word-count and duration floors.
+        let annotations = value.observe(Event::Utterance(&utterance(
+            Source::System,
+            10_000,
+            10_120,
+            "of",
+        )));
+        assert!(
+            !annotations
+                .iter()
+                .any(|item| matches!(item, Annotation::SpeechRate(_)))
+        );
+        // Two words over 0.32s ("your current." at 375 wpm): clears the word
+        // count floor but not the duration floor.
+        let annotations = value.observe(Event::Utterance(&utterance(
+            Source::System,
+            10_120,
+            10_440,
+            "your current",
+        )));
+        assert!(
+            !annotations
+                .iter()
+                .any(|item| matches!(item, Annotation::SpeechRate(_)))
+        );
+    }
+
+    #[test]
+    fn short_fragment_does_not_move_the_baseline() {
+        let mut with_fragment = Annotator::default();
+        let mut without_fragment = Annotator::default();
+        let established = utterance(
+            Source::System,
+            0,
+            10_000,
+            "one two three four five six seven eight nine ten",
+        );
+        with_fragment.observe(Event::Utterance(&established));
+        without_fragment.observe(Event::Utterance(&established));
+
+        // Only `with_fragment` sees the boundary fragment; a fast one-word
+        // blip that would compute to 500 wpm if it were allowed to count.
+        with_fragment.observe(Event::Utterance(&utterance(
+            Source::System,
+            10_000,
+            10_120,
+            "of",
+        )));
+
+        // The same legitimate utterance follows in both annotators, offset
+        // by the fragment's span so timelines stay comparable.
+        let legitimate_with = utterance(Source::System, 10_120, 12_120, "one two three four");
+        let legitimate_without = utterance(Source::System, 10_000, 12_000, "one two three four");
+
+        let annotations_with = with_fragment.observe(Event::Utterance(&legitimate_with));
+        let annotations_without = without_fragment.observe(Event::Utterance(&legitimate_without));
+
+        assert_eq!(annotations_with, annotations_without);
+        assert_eq!(
+            with_fragment.last_delta().map(|delta| delta.speech_rate),
+            without_fragment.last_delta().map(|delta| delta.speech_rate)
+        );
+    }
+
+    #[test]
     fn talk_time_is_queryable() {
         let mut value = Annotator::default();
         value.observe(Event::Utterance(&utterance(Source::Mic, 0, 3_000, "rep")));
@@ -190,7 +264,7 @@ mod tests {
         value.annotations = chosen;
         assert_eq!(
             value.render_inline(),
-            "[customer, hesitant, 2.5s pause] \"sure, sounds fine\""
+            "[meeting audio, hesitant, 2.5s pause] \"sure, sounds fine\""
         );
     }
 }

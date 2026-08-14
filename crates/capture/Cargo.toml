@@ -14,7 +14,9 @@ tokio.workspace = true
 
 [dev-dependencies]
 hound = "3.5.1"
+libc = "0.2.189"
 png = "0.18.1"
+tempfile = "3.27.0"
 
 [lints]
 workspace = true

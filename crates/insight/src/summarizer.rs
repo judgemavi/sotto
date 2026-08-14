@@ -1,13 +1,15 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use futures_util::StreamExt;
+use providers::{ReasoningProvider, text_reasoning_provider};
 use rag::Store;
+use screen::ScreenInspectionSource;
 use serde::{Deserialize, Serialize};
 use sotto_core::{
-    CancellationToken, CompletionMessage, CompletionProvider, CompletionRequest, EventId,
-    EventPayload, MessageRole, ProviderError, SessionId, TimelineEvent, Usage,
+    CompletionProvider, EventId, EventPayload, ProviderError, SessionId, TimelineEvent, Usage,
 };
 use thiserror::Error;
+
+use crate::context::{ReasoningContextError, complete_with_optional_inspection, render_transcript};
 
 const MAP_PROMPT: &str = include_str!("../../../prompts/summary/v1-map.md");
 const REDUCE_PROMPT: &str = include_str!("../../../prompts/summary/v1-reduce.md");
@@ -130,15 +132,20 @@ pub enum SummaryError {
     UnknownCitation(EventId),
     #[error("image context is unsupported by the provider-neutral text completion contract")]
     ImageContextUnsupported,
+    #[error("eager OCR context was removed; use the typed inspect_screen second pass")]
+    EagerOcrContextRemoved,
+    #[error(transparent)]
+    Context(#[from] ReasoningContextError),
     #[error("persisted session contains no final utterances")]
     EmptyTimeline,
 }
 
 pub struct Summarizer<'a> {
     store: &'a Store,
-    provider: Arc<dyn CompletionProvider>,
+    provider: Arc<dyn ReasoningProvider>,
     pricing: Option<Pricing>,
     context_mode: ContextMode,
+    screen_inspector: Option<Arc<dyn ScreenInspectionSource>>,
 }
 
 impl<'a> Summarizer<'a> {
@@ -146,10 +153,18 @@ impl<'a> Summarizer<'a> {
     pub fn new(store: &'a Store, provider: Arc<dyn CompletionProvider>) -> Self {
         Self {
             store,
-            provider,
+            provider: text_reasoning_provider(provider),
             pricing: None,
             context_mode: ContextMode::default(),
+            screen_inspector: None,
         }
+    }
+
+    /// Replaces the text-compatible adapter with an image-capable reasoning transport.
+    #[must_use]
+    pub fn with_reasoning_provider(mut self, provider: Arc<dyn ReasoningProvider>) -> Self {
+        self.provider = provider;
+        self
     }
 
     #[must_use]
@@ -164,9 +179,18 @@ impl<'a> Summarizer<'a> {
         self
     }
 
+    #[must_use]
+    pub fn with_screen_inspector(mut self, inspector: Arc<dyn ScreenInspectionSource>) -> Self {
+        self.screen_inspector = Some(inspector);
+        self
+    }
+
     pub async fn summarize(&self, session_id: SessionId) -> Result<SummaryReport, SummaryError> {
         if self.context_mode == ContextMode::MetadataAndImages {
             return Err(SummaryError::ImageContextUnsupported);
+        }
+        if self.context_mode == ContextMode::MetadataAndOcr {
+            return Err(SummaryError::EagerOcrContextRemoved);
         }
         let session = self.store.load_session_record(session_id)?;
         let events = self.store.load_session(session_id)?;
@@ -179,28 +203,37 @@ impl<'a> Summarizer<'a> {
         let mut usage = Usage::default();
         let windows = windows(&events);
         let mut partials = Vec::with_capacity(windows.len());
+        let mut calls = 0_usize;
         for window in &windows {
             let target = session.capture_target();
-            let input = format!(
-                "Capture target: app={} window={}\n\n{}",
-                target.display_name,
-                target.window_title.as_deref().unwrap_or("unknown"),
-                render_window(window, self.context_mode)
-            );
-            let (recap, call_usage) = self.complete(MAP_PROMPT, input).await?;
-            add_usage(&mut usage, call_usage);
-            partials.push(recap);
+            let input = render_transcript(target, window.iter().copied());
+            let result = complete_with_optional_inspection(
+                self.provider.as_ref(),
+                MAP_PROMPT,
+                input,
+                &events,
+                self.screen_inspector.as_deref(),
+            )
+            .await?;
+            add_usage(&mut usage, result.usage);
+            calls = calls.saturating_add(result.calls);
+            partials.push(result.value);
         }
-        let calls;
         let recap = if partials.len() == 1 {
-            calls = 1;
             partials.pop().ok_or(SummaryError::EmptyTimeline)?
         } else {
             let input = serde_json::to_string(&partials)?;
-            let (recap, call_usage) = self.complete(REDUCE_PROMPT, input).await?;
-            add_usage(&mut usage, call_usage);
-            calls = partials.len() + 1;
-            recap
+            let result = complete_with_optional_inspection::<Recap>(
+                self.provider.as_ref(),
+                REDUCE_PROMPT,
+                input,
+                &events,
+                None,
+            )
+            .await?;
+            add_usage(&mut usage, result.usage);
+            calls = calls.saturating_add(result.calls);
+            result.value
         };
         validate_citations(&recap, &events)?;
         Ok(SummaryReport {
@@ -210,35 +243,6 @@ impl<'a> Summarizer<'a> {
             model: self.provider.model_id().to_owned(),
             calls,
         })
-    }
-
-    async fn complete(&self, system: &str, input: String) -> Result<(Recap, Usage), SummaryError> {
-        let request = CompletionRequest {
-            model: self.provider.model_id().to_owned(),
-            system: Some(system.to_owned()),
-            messages: vec![CompletionMessage {
-                role: MessageRole::User,
-                content: input,
-                cache_boundary: false,
-            }],
-            max_tokens: Some(4_096),
-            temperature: Some(0.0),
-            stop: Vec::new(),
-        };
-        let mut stream = self
-            .provider
-            .stream(request, CancellationToken::new())
-            .await?;
-        let mut output = String::new();
-        let mut usage = Usage::default();
-        while let Some(delta) = stream.next().await {
-            let delta = delta?;
-            output.push_str(&delta.text);
-            if let Some(final_usage) = delta.usage {
-                usage = final_usage;
-            }
-        }
-        Ok((serde_json::from_str(strip_fence(&output))?, usage))
     }
 }
 
@@ -264,10 +268,6 @@ fn windows(events: &[TimelineEvent]) -> Vec<Vec<&TimelineEvent>> {
                     EventPayload::UtteranceFinal(utterance) => {
                         utterance.start >= start && utterance.start < end
                     }
-                    EventPayload::ScreenSnapshot(snapshot) => {
-                        snapshot.visible_from < end
-                            && snapshot.visible_to.is_none_or(|until| until >= start)
-                    }
                     _ => false,
                 })
                 .collect();
@@ -277,36 +277,6 @@ fn windows(events: &[TimelineEvent]) -> Vec<Vec<&TimelineEvent>> {
                 .then_some(window)
         })
         .collect()
-}
-
-fn render_window(events: &[&TimelineEvent], context: ContextMode) -> String {
-    let mut lines = Vec::new();
-    for event in events {
-        match event.payload() {
-            EventPayload::UtteranceFinal(utterance) => lines.push(format!(
-                "[event:{} at:{:.1}s] {}",
-                event.id().get(),
-                utterance.start.as_secs_f64(),
-                utterance.render_inline()
-            )),
-            EventPayload::ScreenSnapshot(snapshot) => {
-                let mut line = format!(
-                    "[event:{} screen at:{:.1}s app={} window={}]",
-                    event.id().get(),
-                    snapshot.visible_from.as_secs_f64(),
-                    snapshot.active_app.as_deref().unwrap_or("unknown"),
-                    snapshot.window_title.as_deref().unwrap_or("unknown")
-                );
-                if context == ContextMode::MetadataAndOcr && !snapshot.ocr_text.trim().is_empty() {
-                    line.push_str(" OCR: ");
-                    line.push_str(snapshot.ocr_text.trim());
-                }
-                lines.push(line);
-            }
-            _ => {}
-        }
-    }
-    lines.join("\n")
 }
 
 fn validate_citations(recap: &Recap, events: &[TimelineEvent]) -> Result<(), SummaryError> {
@@ -342,13 +312,4 @@ fn cost(usage: Usage, pricing: Pricing) -> Cost {
         + f64::from(usage.cache_write_tokens) * pricing.cache_write_per_million_usd)
         / 1_000_000.0;
     Cost { usd }
-}
-
-fn strip_fence(output: &str) -> &str {
-    let trimmed = output.trim();
-    trimmed
-        .strip_prefix("```json")
-        .and_then(|body| body.strip_suffix("```"))
-        .map(str::trim)
-        .unwrap_or(trimmed)
 }

@@ -9,15 +9,19 @@
 
 #![deny(warnings)]
 
+pub mod inspection;
 mod parse;
+mod reasoning;
 
 pub mod anthropic;
+pub mod backend;
+pub mod codex;
 pub mod google;
 pub mod ollama;
 pub mod openai;
 pub mod openrouter;
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::fmt;
 
 use secrecy::{ExposeSecret, SecretString};
 use sotto_core::{
@@ -25,32 +29,13 @@ use sotto_core::{
     ProviderError,
 };
 
+pub use backend::{
+    AuthKind, AuthStatus, BackendCapabilities, BackendCapability, BackendContractError,
+    BackendDescriptor, BackendFingerprint, BackendId, CODEX_CLI_BACKEND_ID,
+    OPENAI_RESPONSES_BACKEND_ID, Registry, RegistryError, ResolvedBackend, Role,
+};
 pub use parse::{ProviderKind, Transport};
-
-/// Runtime purpose assigned to a configured provider.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Role {
-    Watcher,
-    Suggester,
-    Summarizer,
-}
-
-/// Multiple provider choices resolved independently by runtime role.
-#[derive(Default)]
-pub struct Registry {
-    providers: HashMap<Role, Arc<dyn CompletionProvider>>,
-}
-
-impl Registry {
-    pub fn set(&mut self, role: Role, provider: Arc<dyn CompletionProvider>) {
-        self.providers.insert(role, provider);
-    }
-
-    #[must_use]
-    pub fn get(&self, role: Role) -> Option<Arc<dyn CompletionProvider>> {
-        self.providers.get(&role).cloned()
-    }
-}
+pub use reasoning::{ReasoningProvider, TextReasoningProvider, text_reasoning_provider};
 
 /// A configured HTTP adapter. Secret material is intentionally absent from `Debug`.
 pub struct Provider {
@@ -212,7 +197,7 @@ pub fn has_key(kind: ProviderKind) -> Result<bool, ProviderError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Provider, ProviderKind, Role, validate};
+    use super::{Provider, ProviderKind, validate};
     use futures_util::StreamExt;
     use secrecy::SecretString;
     use sotto_core::{
@@ -259,30 +244,6 @@ mod tests {
         assert!(
             validate(&req).is_err(),
             "multiple cache boundaries must be rejected"
-        );
-    }
-
-    #[test]
-    fn registry_roles_are_independent() {
-        let mut registry = super::Registry::default();
-        registry.set(
-            Role::Watcher,
-            std::sync::Arc::new(Provider::new(ProviderKind::Ollama, "tiny", None)),
-        );
-        registry.set(
-            Role::Suggester,
-            std::sync::Arc::new(Provider::new(ProviderKind::OpenAi, "large", None)),
-        );
-        assert_eq!(
-            registry
-                .get(Role::Watcher)
-                .map(|provider| provider.model_id().to_owned()),
-            Some("tiny".to_owned()),
-            "watcher role must resolve independently"
-        );
-        assert!(
-            registry.get(Role::Summarizer).is_none(),
-            "unset role must remain empty"
         );
     }
 

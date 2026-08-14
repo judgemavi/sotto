@@ -13,8 +13,8 @@ use futures_core::Stream;
 use tokio::sync::{Notify, broadcast};
 
 use crate::{
-    AudioFrame, CaptureError, Chunk, CompletionRequest, Delta, PermissionStatus, ProviderError,
-    RagError, Utterance, VadSegment,
+    AsrError, AudioFrame, CaptureError, Chunk, CompletionRequest, Delta, PermissionStatus,
+    ProviderError, RagError, ReasoningOutput, ReasoningRequest, Utterance, VadSegment,
 };
 
 /// A boxed, sendable stream with a caller-selected lifetime.
@@ -70,10 +70,31 @@ pub trait VoiceActivityDetector: Send {
     fn reset(&mut self);
 }
 
-/// Produces sliding-window partials and final utterances from audio frames.
+/// Produces transcript updates from media-timestamped audio frames.
 pub trait Transcriber: Send {
     fn push(&mut self, frame: &AudioFrame);
     fn poll(&mut self) -> Vec<TranscriptUpdate>;
+
+    /// Declares that no more input will arrive, allowing a partial media window to settle.
+    fn finish(&mut self) {}
+}
+
+/// Whether a retained recording may still acquire committed media segments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordingStatus {
+    Growing,
+    Complete,
+}
+
+/// Follows a retained recording and emits transcript updates in recording media time.
+pub trait RecordingTranscriber: Send {
+    fn transcribe_available(
+        &mut self,
+        status: RecordingStatus,
+    ) -> Result<Vec<TranscriptUpdate>, AsrError>;
+
+    /// End of the contiguous media prefix already submitted for transcription.
+    fn media_cursor(&self) -> std::time::Duration;
 }
 
 /// A transcription result and whether it is still subject to revision.
@@ -121,6 +142,27 @@ pub trait CompletionProvider: Send + Sync {
         req: CompletionRequest,
         cancellation: CancellationToken,
     ) -> BoxFuture<'_, Result<BoxStream<'static, Result<Delta, ProviderError>>, ProviderError>>;
+
+    /// Dispatches provider-neutral structured/image input. Text-only requests
+    /// delegate to the original method; connectors must explicitly implement
+    /// every advanced capability they advertise.
+    fn stream_reasoning(
+        &self,
+        req: ReasoningRequest,
+        cancellation: CancellationToken,
+    ) -> BoxFuture<'_, Result<BoxStream<'static, Result<Delta, ProviderError>>, ProviderError>>
+    {
+        Box::pin(async move {
+            req.validate()
+                .map_err(|error| ProviderError::InvalidRequest(error.to_string()))?;
+            if matches!(req.output, ReasoningOutput::JsonSchema(_)) {
+                return Err(ProviderError::InvalidRequest(
+                    "provider does not support this reasoning output".to_owned(),
+                ));
+            }
+            self.stream(req.completion, cancellation).await
+        })
+    }
 
     fn model_id(&self) -> &str;
 }

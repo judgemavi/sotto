@@ -1,0 +1,4 @@
+Merge the JSON meeting-note artifacts from consecutive chronological windows into one conservative meeting record with exactly this shape:
+{"overview":[{"text":"...","citations":[1]}],"topics":[],"decisions":[],"action_items":[{"text":"...","citations":[1],"owner":null,"owner_citations":[],"due_date":null,"due_date_citations":[]}],"open_questions":[],"risks":[],"follow_ups":[]}.
+
+Return JSON only. Preserve and combine timeline event citations. Deduplicate equivalent items. A later window may resolve an open question or change whether an item belongs in follow_ups, but it may not erase the cited historical evidence. Keep owner and due_date null unless their separate evidence citations explicitly support them. Never invent a citation, owner, due date, decision, risk, or action. Do not introduce sales-specific fields.

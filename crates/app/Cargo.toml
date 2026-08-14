@@ -11,15 +11,33 @@ workspace = true
 [dependencies]
 asr = { path = "../asr" }
 capture = { path = "../capture" }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 gpui = "=0.2.2"
 gpui-component = "=0.5.1"
 futures-util = "0.3.32"
+insight = { path = "../insight" }
+keyring = "4.0.0"
+mcp = { path = "../mcp" }
 objc2 = "=0.6.4"
 providers = { path = "../providers" }
 prosody = { path = "../prosody" }
 rag = { path = "../rag" }
 raw-window-handle = "=0.6.2"
+screen = { path = "../screen" }
 secrecy = "0.10.3"
+sha2 = "0.11.0"
+hex = "0.4.3"
+serde.workspace = true
+serde_json.workspace = true
 sotto-core = { package = "core", path = "../core" }
 tokio = { version = "=1.53.1", features = ["rt", "sync", "time"] }
 vad = { path = "../vad" }
+
+[dev-dependencies]
+gpui = { version = "=0.2.2", features = ["test-support"] }
+# The exact rasterizer GPUI uses for SVG assets, pinned to the version already in the graph.
+# Dev-only: it proves the vendored icons really draw ink through the same code path the shipped
+# binary uses, without adding a byte to that binary. `gpui::SvgRenderer` is not public, so this is
+# the only way to assert on the real answer rather than on the file's structure.
+resvg = { version = "=0.45.1", default-features = false }
+tempfile = "3.27.0"

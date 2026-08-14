@@ -30,9 +30,9 @@ use tokio::{
 };
 
 use crate::{
-    AudioFrame, BoxFuture, CaptureBackend, CaptureError, EventBus, EventPayload, PipelineError,
-    ProsodyDelta, RagError, Session, Source, TimelineEvent, Transcriber, TranscriptUpdate,
-    Utterance, VadSegment, VoiceActivityDetector,
+    AudioFrame, BoxFuture, CaptureBackend, CaptureError, EventBus, EventId, EventPayload, MarkKind,
+    PipelineError, ProsodyDelta, RagError, Session, Source, TimelineEvent, Transcriber,
+    TranscriptUpdate, Utterance, VadSegment, VoiceActivityDetector,
 };
 
 pub use session::{CallSession, RecordingState, SessionView};
@@ -347,6 +347,40 @@ impl PipelineHandle {
             EventPayload::ScreenSnapshot(payload),
         ));
     }
+    /// Queues a user-authored annotation through the timeline actor so event ids and persistence
+    /// remain serialized with capture output. Returns false when shutdown has closed the actor.
+    pub async fn append_user_annotation(
+        &self,
+        timestamp: Duration,
+        anchor: EventId,
+        text: String,
+        mark: MarkKind,
+    ) -> bool {
+        let Some(sender) = &self.control_tx else {
+            return false;
+        };
+        sender
+            .send(StageMessage::UserAnnotation(timestamp, anchor, text, mark))
+            .await
+            .is_ok()
+    }
+    pub async fn supersede_user_annotation(
+        &self,
+        timestamp: Duration,
+        target: EventId,
+        text: String,
+        mark: MarkKind,
+    ) -> bool {
+        let Some(sender) = &self.control_tx else {
+            return false;
+        };
+        sender
+            .send(StageMessage::SupersedeUserAnnotation(
+                timestamp, target, text, mark,
+            ))
+            .await
+            .is_ok()
+    }
     pub async fn report_capture_error(&self, timestamp: Duration, error: CaptureError) {
         self.pause();
         if let Some(sender) = &self.control_tx {
@@ -389,6 +423,8 @@ impl PipelineHandle {
 pub(super) enum StageMessage {
     Payload(Duration, EventPayload),
     Annotated(Duration, Utterance, Option<ProsodyDelta>),
+    UserAnnotation(Duration, EventId, String, MarkKind),
+    SupersedeUserAnnotation(Duration, EventId, String, MarkKind),
 }
 
 enum TranscriptMessage {

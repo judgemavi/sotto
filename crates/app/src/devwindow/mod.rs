@@ -2,6 +2,8 @@
 
 mod seam;
 
+#[cfg(test)]
+pub(crate) use seam::test_ingress;
 pub use seam::{TimelineIngress, TimelineState, attach_ingress};
 
 use gpui::{

@@ -2,8 +2,14 @@
 
 #![deny(warnings)]
 
+pub mod board;
 pub mod devwindow;
+pub mod mcp;
+pub mod notes;
+pub mod reasoning;
+pub mod session;
 pub mod settings;
+pub mod workspace;
 
 use std::sync::Arc;
 
@@ -37,9 +43,12 @@ impl SceneRect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SceneObjectKind {
     /// A transcript block.
-    Utterance { text: Arc<str>, customer: bool },
-    /// A suggestion anchored to another scene object.
-    Suggestion { anchor: SceneId, text: Arc<str> },
+    Utterance {
+        text: Arc<str>,
+        remote_participant: bool,
+    },
+    /// A proposal anchored to another scene object.
+    Proposal { anchor: SceneId, text: Arc<str> },
 }
 
 /// An immutable positioned object.
@@ -76,11 +85,11 @@ impl Scene {
     const BLOCK_GAP: f32 = 32.0;
 
     /// Appends an utterance at the frontier without touching existing objects.
-    pub fn append_utterance(&mut self, text: Arc<str>, customer: bool) -> SceneId {
+    pub fn append_utterance(&mut self, text: Arc<str>, remote_participant: bool) -> SceneId {
         let id = self.allocate_id();
         let rect = SceneRect {
             x: self.frontier_x,
-            y: if customer { 180.0 } else { 48.0 },
+            y: if remote_participant { 180.0 } else { 48.0 },
             width: Self::BLOCK_WIDTH,
             height: Self::BLOCK_HEIGHT,
         };
@@ -88,13 +97,16 @@ impl Scene {
         self.objects.push(SceneObject {
             id,
             rect,
-            kind: SceneObjectKind::Utterance { text, customer },
+            kind: SceneObjectKind::Utterance {
+                text,
+                remote_participant,
+            },
         });
         id
     }
 
-    /// Appends an anchored suggestion, with no layout pass over prior objects.
-    pub fn append_suggestion(&mut self, anchor: SceneId, text: Arc<str>) -> Option<SceneId> {
+    /// Appends an anchored proposal, with no layout pass over prior objects.
+    pub fn append_proposal(&mut self, anchor: SceneId, text: Arc<str>) -> Option<SceneId> {
         let anchor_rect = self.objects.iter().find(|object| object.id == anchor)?.rect;
         let id = self.allocate_id();
         self.objects.push(SceneObject {
@@ -105,20 +117,20 @@ impl Scene {
                 width: 240.0,
                 height: 112.0,
             },
-            kind: SceneObjectKind::Suggestion { anchor, text },
+            kind: SceneObjectKind::Proposal { anchor, text },
         });
         Some(id)
     }
 
-    /// Replaces only the streaming suggestion payload; its placement remains stable.
-    pub fn stream_suggestion(&mut self, id: SceneId, text: Arc<str>) -> bool {
+    /// Replaces only the streaming proposal payload; its placement remains stable.
+    pub fn stream_proposal(&mut self, id: SceneId, text: Arc<str>) -> bool {
         let Some(object) = self.objects.iter_mut().find(|object| object.id == id) else {
             return false;
         };
-        let SceneObjectKind::Suggestion { anchor, .. } = object.kind else {
+        let SceneObjectKind::Proposal { anchor, .. } = object.kind else {
             return false;
         };
-        object.kind = SceneObjectKind::Suggestion { anchor, text };
+        object.kind = SceneObjectKind::Proposal { anchor, text };
         true
     }
 
@@ -251,18 +263,18 @@ mod tests {
     }
 
     #[test]
-    fn suggestion_streaming_preserves_anchor_and_placement() {
+    fn proposal_streaming_preserves_anchor_and_placement() {
         let mut scene = Scene::default();
         let anchor = scene.append_utterance(Arc::from("pricing"), true);
-        let suggestion = scene
-            .append_suggestion(anchor, Arc::from("Ask"))
+        let proposal = scene
+            .append_proposal(anchor, Arc::from("Ask"))
             .ok_or("anchor should exist");
-        assert!(suggestion.is_ok(), "suggestion should be appended");
-        let suggestion = suggestion.unwrap_or(super::SceneId(u64::MAX));
+        assert!(proposal.is_ok(), "proposal should be appended");
+        let proposal = proposal.unwrap_or(super::SceneId(u64::MAX));
         let rect = scene.objects[1].rect;
 
         assert!(
-            scene.stream_suggestion(suggestion, Arc::from("Ask about budget")),
+            scene.stream_proposal(proposal, Arc::from("Ask about budget")),
             "stream update should succeed"
         );
         assert_eq!(
@@ -270,7 +282,7 @@ mod tests {
             "streaming text must not move the card"
         );
         assert!(
-            matches!(scene.objects[1].kind, SceneObjectKind::Suggestion { anchor: value, .. } if value == anchor),
+            matches!(scene.objects[1].kind, SceneObjectKind::Proposal { anchor: value, .. } if value == anchor),
             "anchor must survive streaming updates"
         );
     }

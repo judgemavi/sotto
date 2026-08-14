@@ -83,12 +83,20 @@ enum Command {
         session_id: u128,
         #[arg(long, default_value = "sotto.sqlite3")]
         database: PathBuf,
-        #[arg(long, default_value = "ollama")]
-        provider: String,
+        #[arg(long, default_value = "none")]
+        backend: String,
         #[arg(long)]
-        model: String,
-        #[arg(long, default_value = "ocr")]
-        screen_context: String,
+        model: Option<String>,
+    },
+    /// Generate a topical derived view from a persisted session.
+    Cluster {
+        session_id: u128,
+        #[arg(long, default_value = "sotto.sqlite3")]
+        database: PathBuf,
+        #[arg(long, default_value = "none")]
+        backend: String,
+        #[arg(long)]
+        model: Option<String>,
     },
 }
 
@@ -196,46 +204,59 @@ fn main() -> Result<()> {
         Command::Summarize {
             session_id,
             database,
-            provider,
+            backend,
             model,
-            screen_context,
         } => {
-            let kind = parse_provider(&provider)?;
-            let key = providers::load_key(kind)?;
-            let provider = std::sync::Arc::new(providers::Provider::new(kind, model, key));
+            let choice = cli::reasoning::BackendChoice::parse(&backend)?;
+            let resolved = cli::reasoning::resolve_keychain_backend(
+                choice,
+                model.as_deref(),
+                providers::Role::Summarizer,
+            )?;
+            let Some(resolved) = resolved else {
+                println!(r#"{{"status":"reasoning_disabled"}}"#);
+                return Ok(());
+            };
             let store = rag::Store::open(database)?;
-            let summarizer = insight::Summarizer::new(&store, provider)
-                .with_context(parse_screen_context(&screen_context)?);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let report = runtime.block_on(summarizer.summarize(SessionId::new(session_id)))?;
+            let report = runtime.block_on(cli::reasoning::summarize(
+                &store,
+                SessionId::new(session_id),
+                &resolved,
+            ))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::Cluster {
+            session_id,
+            database,
+            backend,
+            model,
+        } => {
+            let choice = cli::reasoning::BackendChoice::parse(&backend)?;
+            let resolved = cli::reasoning::resolve_keychain_backend(
+                choice,
+                model.as_deref(),
+                providers::Role::Summarizer,
+            )?;
+            let Some(resolved) = resolved else {
+                println!(r#"{{"status":"reasoning_disabled"}}"#);
+                return Ok(());
+            };
+            let store = rag::Store::open(database)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let report = runtime.block_on(cli::reasoning::cluster(
+                &store,
+                SessionId::new(session_id),
+                &resolved,
+            ))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
     Ok(())
-}
-
-fn parse_provider(value: &str) -> Result<providers::ProviderKind> {
-    match value {
-        "anthropic" => Ok(providers::ProviderKind::Anthropic),
-        "openai" => Ok(providers::ProviderKind::OpenAi),
-        "google" => Ok(providers::ProviderKind::Google),
-        "openrouter" => Ok(providers::ProviderKind::OpenRouter),
-        "ollama" => Ok(providers::ProviderKind::Ollama),
-        _ => anyhow::bail!(
-            "unknown provider {value}; expected anthropic, openai, google, openrouter, or ollama"
-        ),
-    }
-}
-
-fn parse_screen_context(value: &str) -> Result<insight::ContextMode> {
-    match value {
-        "metadata" => Ok(insight::ContextMode::Metadata),
-        "ocr" => Ok(insight::ContextMode::MetadataAndOcr),
-        "images" => Ok(insight::ContextMode::MetadataAndImages),
-        _ => anyhow::bail!("unknown screen context {value}; expected metadata, ocr, or images"),
-    }
 }
 
 fn warn_run_stages(events: &[TimelineEvent], asr_configured: bool, frames_configured: bool) {
@@ -305,9 +326,11 @@ fn parse_kinds(values: &[String]) -> Result<HashSet<EventKind>> {
             "vad" => Ok(EventKind::Vad),
             "prosody" => Ok(EventKind::Prosody),
             "screen.snapshot" => Ok(EventKind::ScreenSnapshot),
-            "trigger" => Ok(EventKind::Trigger),
-            "suggestion.partial" => Ok(EventKind::SuggestionPartial),
-            "suggestion.final" => Ok(EventKind::SuggestionFinal),
+            "proposal.trigger" => Ok(EventKind::ProposalTrigger),
+            "proposal.partial" => Ok(EventKind::ProposalPartial),
+            "proposal.final" => Ok(EventKind::ProposalFinal),
+            "proposal.disposition" => Ok(EventKind::ProposalDisposition),
+            "proposal.run_audit" => Ok(EventKind::ProposalRunAudit),
             "annotation.user" => Ok(EventKind::UserAnnotation),
             "error" => Ok(EventKind::Error),
             _ => anyhow::bail!("unknown event kind: {value}"),
@@ -320,10 +343,10 @@ fn print_latency(report: &cli::LatencyReport) -> Result<()> {
     print_row("frame -> VAD decision", &report.frame_to_vad);
     print_row("speech end -> first partial", &report.speech_end_to_partial);
     print_row("speech end -> final", &report.speech_end_to_final);
-    if let Some(values) = &report.speech_end_to_suggestion {
-        print_row("speech end -> suggestion", values);
+    if let Some(values) = &report.speech_end_to_proposal {
+        print_row("speech end -> proposal", values);
     } else {
-        println!("{:<34} {:>5}", "speech end -> suggestion", "n/a");
+        println!("{:<34} {:>5}", "speech end -> proposal", "n/a");
     }
     println!("{}", serde_json::to_string(report)?);
     Ok(())

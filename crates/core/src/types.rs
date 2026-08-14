@@ -10,16 +10,202 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::EventId;
+use crate::{EventId, SessionId};
+
+/// Container written for one retained local meeting recording.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum RecordingContainer {
+    Mp4,
+}
+
+impl RecordingContainer {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mp4 => "mp4",
+        }
+    }
+}
+
+/// Why a session no longer has locally addressable media.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum RecordingMissingReason {
+    Deleted,
+    Pruned,
+}
+
+/// Exact affine mapping from session-relative nanoseconds to media presentation time.
+///
+/// V1 deliberately records the identity mapping. Keeping it explicit prevents later readers from
+/// silently assuming that timeline and media clocks still coincide after a format change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct MediaTimeMapping {
+    pub session_origin_ns: u64,
+    pub media_origin_ns: u64,
+    pub rate_numerator: u32,
+    pub rate_denominator: u32,
+}
+
+impl MediaTimeMapping {
+    pub const IDENTITY: Self = Self {
+        session_origin_ns: 0,
+        media_origin_ns: 0,
+        rate_numerator: 1,
+        rate_denominator: 1,
+    };
+
+    #[must_use]
+    pub const fn is_identity(self) -> bool {
+        self.session_origin_ns == 0
+            && self.media_origin_ns == 0
+            && self.rate_numerator == 1
+            && self.rate_denominator == 1
+    }
+
+    #[must_use]
+    pub fn media_time(self, session_time: Duration) -> Option<Duration> {
+        if self.rate_denominator == 0 {
+            return None;
+        }
+        let relative = session_time
+            .as_nanos()
+            .checked_sub(u128::from(self.session_origin_ns))?;
+        let scaled = relative
+            .checked_mul(u128::from(self.rate_numerator))?
+            .checked_div(u128::from(self.rate_denominator))?;
+        let media_ns = u128::from(self.media_origin_ns).checked_add(scaled)?;
+        u64::try_from(media_ns).ok().map(Duration::from_nanos)
+    }
+}
+
+/// Durable media state linked to a session without mutating its append-only timeline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub enum SessionRecording {
+    Available {
+        session_id: SessionId,
+        path: String,
+        container: RecordingContainer,
+        duration: Duration,
+        byte_size: u64,
+        time_mapping: MediaTimeMapping,
+    },
+    Missing {
+        session_id: SessionId,
+        reason: RecordingMissingReason,
+    },
+}
+
+impl SessionRecording {
+    #[must_use]
+    pub const fn session_id(&self) -> SessionId {
+        match self {
+            Self::Available { session_id, .. } | Self::Missing { session_id, .. } => *session_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn byte_size(&self) -> u64 {
+        match self {
+            Self::Available { byte_size, .. } => *byte_size,
+            Self::Missing { .. } => 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn time_mapping(&self) -> Option<MediaTimeMapping> {
+        match self {
+            Self::Available { time_mapping, .. } => Some(*time_mapping),
+            Self::Missing { .. } => None,
+        }
+    }
+}
+
+/// A person's chosen name for one recording.
+///
+/// This is deliberately **not** part of [`crate::CaptureTarget`]. The capture target is a captured
+/// fact — which application or window the OS content filter was built from, and whether audio was
+/// scoped to it — and ADR-0006 plus the timeline's append-only rule make that fact unrewritable.
+/// A title is a label laid over the recording, so it is a separate value with a separate lifetime:
+/// it can be chosen, changed, and cleared without any claim about what was recorded changing.
+///
+/// It also stands on its own. An imported recording (T071) has no capture target at all, so a
+/// title modelled as a decoration on one would have nothing to decorate.
+///
+/// Construction normalizes rather than trusting the caller, because the value renders in a single
+/// ellipsizing rail row: surrounding and interior whitespace collapses to single spaces, and a
+/// name that is empty or entirely whitespace is refused so no surface can ever render blank.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct RecordingTitle(String);
+
+impl RecordingTitle {
+    /// Longest title retained, in characters.
+    ///
+    /// A title is navigation, not content: the rail ellipsizes it well before this. The bound
+    /// exists so a paste of an entire document cannot become a durable session row.
+    pub const MAX_CHARS: usize = 200;
+
+    /// Normalizes `value` into a title, or `None` when nothing nameable remains.
+    ///
+    /// `None` is the caller's signal to fall back to the default name — it never means "store an
+    /// empty title".
+    #[must_use]
+    pub fn new(value: &str) -> Option<Self> {
+        let mut normalized = String::with_capacity(value.len());
+        for word in value.split_whitespace() {
+            if !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            normalized.push_str(word);
+        }
+        if normalized.is_empty() {
+            return None;
+        }
+        if normalized.chars().count() > Self::MAX_CHARS {
+            normalized = normalized.chars().take(Self::MAX_CHARS).collect();
+            // Truncation can only remove characters, so the value stays non-empty here.
+        }
+        Some(Self(normalized))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RecordingTitle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for RecordingTitle {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value)
+            .ok_or_else(|| serde::de::Error::custom("recording title must not be blank"))
+    }
+}
 
 /// The independently captured audio stream that produced an event.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum Source {
-    /// The sales representative's microphone.
+    /// The local participant's microphone.
     Mic,
-    /// System audio carrying the customer's voice.
+    /// Captured meeting audio carrying remote participants.
     System,
 }
 
@@ -28,8 +214,8 @@ impl Source {
     #[must_use]
     pub const fn speaker_name(self) -> &'static str {
         match self {
-            Self::Mic => "rep",
-            Self::System => "customer",
+            Self::Mic => "local participant",
+            Self::System => "meeting audio",
         }
     }
 }
@@ -134,53 +320,257 @@ impl Annotation {
     }
 }
 
-/// The v1 reason that the watcher requested a suggestion.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Meeting-general reason that Sotto may offer a proposal.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum TriggerKind {
-    CompetitorMention,
-    PricingQuestion,
-    Objection,
-    DiscoveryGap,
+pub enum ProposalKind {
+    ClarifyingQuestion,
+    DecisionCheck,
+    NextStep,
+    FollowUp,
+    RelevantContext,
 }
 
-/// Stable location of the utterance that prompted a trigger.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-pub struct UtteranceSpan {
-    pub source: Source,
-    pub start: Duration,
-    pub end: Duration,
+/// Invalid proposal content rejected before it reaches the timeline.
+#[derive(Clone, Debug, Eq, thiserror::Error, PartialEq)]
+pub enum ProposalError {
+    #[error("a proposal must have at least one meeting anchor")]
+    MissingAnchor,
+    #[error("proposal anchors and evidence ids must be unique")]
+    DuplicateReference,
+    #[error("proposal text must not be blank")]
+    BlankText,
+    #[error("proposal confidence must be finite and between zero and one")]
+    InvalidConfidence,
+    #[error("external evidence id must be 1..=256 safe opaque characters")]
+    InvalidExternalEvidenceId,
 }
 
-/// A watcher decision that warrants invoking the suggestion model.
+/// Opaque reference to evidence retained outside `core` in a durable context bundle.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct ExternalEvidenceRef(String);
+
+impl ExternalEvidenceRef {
+    pub fn new(value: impl Into<String>) -> Result<Self, ProposalError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 256
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+        {
+            return Err(ProposalError::InvalidExternalEvidenceId);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for ExternalEvidenceRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Watcher decision that a particular meeting moment may benefit from a proposal.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-pub struct Trigger {
-    pub kind: TriggerKind,
-    pub utterance_span: UtteranceSpan,
-    pub confidence: f32,
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct ProposalTrigger {
+    kind: ProposalKind,
+    anchors: Vec<EventId>,
+    confidence: f32,
 }
 
-/// Evidence supporting a generated suggestion.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-pub struct Citation {
-    pub title: String,
-    pub uri: Option<String>,
-    pub excerpt: String,
+impl ProposalTrigger {
+    pub fn new(
+        kind: ProposalKind,
+        anchors: Vec<EventId>,
+        confidence: f32,
+    ) -> Result<Self, ProposalError> {
+        validate_event_refs(&anchors, true)?;
+        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+            return Err(ProposalError::InvalidConfidence);
+        }
+        Ok(Self {
+            kind,
+            anchors,
+            confidence,
+        })
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> ProposalKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn anchors(&self) -> &[EventId] {
+        &self.anchors
+    }
+
+    #[must_use]
+    pub const fn confidence(&self) -> f32 {
+        self.confidence
+    }
 }
 
-/// Suggestion content carried by a partial or final timeline payload.
+/// Streaming or final proposal with typed meeting and external evidence references.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-pub struct Suggestion {
-    /// Timeline events whose context caused this suggestion.
-    pub anchors: Vec<EventId>,
-    pub trigger: Trigger,
-    pub text: String,
-    pub citations: Vec<Citation>,
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct Proposal {
+    kind: ProposalKind,
+    anchors: Vec<EventId>,
+    text: String,
+    meeting_evidence: Vec<EventId>,
+    external_evidence: Vec<ExternalEvidenceRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProposalProvenance {
+    pub(crate) kind: ProposalKind,
+    pub(crate) anchors: Vec<EventId>,
+    pub(crate) meeting_evidence: Vec<EventId>,
+    pub(crate) external_evidence: Vec<ExternalEvidenceRef>,
+}
+
+impl Proposal {
+    pub fn new(
+        kind: ProposalKind,
+        anchors: Vec<EventId>,
+        text: impl Into<String>,
+        meeting_evidence: Vec<EventId>,
+        external_evidence: Vec<ExternalEvidenceRef>,
+    ) -> Result<Self, ProposalError> {
+        validate_event_refs(&anchors, true)?;
+        validate_event_refs(&meeting_evidence, false)?;
+        if has_duplicates(&external_evidence) {
+            return Err(ProposalError::DuplicateReference);
+        }
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(ProposalError::BlankText);
+        }
+        Ok(Self {
+            kind,
+            anchors,
+            text,
+            meeting_evidence,
+            external_evidence,
+        })
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> ProposalKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn anchors(&self) -> &[EventId] {
+        &self.anchors
+    }
+
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    #[must_use]
+    pub fn meeting_evidence(&self) -> &[EventId] {
+        &self.meeting_evidence
+    }
+
+    #[must_use]
+    pub fn external_evidence(&self) -> &[ExternalEvidenceRef] {
+        &self.external_evidence
+    }
+
+    pub(crate) fn provenance(&self) -> ProposalProvenance {
+        ProposalProvenance {
+            kind: self.kind,
+            anchors: self.anchors.clone(),
+            meeting_evidence: self.meeting_evidence.clone(),
+            external_evidence: self.external_evidence.clone(),
+        }
+    }
+
+    pub(crate) fn has_same_provenance(&self, other: &Self) -> bool {
+        self.provenance() == other.provenance()
+    }
+}
+
+fn validate_event_refs(values: &[EventId], require_one: bool) -> Result<(), ProposalError> {
+    if require_one && values.is_empty() {
+        return Err(ProposalError::MissingAnchor);
+    }
+    if has_duplicates(values) {
+        return Err(ProposalError::DuplicateReference);
+    }
+    Ok(())
+}
+
+fn has_duplicates<T: Eq + std::hash::Hash>(values: &[T]) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(values.len());
+    values.iter().any(|value| !seen.insert(value))
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalTriggerWire {
+    kind: ProposalKind,
+    anchors: Vec<EventId>,
+    confidence: f32,
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for ProposalTrigger {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ProposalTriggerWire::deserialize(deserializer)?;
+        Self::new(wire.kind, wire.anchors, wire.confidence).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalWire {
+    kind: ProposalKind,
+    anchors: Vec<EventId>,
+    text: String,
+    meeting_evidence: Vec<EventId>,
+    external_evidence: Vec<ExternalEvidenceRef>,
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Proposal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ProposalWire::deserialize(deserializer)?;
+        Self::new(
+            wire.kind,
+            wire.anchors,
+            wire.text,
+            wire.meeting_evidence,
+            wire.external_evidence,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 /// A locally indexed passage returned by retrieval.
@@ -226,6 +616,128 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub stop: Vec<String>,
+}
+
+/// Provider-neutral constraint for the final model text.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum ReasoningOutput {
+    /// Unconstrained text, preserving the original completion behavior.
+    #[default]
+    Text,
+    /// A syntactically valid JSON object without schema adherence.
+    JsonObject,
+    /// JSON constrained to the supplied schema.
+    JsonSchema(JsonSchemaConstraint),
+}
+
+/// Caller-owned JSON Schema data. The JSON remains an opaque string in `core` so
+/// the headless layer does not gain a mandatory JSON implementation dependency.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct JsonSchemaConstraint {
+    name: String,
+    description: Option<String>,
+    schema_json: String,
+}
+
+impl JsonSchemaConstraint {
+    pub fn new(
+        name: impl Into<String>,
+        description: Option<String>,
+        schema_json: impl Into<String>,
+    ) -> Result<Self, ReasoningRequestError> {
+        let value = Self {
+            name: name.into(),
+            description,
+            schema_json: schema_json.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    #[must_use]
+    pub fn schema_json(&self) -> &str {
+        &self.schema_json
+    }
+
+    fn validate(&self) -> Result<(), ReasoningRequestError> {
+        if self.name.is_empty()
+            || self.name.len() > 64
+            || !self
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(ReasoningRequestError::InvalidSchemaName);
+        }
+        if self.schema_json.trim().is_empty() {
+            return Err(ReasoningRequestError::EmptySchema);
+        }
+        Ok(())
+    }
+}
+
+/// Source-compatible extension of a text completion with output constraints.
+/// Screen-authorized image evidence remains outside `core` and is dispatched by `providers`.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct ReasoningRequest {
+    pub completion: CompletionRequest,
+    pub output: ReasoningOutput,
+}
+
+impl ReasoningRequest {
+    #[must_use]
+    pub fn text(completion: CompletionRequest) -> Self {
+        Self {
+            completion,
+            output: ReasoningOutput::Text,
+        }
+    }
+
+    #[must_use]
+    pub fn json_object(completion: CompletionRequest) -> Self {
+        Self {
+            completion,
+            output: ReasoningOutput::JsonObject,
+        }
+    }
+
+    #[must_use]
+    pub fn json_schema(completion: CompletionRequest, schema: JsonSchemaConstraint) -> Self {
+        Self {
+            completion,
+            output: ReasoningOutput::JsonSchema(schema),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ReasoningRequestError> {
+        if let ReasoningOutput::JsonSchema(schema) = &self.output {
+            schema.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// Invalid provider-neutral reasoning input, rejected before connector I/O.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ReasoningRequestError {
+    #[error("JSON Schema name must be 1..=64 ASCII letters, digits, underscores, or dashes")]
+    InvalidSchemaName,
+    #[error("JSON Schema must not be empty")]
+    EmptySchema,
 }
 
 /// One provider-neutral update from a streaming completion.
@@ -274,8 +786,62 @@ pub enum PermissionStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{Annotation, Source, Utterance};
+    use super::{Annotation, MediaTimeMapping, RecordingTitle, Source, Utterance};
     use std::time::Duration;
+
+    #[test]
+    fn a_chosen_title_is_normalized_and_never_blank() {
+        assert_eq!(
+            RecordingTitle::new("  Standup  ").map(|title| title.as_str().to_owned()),
+            Some("Standup".to_owned()),
+            "a title is trimmed rather than stored with the whitespace a field collects"
+        );
+        assert_eq!(
+            RecordingTitle::new("BTU\n daily\tstandup").map(|title| title.as_str().to_owned()),
+            Some("BTU daily standup".to_owned()),
+            "a pasted multi-line name must collapse into the single rail row that renders it"
+        );
+        for blank in ["", "   ", "\t\n ", "\u{a0}"] {
+            assert!(
+                RecordingTitle::new(blank).is_none(),
+                "{blank:?} names nothing, so it must be refused rather than rendered blank"
+            );
+        }
+    }
+
+    #[test]
+    fn an_oversized_title_is_bounded_and_still_a_title() -> Result<(), Box<dyn std::error::Error>> {
+        let pasted = "word ".repeat(400);
+        let title = RecordingTitle::new(&pasted).ok_or("a long paste still names something")?;
+        assert_eq!(
+            title.as_str().chars().count(),
+            RecordingTitle::MAX_CHARS,
+            "a title is navigation, so it is bounded rather than unbounded"
+        );
+        assert!(
+            !title.as_str().trim().is_empty(),
+            "bounding must never produce a blank title"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_blank_persisted_title_is_rejected_on_the_way_back_in()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            serde_json::from_str::<RecordingTitle>("\"  \"").is_err(),
+            "a blank title must not survive a round trip through storage"
+        );
+        let title = RecordingTitle::new("Standup").ok_or("Standup is a title")?;
+        let json = serde_json::to_string(&title)?;
+        assert_eq!(
+            serde_json::from_str::<RecordingTitle>(&json)?,
+            title,
+            "a chosen title must survive serialization unchanged"
+        );
+        Ok(())
+    }
 
     #[test]
     fn renders_llm_ready_inline_annotation_context() {
@@ -293,7 +859,21 @@ mod tests {
 
         assert_eq!(
             utterance.render_inline(),
-            "[customer, hesitant, 2.5s pause] \"sure, sounds fine\""
+            "[meeting audio, hesitant, 2.5s pause] \"sure, sounds fine\""
+        );
+    }
+
+    #[test]
+    fn identity_media_clock_maps_citations_without_offset_or_scale() {
+        let citation = Duration::from_secs(138) + Duration::from_millis(275);
+        assert_eq!(
+            MediaTimeMapping::IDENTITY.media_time(citation),
+            Some(citation),
+            "the recorded v1 identity mapping must address the same media presentation time"
+        );
+        assert!(
+            MediaTimeMapping::IDENTITY.is_identity(),
+            "the v1 clock equivalence must be asserted explicitly"
         );
     }
 

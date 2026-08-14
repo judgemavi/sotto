@@ -1,8 +1,19 @@
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use insight::{ContextMode, Pricing, Summarizer, SummaryError};
+    use screen::{
+        InspectScreenRequest, ScreenInspection, ScreenInspectionSource, ScreenPrecision,
+        ScreenProvenance,
+    };
     use sotto_core::{
         Annotation, BoxFuture, BoxStream, CancellationToken, CaptureTarget, CompletionProvider,
         CompletionRequest, Delta, EventPayload, ProviderError, Session, SessionId, Source,
@@ -38,6 +49,76 @@ mod tests {
 
         fn model_id(&self) -> &str {
             "mock-summary"
+        }
+    }
+
+    struct QueueProvider {
+        outputs: Mutex<VecDeque<String>>,
+        inputs: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CompletionProvider for QueueProvider {
+        fn stream(
+            &self,
+            request: CompletionRequest,
+            _cancellation: CancellationToken,
+        ) -> BoxFuture<'_, Result<BoxStream<'static, Result<Delta, ProviderError>>, ProviderError>>
+        {
+            let output = self
+                .outputs
+                .lock()
+                .map_err(|_| ProviderError::Network("output queue poisoned".to_owned()))
+                .and_then(|mut outputs| {
+                    outputs
+                        .pop_front()
+                        .ok_or_else(|| ProviderError::Network("missing queued output".to_owned()))
+                });
+            if let Some(message) = request.messages.first()
+                && let Ok(mut inputs) = self.inputs.lock()
+            {
+                inputs.push(message.content.clone());
+            }
+            Box::pin(async move {
+                let output = output?;
+                Ok(Box::pin(futures_util::stream::iter([Ok(Delta {
+                    text: output,
+                    is_final: true,
+                    usage: Some(Usage::default()),
+                    stop_reason: Some(StopReason::EndTurn),
+                })]))
+                    as BoxStream<'static, Result<Delta, ProviderError>>)
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "mock-summary"
+        }
+    }
+
+    struct FakeInspector {
+        calls: AtomicUsize,
+    }
+
+    impl ScreenInspectionSource for FakeInspector {
+        fn inspect(
+            &self,
+            _events: &[sotto_core::TimelineEvent],
+            request: &InspectScreenRequest,
+        ) -> ScreenInspection {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            ScreenInspection::Available {
+                provenance: ScreenProvenance {
+                    requested: request.selector.clone(),
+                    captured_at: Duration::from_secs(10),
+                    visible_from: Duration::from_secs(10),
+                    visible_to: Some(Duration::from_secs(20)),
+                    snapshot_event_id: sotto_core::EventId::new(3),
+                    frame_ref: sotto_core::FrameRef::new("/private/cache/frame.png"),
+                    precision: ScreenPrecision::SampledChangeFrame,
+                },
+                ocr_text: Some("Enterprise pricing slide".to_owned()),
+                authorized_image: None,
+            }
         }
     }
 
@@ -129,6 +210,119 @@ mod tests {
         assert!(
             matches!(result, Err(SummaryError::ImageContextUnsupported)),
             "text-only provider contract must make the unrun image arm explicit"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn screen_evidence_is_absent_initially_and_added_only_after_typed_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = persisted_store()?;
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(QueueProvider {
+            outputs: Mutex::new(VecDeque::from([
+                r#"{"action":"inspect_screen","timestamp_seconds":15.0,"evidence":"local_ocr","reason":"verify the pricing slide"}"#.to_owned(),
+                RECAP.to_owned(),
+            ])),
+            inputs: Arc::clone(&inputs),
+        });
+        let inspector = Arc::new(FakeInspector {
+            calls: AtomicUsize::new(0),
+        });
+        let report = Summarizer::new(&store, provider)
+            .with_screen_inspector(inspector.clone())
+            .summarize(SessionId::new(7))
+            .await?;
+
+        assert_eq!(
+            report.calls, 2,
+            "inspection requires exactly one second pass"
+        );
+        assert_eq!(
+            inspector.calls.load(Ordering::Relaxed),
+            1,
+            "OCR inspection must run only after the typed request"
+        );
+        let inputs = inputs.lock().map_err(|_| "input capture poisoned")?;
+        let initial = inputs.first().ok_or("missing initial request")?;
+        assert!(
+            initial.contains("from:1.000s to:3.000s"),
+            "initial transcript must carry start and end timestamps"
+        );
+        assert!(
+            !initial.contains("screen at:"),
+            "initial context must omit screen snapshot rows"
+        );
+        assert!(
+            !initial.contains("OCR"),
+            "initial context must omit eager OCR text"
+        );
+        assert!(
+            !initial.contains("frame.png"),
+            "initial context must omit local frame references"
+        );
+        let second = inputs.get(1).ok_or("missing second request")?;
+        assert!(
+            second.contains("requested=timestamp:15.000s"),
+            "second pass must retain the requested timestamp"
+        );
+        assert!(
+            second.contains("captured_at=10.000s"),
+            "second pass must distinguish sampled capture time"
+        );
+        assert!(
+            second.contains("visible_interval=[10.000s,20.000s)"),
+            "second pass must expose the resolved visibility interval"
+        );
+        assert!(
+            second.contains("snapshot_event=3"),
+            "second pass must cite the snapshot event"
+        );
+        assert!(
+            second.contains("precision=sampled_change_frame"),
+            "second pass must not claim exact-video precision"
+        );
+        assert!(
+            second.contains("Local OCR: Enterprise pricing slide"),
+            "second pass must include explicitly requested local OCR"
+        );
+        assert!(
+            !second.contains("/private/cache/frame.png"),
+            "local frame paths must not masquerade as provider image content"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_inspection_action_does_not_invoke_screen_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = persisted_store()?;
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(QueueProvider {
+            outputs: Mutex::new(VecDeque::from([RECAP.to_owned()])),
+            inputs: Arc::clone(&inputs),
+        });
+        let inspector = Arc::new(FakeInspector {
+            calls: AtomicUsize::new(0),
+        });
+        let report = Summarizer::new(&store, provider)
+            .with_screen_inspector(inspector.clone())
+            .summarize(SessionId::new(7))
+            .await?;
+
+        assert_eq!(
+            report.calls, 1,
+            "a completed first pass must not create an inspection pass"
+        );
+        assert_eq!(
+            inspector.calls.load(Ordering::Relaxed),
+            0,
+            "no inspect_screen action means no OCR or image inspection work"
+        );
+        assert_eq!(
+            inputs.lock().map_err(|_| "input capture poisoned")?.len(),
+            1,
+            "reasoning must stop after the completed transcript-first request"
         );
         Ok(())
     }

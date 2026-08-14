@@ -140,7 +140,12 @@ struct ActorState {
     ratios: [f32; 2],
     recording: RecordingState,
     unrecorded: u64,
-    active_utterances: HashMap<(Source, Duration), TimelineEvent>,
+    /// The latest in-progress ASR hypothesis for each independently captured stream.
+    ///
+    /// Sliding-window transcription can move an utterance's estimated start timestamp as
+    /// more audio arrives. The stream identity, rather than that provisional timestamp, is
+    /// therefore the stable identity of the active hypothesis chain.
+    active_utterances: HashMap<Source, TimelineEvent>,
 }
 
 impl ActorState {
@@ -173,6 +178,19 @@ impl ActorState {
                 }
                 events
             }
+            StageMessage::UserAnnotation(ts, anchor, text, mark) => self
+                .timeline
+                .append_user_annotation(ts, anchor, text, mark)
+                .into_iter()
+                .collect(),
+            // Superseding by id, not by envelope: `checkpoint` drains the pending payload buffer
+            // every 64 events, so looking the target up in `events()` lost every note older than
+            // that and dropped the edit without a word. The builder retains the id.
+            StageMessage::SupersedeUserAnnotation(ts, target_id, text, mark) => self
+                .timeline
+                .supersede_user_annotation(ts, text, mark, target_id)
+                .into_iter()
+                .collect(),
         };
         for event in events {
             if let EventPayload::Prosody(delta) = event.payload() {
@@ -183,20 +201,30 @@ impl ActorState {
     }
 
     fn append_payload(&mut self, ts: Duration, payload: EventPayload) -> TimelineEvent {
-        let key = match &payload {
-            EventPayload::UtterancePartial(value) | EventPayload::UtteranceFinal(value) => {
-                Some((value.source, value.start))
+        match &payload {
+            EventPayload::UtterancePartial(value) => {
+                let source = value.source;
+                let event = self
+                    .active_utterances
+                    .get(&source)
+                    .and_then(|previous| {
+                        self.timeline.supersede(ts, payload.clone(), previous).ok()
+                    })
+                    .unwrap_or_else(|| self.timeline.append(ts, payload));
+                self.active_utterances.insert(source, event.clone());
+                event
             }
-            _ => None,
-        };
-        let event = key
-            .and_then(|key| self.active_utterances.get(&key))
-            .and_then(|previous| self.timeline.supersede(ts, payload.clone(), previous).ok())
-            .unwrap_or_else(|| self.timeline.append(ts, payload));
-        if let Some(key) = key {
-            self.active_utterances.insert(key, event.clone());
+            EventPayload::UtteranceFinal(value) => {
+                let previous = self.active_utterances.remove(&value.source);
+                previous
+                    .as_ref()
+                    .and_then(|previous| {
+                        self.timeline.supersede(ts, payload.clone(), previous).ok()
+                    })
+                    .unwrap_or_else(|| self.timeline.append(ts, payload))
+            }
+            _ => self.timeline.append(ts, payload),
         }
-        event
     }
 
     fn attempt_checkpoint(
@@ -348,5 +376,123 @@ const fn source_index(source: Source) -> usize {
     match source {
         Source::Mic => 0,
         Source::System => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::{
+        CaptureTarget, EventPayload, Session, SessionId, Source, TargetKind, Utterance,
+        timeline::replay,
+    };
+
+    use super::ActorState;
+
+    fn session() -> Session {
+        Session::new(
+            SessionId::new(7),
+            CaptureTarget {
+                bundle_id: Some("com.example.meeting".to_owned()),
+                display_name: "Meeting".to_owned(),
+                window_title: Some("Rolling transcript".to_owned()),
+                kind: TargetKind::Window,
+                audio_scoped: true,
+            },
+            1_753_776_000_000,
+        )
+    }
+
+    fn utterance(source: Source, start_ms: u64, text: &str) -> Utterance {
+        Utterance {
+            source,
+            start: Duration::from_millis(start_ms),
+            end: Duration::from_millis(start_ms.saturating_add(750)),
+            text: text.to_owned(),
+            avg_logprob: -0.1,
+            annotations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn drifting_partial_start_remains_one_chain_and_final_closes_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = ActorState::new(session(), 16);
+        let first = state.append_payload(
+            Duration::from_millis(800),
+            EventPayload::UtterancePartial(utterance(Source::Mic, 0, "we")),
+        );
+        let shifted = state.append_payload(
+            Duration::from_millis(1_300),
+            EventPayload::UtterancePartial(utterance(Source::Mic, 500, "we should")),
+        );
+        let final_event = state.append_payload(
+            Duration::from_millis(1_800),
+            EventPayload::UtteranceFinal(utterance(Source::Mic, 500, "we should proceed")),
+        );
+
+        assert_eq!(
+            shifted.supersedes(),
+            Some(first.id()),
+            "a shifted rolling-window hypothesis must replace the active card"
+        );
+        assert_eq!(
+            final_event.supersedes(),
+            Some(shifted.id()),
+            "the final utterance must settle the active partial card"
+        );
+        assert!(
+            state.active_utterances.is_empty(),
+            "a final utterance must close the source's active hypothesis chain"
+        );
+        let replayed = replay(state.timeline.events())?;
+        assert_eq!(
+            replayed.active().keys().copied().collect::<Vec<_>>(),
+            vec![final_event.id()],
+            "the board projection must see only the settled utterance"
+        );
+
+        let next = state.append_payload(
+            Duration::from_millis(2_500),
+            EventPayload::UtterancePartial(utterance(Source::Mic, 2_000, "next point")),
+        );
+        assert_eq!(
+            next.supersedes(),
+            None,
+            "the next utterance must not replace the previous final"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mic_and_meeting_audio_keep_independent_partial_chains() {
+        let mut state = ActorState::new(session(), 16);
+        let mic = state.append_payload(
+            Duration::from_millis(700),
+            EventPayload::UtterancePartial(utterance(Source::Mic, 0, "local")),
+        );
+        let system = state.append_payload(
+            Duration::from_millis(800),
+            EventPayload::UtterancePartial(utterance(Source::System, 0, "remote")),
+        );
+        let mic_shifted = state.append_payload(
+            Duration::from_millis(1_200),
+            EventPayload::UtterancePartial(utterance(Source::Mic, 500, "local update")),
+        );
+
+        assert_eq!(
+            mic_shifted.supersedes(),
+            Some(mic.id()),
+            "mic hypotheses must replace only the mic chain"
+        );
+        assert_eq!(
+            state
+                .active_utterances
+                .get(&Source::System)
+                .map(|event| event.id()),
+            Some(system.id()),
+            "meeting-audio hypotheses must remain independent"
+        );
     }
 }

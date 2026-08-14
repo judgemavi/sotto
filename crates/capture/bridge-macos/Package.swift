@@ -8,6 +8,7 @@ let package = Package(
         .library(name: "SottoCaptureBridge", type: .static, targets: ["SottoCaptureBridge"])
     ],
     targets: [
-        .target(name: "SottoCaptureBridge")
+        .target(name: "SottoCaptureBridge"),
+        .testTarget(name: "SottoCaptureBridgeTests", dependencies: ["SottoCaptureBridge"]),
     ]
 )

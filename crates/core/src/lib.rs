@@ -17,16 +17,19 @@ pub use pipeline::{
     TranscriptAnnotator,
 };
 pub use timeline::{
-    CaptureTarget, EventId, EventKind, EventPayload, FrameRef, LenientReplay, MarkKind,
-    ProsodyDelta, ReplayState, SQLITE_SCHEMA, ScreenSnapshot, Session, SessionId, TargetKind,
-    TimelineBuilder, TimelineError, TimelineEvent, UserAnnotation, replay, replay_lenient,
+    CaptureTarget, EventClass, EventId, EventKind, EventPayload, FrameRef, LenientReplay, MarkKind,
+    ProposalDisposition, ProposalDispositionKind, ProposalEvent, ProposalPhase, ProposalRunAudit,
+    ProposalRunAuditError, ProposalRunOutcome, ProsodyDelta, ReplayState, SQLITE_SCHEMA,
+    ScreenSnapshot, Session, SessionId, TargetKind, TimelineBuilder, TimelineError, TimelineEvent,
+    UserAnnotation, checked_user_annotation, replay, replay_lenient,
 };
 pub use traits::{
-    BoxFuture, BoxStream, CancellationToken, CaptureBackend, CompletionProvider, Retriever,
-    Transcriber, TranscriptUpdate, VoiceActivityDetector,
+    BoxFuture, BoxStream, CancellationToken, CaptureBackend, CompletionProvider, RecordingStatus,
+    RecordingTranscriber, Retriever, Transcriber, TranscriptUpdate, VoiceActivityDetector,
 };
 pub use types::{
-    Annotation, AudioFrame, Chunk, Citation, CompletionMessage, CompletionRequest, Delta,
-    MessageRole, PermissionStatus, Source, SpeechState, StopReason, Suggestion, Trigger,
-    TriggerKind, Usage, Utterance, UtteranceSpan, VadSegment,
+    Annotation, AudioFrame, Chunk, CompletionMessage, CompletionRequest, Delta,
+    ExternalEvidenceRef, JsonSchemaConstraint, MessageRole, PermissionStatus, Proposal,
+    ProposalError, ProposalKind, ProposalTrigger, ReasoningOutput, ReasoningRequest,
+    ReasoningRequestError, Source, SpeechState, StopReason, Usage, Utterance, VadSegment,
 };

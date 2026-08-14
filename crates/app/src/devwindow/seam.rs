@@ -31,6 +31,12 @@ impl TimelineIngress {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_ingress(capacity: usize) -> (TimelineIngress, mpsc::Receiver<TimelineEvent>) {
+    let (sender, receiver) = mpsc::channel(capacity.max(1));
+    (TimelineIngress(sender), receiver)
+}
+
 /// Creates and drains the one bounded ingress channel into a shared GPUI entity.
 ///
 /// All UI projections consume `TimelineState`; none subscribe directly to the core bus.

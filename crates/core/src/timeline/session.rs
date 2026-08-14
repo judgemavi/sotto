@@ -8,6 +8,8 @@ pub enum TargetKind {
     Application,
     Window,
     Display,
+    /// A deliberately started session that captures only the local microphone.
+    Microphone,
 }
 
 /// The application, window, or display explicitly selected through the system picker.
@@ -20,6 +22,42 @@ pub struct CaptureTarget {
     pub kind: TargetKind,
     /// Whether captured audio was scoped to this target rather than system-wide.
     pub audio_scoped: bool,
+}
+
+impl CaptureTarget {
+    /// Canonical recorded scope for a session that never presents the system picker.
+    #[must_use]
+    pub fn microphone_only() -> Self {
+        Self {
+            bundle_id: None,
+            display_name: "Microphone only".to_owned(),
+            window_title: None,
+            kind: TargetKind::Microphone,
+            audio_scoped: true,
+        }
+    }
+
+    /// Whether this scope captures the microphone and no application audio or screen.
+    #[must_use]
+    pub const fn is_microphone_only(&self) -> bool {
+        matches!(self.kind, TargetKind::Microphone)
+    }
+
+    /// Rejects impossible combinations before they become durable session provenance.
+    #[must_use]
+    pub fn has_valid_scope(&self) -> bool {
+        match self.kind {
+            TargetKind::Microphone => {
+                self.bundle_id.is_none()
+                    && self.window_title.is_none()
+                    && self.display_name == "Microphone only"
+                    && self.audio_scoped
+            }
+            TargetKind::Application | TargetKind::Window | TargetKind::Display => {
+                !self.display_name.trim().is_empty()
+            }
+        }
+    }
 }
 
 /// Identity and monotonic id allocator for one call.
@@ -112,6 +150,17 @@ mod tests {
     }
 
     #[test]
+    fn microphone_only_is_an_explicit_valid_scope() {
+        let target = CaptureTarget::microphone_only();
+
+        assert!(target.is_microphone_only());
+        assert!(target.has_valid_scope());
+        assert_eq!(target.kind, TargetKind::Microphone);
+        assert!(target.bundle_id.is_none());
+        assert!(target.window_title.is_none());
+    }
+
+    #[test]
     fn session_lifecycle_uses_caller_supplied_wall_clock() {
         let mut session = Session::new(SessionId::new(2), target(), 1_753_776_000_000);
 
@@ -150,6 +199,18 @@ mod tests {
             json.contains("\"kind\":\"window\""),
             "target kinds must use the SQLite-compatible snake-case representation"
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn microphone_scope_round_trips_through_json() -> Result<(), Box<dyn std::error::Error>> {
+        let target = CaptureTarget::microphone_only();
+        let json = serde_json::to_string(&target)?;
+        let decoded = serde_json::from_str::<CaptureTarget>(&json)?;
+
+        assert_eq!(decoded, target);
+        assert!(json.contains("\"kind\":\"microphone\""));
         Ok(())
     }
 }

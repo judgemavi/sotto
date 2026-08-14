@@ -53,10 +53,11 @@ if [[ $# -eq 1 ]]; then
   fi
 else
   SOURCE_BINARY="${REPO_ROOT}/target/release/app"
-  if [[ ! -f "${SOURCE_BINARY}" ]]; then
-    echo "building ${SOURCE_BINARY}"
-    (cd "${REPO_ROOT}" && cargo build --release -p app)
-  fi
+  # Always build. Cargo is a no-op when nothing changed, and building only when the
+  # binary is absent silently re-signs a stale one — which has repeatedly produced
+  # "verified" runs of code that was never compiled.
+  echo "building ${SOURCE_BINARY}"
+  (cd "${REPO_ROOT}" && cargo build --release -p app)
 fi
 readonly SOURCE_BINARY
 

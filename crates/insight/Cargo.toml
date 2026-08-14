@@ -10,11 +10,16 @@ workspace = true
 
 [dependencies]
 futures-util = "0.3.33"
+mcp = { path = "../mcp" }
+providers = { path = "../providers" }
 rag = { path = "../rag" }
+screen = { path = "../screen" }
 serde.workspace = true
 serde_json.workspace = true
 sotto-core = { package = "core", path = "../core", features = ["serde"] }
 thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [dev-dependencies]
+png = "0.18.0"
 tokio = { workspace = true, features = ["macros", "rt"] }

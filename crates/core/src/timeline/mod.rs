@@ -21,11 +21,13 @@ mod schema;
 mod session;
 
 pub use builder::{
-    LenientReplay, ReplayState, TimelineBuilder, TimelineError, replay, replay_lenient,
+    LenientReplay, ReplayState, TimelineBuilder, TimelineError, checked_user_annotation, replay,
+    replay_lenient,
 };
 pub use event::{
-    EventId, EventKind, EventPayload, FrameRef, MarkKind, ProsodyDelta, ScreenSnapshot, SessionId,
-    TimelineEvent, UserAnnotation,
+    EventClass, EventId, EventKind, EventPayload, FrameRef, MarkKind, ProposalDisposition,
+    ProposalDispositionKind, ProposalEvent, ProposalPhase, ProposalRunAudit, ProposalRunAuditError,
+    ProposalRunOutcome, ProsodyDelta, ScreenSnapshot, SessionId, TimelineEvent, UserAnnotation,
 };
 pub use schema::SQLITE_SCHEMA;
 pub use session::{CaptureTarget, Session, TargetKind};

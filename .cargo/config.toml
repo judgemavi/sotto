@@ -14,3 +14,13 @@
 # step with Package.swift's platforms declaration.
 [env]
 MACOSX_DEPLOYMENT_TARGET = "14.0"
+
+# whisper-rs-sys 0.14.1 can either regenerate its FFI bindings with the host
+# libclang or copy the bindings shipped beside its vendored whisper.cpp source.
+# The live bindgen pipeline with Xcode 26.4 resolves `whisper_full_params` as an
+# opaque declaration when the crate adds its Metal header, while still emitting the complete
+# 296-byte layout assertion. Use the crate's supported bundled-binding mode so
+# local and CI builds consume the bindings released with that exact C source.
+# This only selects Rust FFI declarations; the `metal` Cargo feature and the
+# native Metal build remain enabled.
+WHISPER_DONT_GENERATE_BINDINGS = { value = "1", force = true }

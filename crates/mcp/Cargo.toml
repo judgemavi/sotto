@@ -8,3 +8,25 @@ license.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+futures-util = "0.3.33"
+hex = "0.4.3"
+http = "1.4.0"
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "rustls", "stream"] }
+rmcp = { version = "=3.0.0", default-features = false, features = ["client", "transport-streamable-http-client"] }
+serde = { workspace = true }
+secrecy = "0.10.3"
+sha2 = "0.11.0"
+sse-stream = "0.2.3"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+tokio-util = "0.7.19"
+url = "2.5.8"
+
+[dev-dependencies]
+axum = { version = "0.8.7", default-features = false, features = ["http1", "tokio"] }
+libc = "0.2.183"
+rmcp = { version = "=3.0.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+serde_json.workspace = true
+tempfile = "3.27.0"
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync"] }

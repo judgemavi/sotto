@@ -7,12 +7,8 @@ use super::*;
 struct FixtureOcr;
 
 impl OcrEngine for FixtureOcr {
-    fn recognize(&self, frame: &Frame) -> Result<String, ScreenError> {
-        Ok(if frame.bgra[2] > 100 {
-            "Pricing and Enterprise plan".to_owned()
-        } else {
-            "Acme product overview".to_owned()
-        })
+    fn recognize(&self, _frame: &Frame) -> Result<String, ScreenError> {
+        Err(ScreenError::Ocr("screen ingestion invoked OCR".to_owned()))
     }
 }
 
@@ -73,7 +69,7 @@ fn five_minutes_of_static_frames_collapse_to_one_interval() -> Result<(), Screen
 }
 
 #[test]
-fn slide_change_closes_previous_interval_and_runs_ocr() -> Result<(), ScreenError> {
+fn slide_change_closes_previous_interval_without_running_ocr() -> Result<(), ScreenError> {
     let directory = temporary_directory("change");
     let mut sampler =
         ScreenSampler::new(SamplerConfig::default(), &directory, target(), FixtureOcr)?;
@@ -87,7 +83,10 @@ fn slide_change_closes_previous_interval_and_runs_ocr() -> Result<(), ScreenErro
             "slide change did not emit".to_owned(),
         ));
     };
-    assert_eq!(snapshot.ocr_text, "Acme product overview");
+    assert!(
+        snapshot.ocr_text.is_empty(),
+        "ingestion must not persist eager OCR"
+    );
     assert_eq!(snapshot.visible_to, Some(Duration::from_secs(10)));
     let Some(EventPayload::ScreenSnapshot(final_snapshot)) =
         sampler.finish(Duration::from_secs(20))
@@ -96,7 +95,10 @@ fn slide_change_closes_previous_interval_and_runs_ocr() -> Result<(), ScreenErro
             "missing final snapshot".to_owned(),
         ));
     };
-    assert_eq!(final_snapshot.ocr_text, "Pricing and Enterprise plan");
+    assert!(
+        final_snapshot.ocr_text.is_empty(),
+        "final ingestion must remain OCR-free"
+    );
     sampler.drop_session_frames()?;
     fs::remove_dir_all(directory)?;
     Ok(())

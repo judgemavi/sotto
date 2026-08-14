@@ -1,0 +1,2578 @@
+//! The summary column: your notes first, then whatever the recording supports.
+//!
+//! Two rules shape everything below.
+//!
+//! **The summary is adaptive.** A section exists because the taxonomy returned content for it. A
+//! lecture yields topics, a debugging session yields findings, a planning call yields decisions.
+//! Only [`summary_sections`] names a section; every renderer below it walks a `Vec` it was handed,
+//! so changing the taxonomy is a change to one function rather than to the column.
+//!
+//! **Every claim carries a citation chip.** The chip jumps to the transcript row that supports the
+//! claim. That is the product's central promise made operable, so it is a control on the claim, not
+//! decoration beside it.
+//!
+//! **Evidence is mandatory in the data and quiet on the page.** A claim without a citation is
+//! rejected upstream in `insight` and never reaches this column; nothing here relaxes that. What
+//! [`EvidenceDisclosure`] decides is only when the chips are *spent vertical space*. One claim in
+//! the maintainer's first real summary carried ten of them, which cost more height than the
+//! sentence they supported, so the chips are hidden until a reader asks — for one claim, or for
+//! the whole summary.
+
+use std::{
+    collections::BTreeMap,
+    hash::{Hash as _, Hasher as _},
+    time::Duration,
+};
+
+use gpui::{App, Context, ElementId, Entity, Rgba, WeakEntity, Window, div, prelude::*};
+use gpui_component::{
+    Disableable, Sizable as _,
+    button::{Button, ButtonVariants as _},
+    input::{Input, InputState},
+    scroll::ScrollableElement,
+    text::TextView,
+};
+use insight::{GroundedActionItem, GroundedMeetingNotes, GroundedNoteItem, SourceStatus};
+use sotto_core::{EventId, EventPayload, MarkKind, TimelineEvent, replay_lenient};
+
+use crate::{
+    mcp::{ConfiguredServer, GrantReceiptState, SessionGrantView},
+    notes::NotesState,
+};
+
+use super::{
+    MeetingWorkspace,
+    control_row::{ControlRole, ControlRow},
+    tokens::WorkspaceTokens,
+};
+
+/// Media time of each transcript row a claim may cite, used to label citation chips.
+///
+/// The mock labels every chip with the moment it lands on. The projection that knows those moments
+/// lives in the transcript column, so this column takes them as input rather than re-deriving them:
+/// see [`render_with_citation_times`].
+pub(crate) type CitationTimes = BTreeMap<EventId, Duration>;
+
+/// Renders the column with transcript moments available for citation and anchor labels.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "source context is passed in rather than read back off the rendering entity"
+)]
+pub(crate) fn render_with_citation_times(
+    state: NotesState,
+    live: bool,
+    generation_running: bool,
+    annotations: &[AnnotationView],
+    latest_anchor: Option<EventId>,
+    selected_anchor: Option<EventId>,
+    annotation_input: &Entity<InputState>,
+    servers: Vec<ConfiguredServer>,
+    selected_grant: Option<SessionGrantView>,
+    citation_times: &CitationTimes,
+    cx: &mut Context<MeetingWorkspace>,
+) -> gpui::AnyElement {
+    let tokens = WorkspaceTokens::resolve(cx);
+    let summary = SummaryView::resolve(state, live);
+    div()
+        .size_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .debug_selector(|| "notes-column".into())
+        .child(render_head(&summary, live, generation_running, cx))
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .overflow_y_scrollbar()
+                .px_4()
+                .py_3()
+                .child(render_your_notes(annotations, citation_times, cx))
+                .child(SummaryBody {
+                    summary,
+                    citation_times: citation_times.clone(),
+                    workspace: cx.weak_entity(),
+                })
+                .child(render_source_context(servers, selected_grant, cx)),
+        )
+        .child(
+            div()
+                .px_4()
+                .py_3()
+                .border_t_1()
+                .border_color(tokens.line_soft)
+                .debug_selector(|| "notes-composer".into())
+                .child(div().mb_1().text_sm().text_color(tokens.faint).child(
+                    composer_anchor_label(selected_anchor, latest_anchor, citation_times),
+                ))
+                .child(
+                    ControlRow::new()
+                        .child(
+                            ControlRole::Ellipsizing,
+                            Input::new(annotation_input)
+                                .disabled(selected_anchor.is_none() && latest_anchor.is_none()),
+                        )
+                        .child(
+                            ControlRole::Essential,
+                            Button::new("append-note")
+                                .label("Add")
+                                .small()
+                                .disabled(selected_anchor.is_none() && latest_anchor.is_none())
+                                .debug_selector(|| "append-note-control".into())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.submit_annotation(window, cx);
+                                })),
+                        )
+                        .finish()
+                        .gap_2(),
+                )
+                .children(
+                    annotation_composer_reason(
+                        live,
+                        selected_anchor.is_some() || latest_anchor.is_some(),
+                    )
+                    .map(|reason| {
+                        div()
+                            .mt_1()
+                            .text_sm()
+                            .text_color(tokens.faint)
+                            .child(reason)
+                    }),
+                ),
+        )
+        .into_any_element()
+}
+
+fn render_head(
+    summary: &SummaryView,
+    live: bool,
+    generation_running: bool,
+    cx: &mut Context<MeetingWorkspace>,
+) -> gpui::AnyElement {
+    let tokens = WorkspaceTokens::resolve(cx);
+    div()
+        .px_4()
+        .py_2()
+        .border_b_1()
+        .border_color(tokens.line_soft)
+        .child(
+            ControlRow::new()
+                .child(
+                    ControlRole::Essential,
+                    div().text_color(tokens.ink).child("Notes"),
+                )
+                .child(
+                    ControlRole::Ellipsizing,
+                    div()
+                        .text_sm()
+                        .text_color(tokens.faint)
+                        .child(summary.meta.clone()),
+                )
+                .child(
+                    ControlRole::Essential,
+                    Button::new("summarize")
+                        .label(if summary.sections.is_empty() {
+                            "Summarize"
+                        } else {
+                            "Re-summarize"
+                        })
+                        .small()
+                        .disabled(live || generation_running)
+                        .debug_selector(|| "summarize-control".into())
+                        .on_click(cx.listener(|this, _, _, cx| this.generate_notes(cx))),
+                )
+                .finish()
+                .gap_2()
+                .debug_selector(|| "notes-head-row".into()),
+        )
+        .into_any_element()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AnnotationView {
+    pub(crate) event_id: EventId,
+    pub(crate) anchor: EventId,
+    pub(crate) text: String,
+    pub(crate) mark: MarkKind,
+}
+
+/// Returns the active append-only annotation versions in event order.
+#[cfg(test)]
+pub(crate) fn active_annotations(events: &[TimelineEvent]) -> Vec<AnnotationView> {
+    replay_lenient(events)
+        .state()
+        .active()
+        .values()
+        .filter_map(|event| {
+            let EventPayload::UserAnnotation(annotation) = event.payload() else {
+                return None;
+            };
+            Some(AnnotationView {
+                event_id: event.id(),
+                anchor: annotation.anchor,
+                text: annotation.text.clone(),
+                mark: annotation.mark,
+            })
+        })
+        .collect()
+}
+
+/// Projection consumed by the transcript column to pin annotations under their anchor.
+#[cfg(test)]
+pub(crate) fn annotations_by_anchor(
+    events: &[TimelineEvent],
+) -> BTreeMap<EventId, Vec<AnnotationView>> {
+    let mut grouped = BTreeMap::<EventId, Vec<AnnotationView>>::new();
+    for annotation in active_annotations(events) {
+        let Some(visible_anchor) = resolve_transcript_anchor(events, annotation.anchor) else {
+            continue;
+        };
+        grouped.entry(visible_anchor).or_default().push(annotation);
+    }
+    grouped
+}
+
+/// Resolves a durable annotation/citation anchor to the active utterance that replaced it.
+///
+/// Rolling partial ids are intentionally transient. The annotation retains its original id for
+/// audit, while presentation follows the append-only supersession chain into the current partial
+/// and eventually the settled final.
+#[must_use]
+#[cfg(test)]
+pub(crate) fn resolve_transcript_anchor(
+    events: &[TimelineEvent],
+    anchor: EventId,
+) -> Option<EventId> {
+    let transcript_ids = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.payload(),
+                EventPayload::UtteranceFinal(_) | EventPayload::UtterancePartial(_)
+            )
+        })
+        .map(TimelineEvent::id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if !transcript_ids.contains(&anchor) {
+        return None;
+    }
+
+    let successors = events
+        .iter()
+        .filter(|event| transcript_ids.contains(&event.id()))
+        .filter_map(|event| event.supersedes().map(|target| (target, event.id())))
+        .collect::<BTreeMap<_, _>>();
+    let active = replay_lenient(events)
+        .state()
+        .active()
+        .keys()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    resolve_anchor_with_index(anchor, &transcript_ids, &successors, &active)
+}
+
+pub(crate) fn resolve_anchor_with_index(
+    anchor: EventId,
+    transcript_ids: &std::collections::BTreeSet<EventId>,
+    successors: &BTreeMap<EventId, EventId>,
+    active: &std::collections::BTreeSet<EventId>,
+) -> Option<EventId> {
+    if !transcript_ids.contains(&anchor) {
+        return None;
+    }
+    let mut resolved = anchor;
+    while let Some(next) = successors.get(&resolved).copied() {
+        if next <= resolved {
+            return None;
+        }
+        resolved = next;
+    }
+    active.contains(&resolved).then_some(resolved)
+}
+
+#[must_use]
+pub(crate) fn latest_anchor(events: &[TimelineEvent]) -> Option<EventId> {
+    replay_lenient(events)
+        .state()
+        .active()
+        .values()
+        .filter(|event| {
+            matches!(
+                event.payload(),
+                EventPayload::UtteranceFinal(_) | EventPayload::UtterancePartial(_)
+            )
+        })
+        .map(TimelineEvent::id)
+        .max()
+}
+
+pub(crate) fn render_pinned_annotation_with_tokens(
+    annotation: AnnotationView,
+    tokens: WorkspaceTokens,
+) -> gpui::AnyElement {
+    div()
+        .mt_2()
+        .ml_4()
+        .pl_3()
+        .border_l_2()
+        .border_color(tokens.accent)
+        .text_sm()
+        .child(
+            div()
+                .text_color(tokens.accent)
+                .child(format!("Your {}", mark_label(annotation.mark))),
+        )
+        .child(SelectableText {
+            id: ("pinned-note-text", annotation.event_id.get()).into(),
+            text: annotation.text,
+            color: tokens.ink_2,
+        })
+        .into_any_element()
+}
+
+/// Your notes come first, and say what typing will do rather than reporting emptiness.
+fn render_your_notes(
+    annotations: &[AnnotationView],
+    citation_times: &CitationTimes,
+    cx: &mut Context<MeetingWorkspace>,
+) -> gpui::AnyElement {
+    let tokens = WorkspaceTokens::resolve(cx);
+    div()
+        .mb_4()
+        .rounded_lg()
+        .border_1()
+        .border_color(tokens.line)
+        .bg(tokens.ground)
+        .debug_selector(|| "your-notes-block".into())
+        .child(
+            div().px_3().pt_2().child(
+                ControlRow::new()
+                    .child(
+                        ControlRole::Essential,
+                        div().text_color(tokens.ink).child("Your notes"),
+                    )
+                    .child(ControlRole::Ellipsizing, div())
+                    .finish()
+                    .gap_2(),
+            ),
+        )
+        .when(annotations.is_empty(), |card| {
+            card.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(tokens.faint)
+                    .child("Anything you type lands in the transcript at the moment you typed it."),
+            )
+        })
+        .children(annotations.iter().map(|annotation| {
+            let anchor = annotation.anchor;
+            let event_id = annotation.event_id;
+            let edit = annotation.clone();
+            div()
+                .px_3()
+                .py_2()
+                .child(
+                    ControlRow::new()
+                        .child(
+                            ControlRole::Essential,
+                            div()
+                                .text_sm()
+                                .text_color(tokens.faint)
+                                .child(moment_label(anchor, citation_times)),
+                        )
+                        .child(
+                            ControlRole::Ellipsizing,
+                            div()
+                                .text_sm()
+                                .text_color(tokens.accent)
+                                .child(mark_label(annotation.mark)),
+                        )
+                        .child(
+                            ControlRole::Essential,
+                            Button::new(("edit-typed-note", event_id.get()))
+                                .label("Edit")
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.begin_annotation_edit(edit.clone(), window, cx);
+                                })),
+                        )
+                        .child(
+                            ControlRole::Essential,
+                            Button::new(("typed-note-anchor", event_id.get()))
+                                .label("Show")
+                                .ghost()
+                                .xsmall()
+                                .tooltip("Jump to the transcript row this note is anchored to")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_citation(anchor, cx);
+                                })),
+                        )
+                        .finish()
+                        .gap_2(),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .debug_selector(move || format!("typed-note-text-{}", event_id.get()))
+                        .child(SelectableText {
+                            id: ("typed-note-text", event_id.get()).into(),
+                            text: annotation.text.clone(),
+                            color: tokens.ink_2,
+                        }),
+                )
+        }))
+        .into_any_element()
+}
+
+const fn mark_label(mark: MarkKind) -> &'static str {
+    match mark {
+        MarkKind::Note => "note",
+        MarkKind::Important => "important mark",
+        MarkKind::FollowUp => "follow-up mark",
+    }
+}
+
+/// Only the case a person cannot act on earns a line. The other two explained a text field to
+/// someone already typing in it.
+const fn annotation_composer_reason(_live: bool, has_anchor: bool) -> Option<&'static str> {
+    if has_anchor {
+        None
+    } else {
+        Some("Waiting for the first transcript row so this note has a moment to attach to.")
+    }
+}
+
+/// Labels the composer with the moment the note will attach to.
+fn composer_anchor_label(
+    selected_anchor: Option<EventId>,
+    latest_anchor: Option<EventId>,
+    citation_times: &CitationTimes,
+) -> String {
+    selected_anchor.map_or_else(
+        || {
+            latest_anchor.map_or_else(
+                || "Attaches once this recording has its first transcript row".to_owned(),
+                |anchor| format!("Attaches at {}", moment_label(anchor, citation_times)),
+            )
+        },
+        |anchor| format!("Attaches at {}", moment_label(anchor, citation_times)),
+    )
+}
+
+/// A transcript moment as the user reads it: its timecode when known, its record id otherwise.
+fn moment_label(event_id: EventId, citation_times: &CitationTimes) -> String {
+    citation_times
+        .get(&event_id)
+        .map_or_else(|| format!("#{}", event_id.get()), |time| timecode(*time))
+}
+
+fn timecode(time: Duration) -> String {
+    let seconds = time.as_secs();
+    let (hours, minutes, seconds) = (seconds / 3_600, (seconds % 3_600) / 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+/// Record text the reader can select, copy, and reach with the keyboard.
+///
+/// A note-taking product whose notes cannot be copied is failing at its own job, and until now no
+/// text in this workspace was selectable. [`TextView`] is `gpui-component`'s only selectable text
+/// primitive, and it needs a `Window` that the column's plain render functions never receive — so
+/// the leaf is a [`RenderOnce`] component, which is handed one at draw time. It also registers a
+/// focus handle as a tab stop, so the text is reachable without a mouse.
+#[derive(IntoElement)]
+struct SelectableText {
+    /// Unique within the window: `TextView` keys its parse state off this.
+    id: ElementId,
+    text: String,
+    color: Rgba,
+}
+
+impl RenderOnce for SelectableText {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        TextView::markdown(self.id, as_literal_markdown(&self.text), window, cx)
+            .selectable(true)
+            .text_color(self.color)
+    }
+}
+
+/// Presents record text as text rather than as markup.
+///
+/// [`TextView`] parses its input as markdown. Summary claims and typed notes are prose that nobody
+/// wrote as markup, so a claim mentioning `*` or a note beginning `- ` must not silently restyle
+/// itself. CommonMark defines a backslash before any ASCII punctuation character as that literal
+/// character, and selection copies the rendered text, so the escape never reaches the clipboard.
+fn as_literal_markdown(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len().saturating_mul(2));
+    for character in text.chars() {
+        if character.is_ascii_punctuation() {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
+}
+
+impl MeetingWorkspace {
+    fn begin_annotation_edit(
+        &mut self,
+        annotation: AnnotationView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focused_event = Some(annotation.anchor);
+        self.annotation_input.update(cx, |input, cx| {
+            input.set_value(annotation.text.clone(), window, cx)
+        });
+        self.editing_annotation = Some(annotation);
+        self.message = Some("Editing typed note; Return appends a new version.".to_owned());
+        cx.notify();
+    }
+
+    pub(crate) fn submit_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.transcript_session else {
+            self.message = Some("No recording is selected for this typed note.".to_owned());
+            cx.notify();
+            return;
+        };
+        let events = if self.transcript_live {
+            self.timeline
+                .read(cx)
+                .events()
+                .iter()
+                .filter(|event| event.session_id() == id)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            self.transcript_events.clone()
+        };
+        let selected = self.focused_event.filter(|candidate| {
+            events.iter().any(|event| {
+                event.id() == *candidate
+                    && matches!(
+                        event.payload(),
+                        EventPayload::UtteranceFinal(_) | EventPayload::UtterancePartial(_)
+                    )
+            })
+        });
+        let default_anchor = if self.transcript_live {
+            latest_anchor(&events)
+        } else {
+            last_final_anchor(&events)
+        };
+        let Some(anchor) = self
+            .editing_annotation
+            .as_ref()
+            .map(|editing| editing.anchor)
+            .or(selected)
+            .or(default_anchor)
+        else {
+            self.message =
+                Some("This recording has no transcript row to anchor your note to.".to_owned());
+            cx.notify();
+            return;
+        };
+        let text = self.annotation_input.read(cx).value().to_string();
+        if text.trim().is_empty() {
+            self.message = Some("Type a note before pressing Return.".to_owned());
+            cx.notify();
+            return;
+        }
+        let result = if self.transcript_live {
+            if let Some(editing) = &self.editing_annotation {
+                self.session
+                    .read(cx)
+                    .supersede_user_annotation(
+                        editing.event_id,
+                        text.trim().to_owned(),
+                        editing.mark,
+                    )
+                    .map(|()| None)
+            } else {
+                self.session
+                    .read(cx)
+                    .append_user_annotation(anchor, text.trim().to_owned(), MarkKind::Note)
+                    .map(|()| None)
+            }
+        } else {
+            rag::Store::open(&self.database)
+                .and_then(|store| {
+                    store.append_completed_annotation(
+                        id,
+                        anchor,
+                        text.trim(),
+                        self.editing_annotation
+                            .as_ref()
+                            .map_or(MarkKind::Note, |editing| editing.mark),
+                        self.editing_annotation
+                            .as_ref()
+                            .map(|editing| editing.event_id),
+                    )?;
+                    Ok(store
+                        .refresh_searchable_prior_meeting(id)
+                        .err()
+                        .map(|error| error.to_string()))
+                })
+                .map_err(|error| error.to_string())
+        };
+        match result {
+            Ok(reingestion_error) => {
+                self.annotation_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.editing_annotation = None;
+                if self.transcript_live {
+                    self.message = None;
+                } else {
+                    self.load_transcript(id);
+                    let enabled = self
+                        .reasoning_backend(cx)
+                        .is_ok_and(|backend| backend.is_some());
+                    self.notes.update(cx, |notes, _| {
+                        let _ = notes.select(id, enabled);
+                    });
+                    self.message = Some(reingestion_error.map_or_else(
+                        || "Typed note appended. What was captured is unchanged; any existing summary is now marked stale.".to_owned(),
+                        |error| format!("Typed note appended and any existing summary marked stale, but cross-session search could not be refreshed: {error}"),
+                    ));
+                }
+            }
+            Err(error) => self.message = Some(error),
+        }
+        cx.notify();
+    }
+}
+
+#[must_use]
+fn last_final_anchor(events: &[TimelineEvent]) -> Option<EventId> {
+    replay_lenient(events)
+        .state()
+        .active()
+        .values()
+        .filter(|event| matches!(event.payload(), EventPayload::UtteranceFinal(_)))
+        .map(TimelineEvent::id)
+        .max()
+}
+
+/// What the sources block says, decided before anything is drawn.
+///
+/// The block used to render a heading, the read-only policy, the retrieval receipt and a note that
+/// nothing was configured — four lines of disclosure about a capability nobody in that state is
+/// using. Burying a disclosure in a permanent banner that applies to no one is how disclosures stop
+/// being read, so the policy now appears exactly where a reader can act on it: beside the controls
+/// that select resources and grant query disclosure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SourceContext {
+    /// Nothing is configured. One quiet line, no heading and no policy.
+    Quiet(&'static str),
+    /// Sources exist, so the policy governs live controls and is stated over them.
+    Configured {
+        policy: &'static str,
+        receipt: String,
+    },
+}
+
+impl SourceContext {
+    fn resolve(configured: bool, selected: Option<&SessionGrantView>) -> Self {
+        if !configured {
+            return Self::Quiet(
+                "No outside sources configured; a summary is written from this recording alone. Add one in Settings.",
+            );
+        }
+        Self::Configured {
+            policy: "Default off. Only the exact read-only resources you select can be used by a requested summary.",
+            receipt: selected.map_or_else(
+                || "Select a recording to choose source context.".to_owned(),
+                |view| match &view.receipts {
+                    GrantReceiptState::NotRetrieved => "Not retrieved. A future summary may retrieve bounded evidence; a transcript-only summary remains available if it cannot.".to_owned(),
+                },
+            ),
+        }
+    }
+}
+
+/// Renders from values supplied by the caller.
+///
+/// This must never reach back through `cx.entity()`: it runs inside
+/// `MeetingWorkspace::render`, which already holds that entity, and reading it again is a
+/// double lease that aborts the process at launch rather than failing the frame.
+fn render_source_context(
+    servers: Vec<ConfiguredServer>,
+    selected: Option<SessionGrantView>,
+    cx: &mut Context<MeetingWorkspace>,
+) -> gpui::AnyElement {
+    let tokens = WorkspaceTokens::resolve(cx);
+    let (policy, receipt) = match SourceContext::resolve(!servers.is_empty(), selected.as_ref()) {
+        SourceContext::Quiet(line) => {
+            return div()
+                .mt_4()
+                .text_sm()
+                .text_color(tokens.faint)
+                .debug_selector(|| "source-context-quiet".into())
+                .child(line)
+                .into_any_element();
+        }
+        SourceContext::Configured { policy, receipt } => (policy, receipt),
+    };
+    let selected_resources = selected
+        .as_ref()
+        .map(|view| view.grant.selected_resources())
+        .unwrap_or_default();
+    div()
+        .mt_4()
+        .p_3()
+        .rounded_lg()
+        .bg(tokens.sunken)
+        .debug_selector(|| "source-context-block".into())
+        .child(div().text_color(tokens.ink).child("Sources for this recording"))
+        .child(div().text_sm().text_color(tokens.muted).child(policy))
+        .child(div().text_sm().text_color(tokens.muted).child(receipt))
+        .children(servers.into_iter().enumerate().map(|(server_index, server)| {
+            let disclosed = selected
+                .as_ref()
+                .is_some_and(|view| view.grant.query_disclosure(&server.id) == mcp::MeetingQueryDisclosure::Redacted);
+            let disclosure_id = server.id.clone();
+            div()
+                .mt_2()
+                .child(
+                    ControlRow::new()
+                        .child(
+                            ControlRole::Ellipsizing,
+                            div().text_sm().child(format!(
+                                "{} — remote host {}",
+                                server.display_name,
+                                server.endpoint.host()
+                            )),
+                        )
+                        .child(
+                            ControlRole::Essential,
+                            Button::new(("query-disclosure", server_index))
+                                .label(if disclosed { "Disclosure: on" } else { "Disclosure: off" })
+                                .ghost()
+                                .xsmall()
+                                .tooltip("Whether a summary may disclose a redacted recording-derived query to this source")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_query_disclosure(disclosure_id.clone(), !disclosed, cx);
+                                })),
+                        )
+                        .finish()
+                        .gap_2(),
+                )
+                .children(server.resources.into_iter().enumerate().map(|(resource_index, resource)| {
+                    let chosen = selected_resources.iter().any(|selection| {
+                        selection.server_id == resource.server_id && selection.uri == resource.uri
+                    });
+                    let server_id = resource.server_id.clone();
+                    let uri = resource.uri.clone();
+                    let label = resource.title.clone().unwrap_or(resource.name);
+                    ControlRow::new()
+                        .child(
+                            ControlRole::Ellipsizing,
+                            div().text_sm().text_color(tokens.muted).child(label),
+                        )
+                        .child(
+                            ControlRole::Essential,
+                            Button::new((
+                                "source-resource",
+                                server_index.saturating_mul(10_000).saturating_add(resource_index),
+                            ))
+                            .label(if chosen { "Selected" } else { "Use" })
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_source_resource(server_id.clone(), uri.clone(), cx);
+                            })),
+                        )
+                        .finish()
+                        .gap_2()
+                }))
+        }))
+        .into_any_element()
+}
+
+/// One claim, with the evidence that makes it sayable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Claim {
+    /// Who owns the claim, when the taxonomy attributes one.
+    lead: Option<String>,
+    text: String,
+    /// Qualifiers the taxonomy attached to the claim, such as a due date.
+    detail: Option<String>,
+    meeting: Vec<EventId>,
+    external: Vec<mcp::EvidenceId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SectionShape {
+    /// Continuous text; the mock renders it as a paragraph.
+    Prose,
+    /// Discrete claims; the mock renders them as bullets.
+    Points,
+}
+
+/// One section of the adaptive summary. It exists only because it has claims.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SummarySection {
+    heading: String,
+    shape: SectionShape,
+    claims: Vec<Claim>,
+}
+
+/// The single seam between the notes taxonomy and this column.
+///
+/// This is the only place a section is named. When the taxonomy changes shape, this function
+/// changes and nothing else does — the renderers below walk whatever `Vec` they are handed. An
+/// empty section never reaches them, so a heading with nothing under it cannot be drawn.
+fn summary_sections(notes: GroundedMeetingNotes) -> Vec<SummarySection> {
+    let GroundedMeetingNotes {
+        overview,
+        topics,
+        decisions,
+        action_items,
+        open_questions,
+        risks,
+        follow_ups,
+    } = notes;
+    let mut sections = Vec::new();
+    push_notes(&mut sections, "Overview", SectionShape::Prose, overview);
+    push_notes(&mut sections, "Topics", SectionShape::Points, topics);
+    push_notes(&mut sections, "Decisions", SectionShape::Points, decisions);
+    push_actions(&mut sections, "Action items", action_items);
+    push_notes(
+        &mut sections,
+        "Open questions",
+        SectionShape::Points,
+        open_questions,
+    );
+    push_notes(&mut sections, "Risks", SectionShape::Points, risks);
+    push_actions(&mut sections, "Follow-ups", follow_ups);
+    sections
+}
+
+fn push_notes(
+    sections: &mut Vec<SummarySection>,
+    heading: &str,
+    shape: SectionShape,
+    items: Vec<GroundedNoteItem>,
+) {
+    if items.is_empty() {
+        return;
+    }
+    sections.push(SummarySection {
+        heading: heading.to_owned(),
+        shape,
+        claims: items
+            .into_iter()
+            .map(|item| Claim {
+                lead: None,
+                text: item.text,
+                detail: None,
+                meeting: item.meeting_citations,
+                external: item.external_citations,
+            })
+            .collect(),
+    });
+}
+
+fn push_actions(sections: &mut Vec<SummarySection>, heading: &str, items: Vec<GroundedActionItem>) {
+    if items.is_empty() {
+        return;
+    }
+    sections.push(SummarySection {
+        heading: heading.to_owned(),
+        shape: SectionShape::Points,
+        claims: items.into_iter().map(action_claim).collect(),
+    });
+}
+
+fn action_claim(item: GroundedActionItem) -> Claim {
+    let mut meeting = item.meeting_citations;
+    meeting.extend(item.owner_meeting_citations);
+    meeting.extend(item.due_date_meeting_citations);
+    meeting.sort_unstable();
+    meeting.dedup();
+    let mut external = item.external_citations;
+    external.extend(item.owner_external_citations);
+    external.extend(item.due_date_external_citations);
+    external.sort();
+    external.dedup();
+    Claim {
+        lead: item.owner,
+        text: item.text,
+        detail: item.due_date.map(|date| format!("due {date}")),
+        meeting,
+        external,
+    }
+}
+
+/// Everything the column needs to say about the summary, resolved from one state.
+struct SummaryView {
+    /// The head meta line: "N sections · every claim cited", or why there is no summary yet.
+    meta: String,
+    /// Provenance the user is owed before they trust the sections: model, origin, sources.
+    provenance: Vec<String>,
+    /// A warning band, shown when the summary is stale or the run failed.
+    caution: Option<String>,
+    /// What is happening or will happen, shown when there are no sections to read.
+    pending: Option<String>,
+    sections: Vec<SummarySection>,
+    bundle: Option<mcp::ContextBundle>,
+}
+
+impl SummaryView {
+    fn resolve(state: NotesState, live: bool) -> Self {
+        if live {
+            return Self::pending(
+                "summary comes after you stop",
+                "The summary is written after you stop — from the retained recording, so it can cite every claim. Notes you type below are kept in the transcript at the moment you typed them.",
+            );
+        }
+        match state {
+            NotesState::NoMeeting => Self::pending(
+                "nothing recorded yet",
+                "No recording is open. Start or import one, and the summary is written from its transcript after it stops.",
+            ),
+            NotesState::Disabled => Self::pending(
+                "not summarized yet",
+                "No summary yet. Summarizing reads the transcript and writes only the sections this recording supports — with a timecode on every claim. It needs a ready Summarizer backend in Settings.",
+            ),
+            NotesState::Generating => Self::pending(
+                "summarizing…",
+                "Summarizing — reading the transcript and writing only the sections it supports. The transcript stays readable while this runs.",
+            ),
+            NotesState::Failed(error) => {
+                let mut view = Self::pending(
+                    "not summarized",
+                    "The transcript is unchanged and still complete. Summarize again once the cause above is addressed.",
+                );
+                view.caution = Some(format!("Summarizing failed: {error}"));
+                view
+            }
+            NotesState::Ready {
+                notes,
+                bundle,
+                source_status,
+                cached,
+                model,
+            } => Self::ready(*notes, bundle, source_status, ready_origin(cached), model, None),
+            NotesState::Stale {
+                notes,
+                bundle,
+                source_status,
+                model,
+            } => Self::ready(
+                *notes,
+                bundle,
+                source_status,
+                "Saved summary",
+                model,
+                Some(
+                    "This summary predates your latest typed note. Re-summarize when you want it to account for that note."
+                        .to_owned(),
+                ),
+            ),
+        }
+    }
+
+    fn pending(meta: &str, pending: &str) -> Self {
+        Self {
+            meta: meta.to_owned(),
+            provenance: Vec::new(),
+            caution: None,
+            pending: Some(pending.to_owned()),
+            sections: Vec::new(),
+            bundle: None,
+        }
+    }
+
+    fn ready(
+        notes: GroundedMeetingNotes,
+        bundle: mcp::ContextBundle,
+        source_status: SourceStatus,
+        origin: &str,
+        model: String,
+        caution: Option<String>,
+    ) -> Self {
+        let sections = summary_sections(notes);
+        // A summary with no section at all is not a summary; say so rather than drawing a heading
+        // count of zero over an empty column.
+        if sections.is_empty() {
+            let mut view = Self::pending(
+                "no sections supported",
+                "The transcript did not support a single section. Nothing was written rather than something unevidenced.",
+            );
+            view.provenance = vec![format!("{origin} · {model}")];
+            view.caution = caution;
+            return view;
+        }
+        Self {
+            meta: sections_meta(sections.len()),
+            provenance: std::iter::once(format!("{origin} · {model}"))
+                .chain(source_line(source_status).map(ToOwned::to_owned))
+                .collect(),
+            caution,
+            pending: None,
+            sections,
+            bundle: Some(bundle),
+        }
+    }
+}
+
+fn sections_meta(count: usize) -> String {
+    if count == 1 {
+        "1 section · every claim cited".to_owned()
+    } else {
+        format!("{count} sections · every claim cited")
+    }
+}
+
+const fn ready_origin(cached: bool) -> &'static str {
+    if cached {
+        "Saved summary"
+    } else {
+        "Summarized just now"
+    }
+}
+
+/// Sources are worth a line only when they changed the answer, or when they were meant to and
+/// could not. "None selected" is the default state of a feature the reader is not using.
+const fn source_line(status: SourceStatus) -> Option<&'static str> {
+    match status {
+        SourceStatus::NotSelected => None,
+        SourceStatus::Available => Some("Sources: retrieved and saved with this summary."),
+        SourceStatus::Unavailable => {
+            Some("Sources: unavailable; the summary fell back to this recording alone.")
+        }
+    }
+}
+
+/// Which claims are currently showing the evidence that made them sayable.
+///
+/// This is display state and nothing else. `insight` still rejects an uncited claim before it can
+/// reach this column, and every chip drawn below still resolves to a real transcript row. What is
+/// decided here is only whether the chips are worth their vertical space right now.
+///
+/// It lives in window element state rather than on the workspace on purpose: reading a summary is
+/// not an edit, so revealing evidence must not touch the session, the record, or anything
+/// persisted.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct EvidenceDisclosure {
+    /// Identifies the summary these choices were made about.
+    summary: u64,
+    /// The one toggle: every claim shows its chips, or none does.
+    all: bool,
+}
+
+impl EvidenceDisclosure {
+    /// The choices that apply to `summary`. A different summary reads quiet again.
+    fn revealed(&self, summary: u64) -> Revealed {
+        if self.summary == summary {
+            Revealed { all: self.all }
+        } else {
+            Revealed::default()
+        }
+    }
+
+    /// Re-points at `summary`, discarding choices about a different one: claim ordinals do not
+    /// survive a re-summarize.
+    fn rebind(&mut self, summary: u64) {
+        if self.summary != summary {
+            self.summary = summary;
+            self.all = false;
+        }
+    }
+
+    fn toggle_all(&mut self, summary: u64) {
+        self.rebind(summary);
+        self.all = !self.all;
+    }
+}
+
+/// The disclosure choice in force for the summary being drawn. One switch, whole summary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Revealed {
+    all: bool,
+}
+
+/// Identifies a rendered summary, so evidence choices never carry over to a different one.
+fn summary_fingerprint(sections: &[SummarySection]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for section in sections {
+        section.heading.hash(&mut hasher);
+        section.claims.len().hash(&mut hasher);
+        for claim in &section.claims {
+            claim.text.hash(&mut hasher);
+            claim.meeting.len().hash(&mut hasher);
+            claim.external.len().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+/// The summary itself: provenance, the evidence control, and the sections.
+///
+/// A [`RenderOnce`] component rather than a plain function because the column's callers hand it no
+/// `Window`, and both selectable text and the per-window disclosure state need one. It carries a
+/// weak workspace handle instead of a `Context`, so nothing here can re-lease the entity that
+/// `MeetingWorkspace::render` already holds.
+#[derive(IntoElement)]
+struct SummaryBody {
+    summary: SummaryView,
+    citation_times: CitationTimes,
+    workspace: WeakEntity<MeetingWorkspace>,
+}
+
+/// What every claim in one summary shares, so no renderer needs eight parameters.
+struct ClaimContext<'a> {
+    summary: u64,
+    disclosure: Entity<EvidenceDisclosure>,
+    revealed: Revealed,
+    bundle: mcp::ContextBundle,
+    citation_times: &'a CitationTimes,
+    workspace: WeakEntity<MeetingWorkspace>,
+    tokens: WorkspaceTokens,
+}
+
+impl RenderOnce for SummaryBody {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let tokens = WorkspaceTokens::resolve(cx);
+        let summary = self.summary;
+        let fingerprint = summary_fingerprint(&summary.sections);
+        let disclosure = window.use_keyed_state("summary-evidence-disclosure", cx, |_, _| {
+            EvidenceDisclosure::default()
+        });
+        let revealed = disclosure.read(cx).revealed(fingerprint);
+        let context = ClaimContext {
+            summary: fingerprint,
+            disclosure,
+            revealed,
+            bundle: summary.bundle.unwrap_or_else(mcp::ContextBundle::empty),
+            citation_times: &self.citation_times,
+            workspace: self.workspace,
+            tokens,
+        };
+        let mut ordinal = 0_usize;
+        div()
+            .debug_selector(|| "summary-area".into())
+            .children(summary.caution.map(|caution| {
+                div()
+                    .mb_3()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(tokens.warn_wash)
+                    .text_sm()
+                    .text_color(tokens.warn)
+                    .child(caution)
+            }))
+            .children(
+                summary
+                    .provenance
+                    .into_iter()
+                    .map(|line| div().mb_1().text_sm().text_color(tokens.faint).child(line)),
+            )
+            .children(summary.pending.map(|pending| {
+                div()
+                    .mt_2()
+                    .p_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(tokens.line)
+                    .text_sm()
+                    .text_color(tokens.muted)
+                    .debug_selector(|| "summary-pending".into())
+                    .child(pending)
+            }))
+            .children((!summary.sections.is_empty()).then(|| render_evidence_control(&context)))
+            .children(
+                summary
+                    .sections
+                    .into_iter()
+                    .map(|section| render_section(section, &context, &mut ordinal)),
+            )
+    }
+}
+
+/// The one control that reveals or hides every claim's evidence at once.
+fn render_evidence_control(context: &ClaimContext<'_>) -> gpui::AnyElement {
+    let shown = context.revealed.all;
+    let summary = context.summary;
+    let disclosure = context.disclosure.clone();
+    ControlRow::new()
+        .child(ControlRole::Ellipsizing, div())
+        .child(
+            ControlRole::Essential,
+            evidence_control(
+                "summary-evidence-toggle".into(),
+                "summary-evidence-toggle".to_owned(),
+                if shown {
+                    "Hide timecodes".to_owned()
+                } else {
+                    "Show timecodes".to_owned()
+                },
+                "Show or hide the transcript timecodes behind every claim in this summary",
+                move |cx| {
+                    disclosure.update(cx, |state, cx| {
+                        state.toggle_all(summary);
+                        cx.notify();
+                    });
+                },
+            ),
+        )
+        .finish()
+        .mt_2()
+        .mb_1()
+        .gap_2()
+        .into_any_element()
+}
+
+fn render_section(
+    section: SummarySection,
+    context: &ClaimContext<'_>,
+    ordinal: &mut usize,
+) -> gpui::AnyElement {
+    let tokens = context.tokens;
+    let count = section.claims.len().to_string();
+    let prose = section.shape == SectionShape::Prose;
+    div()
+        .mt_3()
+        .child(
+            div()
+                .pb_1()
+                .mb_2()
+                .border_b_1()
+                .border_color(tokens.line_soft)
+                .child(
+                    ControlRow::new()
+                        .child(
+                            ControlRole::Ellipsizing,
+                            div().text_color(tokens.ink).child(section.heading),
+                        )
+                        .child(
+                            ControlRole::Essential,
+                            div().text_sm().text_color(tokens.faint).child(count),
+                        )
+                        .finish()
+                        .gap_2(),
+                ),
+        )
+        .children(section.claims.into_iter().map(|claim| {
+            let index = *ordinal;
+            *ordinal = ordinal.saturating_add(1);
+            render_claim(claim, index, prose, context)
+        }))
+        .into_any_element()
+}
+
+fn render_claim(
+    claim: Claim,
+    ordinal: usize,
+    prose: bool,
+    context: &ClaimContext<'_>,
+) -> gpui::AnyElement {
+    let tokens = context.tokens;
+    let mut text = claim.text;
+    if let Some(lead) = claim.lead {
+        text = format!("{lead} — {text}");
+    }
+    if let Some(detail) = claim.detail {
+        text = format!("{text} ({detail})");
+    }
+    div()
+        .mb_2()
+        .min_w_0()
+        .when(!prose, |item| {
+            item.pl_3().border_l_2().border_color(tokens.line)
+        })
+        .child(
+            div()
+                .min_w_0()
+                .debug_selector(move || format!("summary-claim-{ordinal}"))
+                .child(SelectableText {
+                    id: ("summary-claim", ordinal).into(),
+                    text,
+                    color: tokens.ink_2,
+                }),
+        )
+        .child(render_evidence(
+            claim.meeting,
+            claim.external,
+            ordinal,
+            context,
+        ))
+        .into_any_element()
+}
+
+/// A claim's evidence: its chips when revealed, otherwise the control that reveals them.
+///
+/// The chips are the promise; this is only when they are spent. Whichever branch renders, it is a
+/// real focusable button with a spoken label, so keyboard and screen-reader readers reach the
+/// evidence exactly as a pointer does.
+fn render_evidence(
+    meeting: Vec<EventId>,
+    external: Vec<mcp::EvidenceId>,
+    ordinal: usize,
+    context: &ClaimContext<'_>,
+) -> gpui::AnyElement {
+    // One control governs the whole summary, not one per claim. A per-claim handle under every
+    // line put twenty controls on screen and cost more vertical space than the chips it hid — the
+    // prose it was meant to protect ended up harder to read than before.
+    if !context.revealed.all {
+        return div().into_any_element();
+    }
+    div()
+        .mt_1()
+        .min_w_0()
+        .child(render_citations(meeting, external, ordinal, context))
+        .into_any_element()
+}
+
+/// One evidence control: a focusable button that answers the pointer and the keyboard alike.
+///
+/// `gpui-component`'s button registers a tab stop but binds no key activation, so a control that
+/// only answered a click would put the evidence out of a keyboard reader's reach. Hiding the chips
+/// is a decision about vertical space; it may not become a decision about who can see the evidence.
+/// The key listener sits on the wrapper because key events dispatch up from the focused button
+/// through its ancestors.
+///
+/// **The key path is NOT covered by an automated test.** The mounted-render harness builds a window
+/// whose root view is [`MeetingWorkspace`] rather than `gpui_component::Root`, so a simulated
+/// keystroke panics inside `gpui-component`'s root lookup before reaching any listener, and mouse
+/// events in that harness never move focus onto a button. Both are properties of how the window is
+/// mounted, not of this control. The pointer path below is covered.
+fn evidence_control(
+    id: ElementId,
+    selector: String,
+    label: String,
+    tooltip: &'static str,
+    activate: impl Fn(&mut App) + 'static,
+) -> gpui::AnyElement {
+    let activate = std::rc::Rc::new(activate);
+    let by_key = std::rc::Rc::clone(&activate);
+    div()
+        .flex_none()
+        .min_w_0()
+        .on_key_down(move |event, _, cx| {
+            if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                by_key(cx);
+            }
+        })
+        .child(
+            Button::new(id)
+                .label(label)
+                .ghost()
+                .xsmall()
+                .tooltip(tooltip)
+                .debug_selector(move || selector)
+                .on_click(move |_, _, cx| activate(cx)),
+        )
+        .into_any_element()
+}
+
+/// Citation chips wrap rather than compete for one line.
+///
+/// This is the fifth instance of the same clipping defect in this project, and the shipped column
+/// was the worst of them: three "Open transcript evidence" buttons on one non-wrapping row, the
+/// third sliced through a word. A chip list has no fixed arity, so no shrink priority can save it —
+/// a fourth citation would always clip whichever child ranked last. The fix is the mock's own: the
+/// chip is a short moment label, and the row wraps. Fixed-arity control rows in this column go
+/// through [`ControlRow`], which is what shrink priority is actually for.
+fn render_citations(
+    meeting: Vec<EventId>,
+    external: Vec<mcp::EvidenceId>,
+    ordinal: usize,
+    context: &ClaimContext<'_>,
+) -> gpui::AnyElement {
+    let tokens = context.tokens;
+    let citation_times = context.citation_times;
+    let bundle = &context.bundle;
+    div()
+        .mt_1()
+        .min_w_0()
+        .child(div().flex().flex_wrap().gap_1().min_w_0().children(
+            meeting.into_iter().enumerate().map(|(index, event_id)| {
+                let workspace = context.workspace.clone();
+                Button::new((
+                    "summary-citation",
+                    ordinal.saturating_mul(1_000).saturating_add(index),
+                ))
+                .label(moment_label(event_id, citation_times))
+                .outline()
+                .xsmall()
+                .tooltip("Jump to the transcript row that supports this claim")
+                .debug_selector(move || format!("summary-citation-{ordinal}-{index}"))
+                .on_click(move |_, _, cx| {
+                    let _ = workspace.update(cx, |this, cx| this.open_citation(event_id, cx));
+                })
+            }),
+        ))
+        .children(external.into_iter().filter_map(|id| {
+            bundle
+                .excerpts()
+                .iter()
+                .find(|excerpt| excerpt.evidence_id == id)
+                .map(|excerpt| {
+                    div()
+                        .mt_1()
+                        .text_sm()
+                        .text_color(tokens.faint)
+                        .child(format!(
+                            "External evidence · {} · {} · {} · SHA-256 {}{}",
+                            excerpt.title,
+                            excerpt.receipt.server_id.as_str(),
+                            excerpt.receipt.resource_uri.as_str(),
+                            excerpt.receipt.content_sha256,
+                            if excerpt.receipt.truncated {
+                                " · truncated"
+                            } else {
+                                ""
+                            }
+                        ))
+                })
+        }))
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use insight::{EvidenceBasis, GroundedActionItem, GroundedMeetingNotes, GroundedNoteItem};
+    use sotto_core::{
+        CaptureTarget, EventId, EventPayload, MarkKind, Session, SessionId, Source, SpeechState,
+        TargetKind, TimelineBuilder, Utterance, VadSegment,
+    };
+
+    use super::{
+        CitationTimes, EvidenceDisclosure, SectionShape, SourceContext, SummaryView,
+        active_annotations, annotations_by_anchor, as_literal_markdown, composer_anchor_label,
+        last_final_anchor, latest_anchor, moment_label, resolve_transcript_anchor, sections_meta,
+        summary_fingerprint, summary_sections, timecode,
+    };
+    use crate::notes::NotesState;
+
+    fn note(text: &str, citation: u64) -> GroundedNoteItem {
+        GroundedNoteItem {
+            text: text.to_owned(),
+            basis: EvidenceBasis::Meeting,
+            meeting_citations: vec![EventId::new(citation)],
+            external_citations: Vec::new(),
+        }
+    }
+
+    fn action(text: &str, citation: u64) -> GroundedActionItem {
+        GroundedActionItem {
+            text: text.to_owned(),
+            basis: EvidenceBasis::Meeting,
+            meeting_citations: vec![EventId::new(citation)],
+            external_citations: Vec::new(),
+            owner: Some("Dana".to_owned()),
+            owner_basis: Some(EvidenceBasis::Meeting),
+            owner_meeting_citations: vec![EventId::new(citation)],
+            owner_external_citations: Vec::new(),
+            due_date: Some("Thursday".to_owned()),
+            due_date_basis: Some(EvidenceBasis::Meeting),
+            due_date_meeting_citations: vec![EventId::new(citation)],
+            due_date_external_citations: Vec::new(),
+        }
+    }
+
+    fn target() -> CaptureTarget {
+        CaptureTarget {
+            bundle_id: None,
+            display_name: "Recording".to_owned(),
+            window_title: None,
+            kind: TargetKind::Application,
+            audio_scoped: true,
+        }
+    }
+
+    #[test]
+    fn a_debugging_session_renders_only_the_sections_its_content_supports() {
+        let notes = GroundedMeetingNotes {
+            overview: vec![note("Traced the double charge to a lock-key mismatch.", 1)],
+            topics: vec![note("Lock is keyed on order id.", 2)],
+            decisions: Vec::new(),
+            action_items: Vec::new(),
+            open_questions: Vec::new(),
+            risks: Vec::new(),
+            follow_ups: vec![action("Key both paths on payment intent id.", 3)],
+        };
+
+        let sections = summary_sections(notes);
+
+        assert_eq!(
+            sections
+                .iter()
+                .map(|section| section.heading.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Overview", "Topics", "Follow-ups"],
+            "only sections with content may be rendered"
+        );
+        assert_eq!(
+            sections[0].shape,
+            SectionShape::Prose,
+            "an overview reads as prose"
+        );
+        assert_eq!(
+            sections[2].shape,
+            SectionShape::Points,
+            "follow-ups read as discrete claims"
+        );
+    }
+
+    #[test]
+    fn a_recording_whose_content_supports_every_section_renders_all_seven() {
+        let notes = GroundedMeetingNotes {
+            overview: vec![note("Sprint 41 planning.", 1)],
+            topics: vec![note("Capacity.", 2)],
+            decisions: vec![note("Search rewrite deferred.", 3)],
+            action_items: vec![action("Retry rollout checklist.", 4)],
+            open_questions: vec![note("Does the exporter live on?", 5)],
+            risks: vec![note("Staging is still fragile.", 6)],
+            follow_ups: vec![action("Book the security review.", 7)],
+        };
+
+        let sections = summary_sections(notes);
+
+        assert_eq!(sections.len(), 7, "seven supported sections render seven");
+        assert_eq!(
+            sections_meta(sections.len()),
+            "7 sections · every claim cited",
+            "the meta line counts what was rendered"
+        );
+        assert_eq!(
+            sections_meta(1),
+            "1 section · every claim cited",
+            "a single section is not reported in the plural"
+        );
+    }
+
+    #[test]
+    fn no_section_is_ever_rendered_empty() {
+        let sections = summary_sections(GroundedMeetingNotes {
+            decisions: vec![note("Ship on Friday.", 9)],
+            ..GroundedMeetingNotes::default()
+        });
+
+        assert_eq!(sections.len(), 1, "one supported section renders one");
+        assert!(
+            sections.iter().all(|section| !section.claims.is_empty()),
+            "a heading with nothing under it must never be produced"
+        );
+    }
+
+    #[test]
+    fn every_claim_carries_the_evidence_a_chip_is_built_from() {
+        let sections = summary_sections(GroundedMeetingNotes {
+            overview: vec![note("Planning.", 1)],
+            action_items: vec![action("Checklist.", 2)],
+            ..GroundedMeetingNotes::default()
+        });
+
+        for section in &sections {
+            for claim in &section.claims {
+                assert!(
+                    !claim.meeting.is_empty() || !claim.external.is_empty(),
+                    "every claim must carry evidence to cite: {}",
+                    claim.text
+                );
+            }
+        }
+        let action_claim = &sections[1].claims[0];
+        assert_eq!(
+            action_claim.lead.as_deref(),
+            Some("Dana"),
+            "an attributed action keeps its owner"
+        );
+        assert_eq!(
+            action_claim.meeting.len(),
+            1,
+            "citations repeated across text, owner and due date collapse to one chip"
+        );
+    }
+
+    #[test]
+    fn a_citation_chip_reads_as_the_moment_it_lands_on() {
+        let mut times = CitationTimes::new();
+        times.insert(EventId::new(7), Duration::from_secs(761));
+        times.insert(EventId::new(8), Duration::from_secs(4_360));
+
+        assert_eq!(
+            moment_label(EventId::new(7), &times),
+            "12:41",
+            "a known moment reads as its timecode"
+        );
+        assert_eq!(
+            moment_label(EventId::new(8), &times),
+            "1:12:40",
+            "a long recording keeps its hour"
+        );
+        assert_eq!(
+            moment_label(EventId::new(9), &times),
+            "#9",
+            "an unknown moment still names the row it jumps to"
+        );
+        assert_eq!(
+            timecode(Duration::ZERO),
+            "00:00",
+            "the start of a recording is a valid moment"
+        );
+    }
+
+    #[test]
+    fn evidence_is_hidden_until_a_reader_asks_for_one_claim_or_for_all_of_them() {
+        let sections = summary_sections(GroundedMeetingNotes {
+            overview: vec![note("Sprint 41 planning.", 1)],
+            decisions: vec![note("Search rewrite deferred.", 2)],
+            ..GroundedMeetingNotes::default()
+        });
+        let summary = summary_fingerprint(&sections);
+        let mut disclosure = EvidenceDisclosure::default();
+
+        assert!(
+            !disclosure.revealed(summary).all,
+            "a summary reads as prose before a reader asks for anything"
+        );
+
+        disclosure.toggle_all(summary);
+        assert!(
+            disclosure.revealed(summary).all,
+            "one control reveals every claim's evidence at once"
+        );
+
+        disclosure.toggle_all(summary);
+        assert!(
+            !disclosure.revealed(summary).all,
+            "toggling back returns the whole summary to prose"
+        );
+    }
+
+    #[test]
+    fn evidence_choices_do_not_carry_over_to_a_different_summary() {
+        let first = summary_fingerprint(&summary_sections(GroundedMeetingNotes {
+            overview: vec![note("Sprint 41 planning.", 1)],
+            ..GroundedMeetingNotes::default()
+        }));
+        let second = summary_fingerprint(&summary_sections(GroundedMeetingNotes {
+            overview: vec![note("A lecture on training dynamics.", 1)],
+            ..GroundedMeetingNotes::default()
+        }));
+        assert_ne!(
+            first, second,
+            "two different summaries must not share one identity"
+        );
+
+        let mut disclosure = EvidenceDisclosure::default();
+        disclosure.toggle_all(first);
+        assert!(
+            disclosure.revealed(first).all,
+            "the summary the reader opened stays open"
+        );
+        assert!(
+            !disclosure.revealed(second).all,
+            "a re-summarize starts quiet; claim ordinals do not survive it"
+        );
+    }
+
+    #[test]
+    fn record_text_is_rendered_as_text_rather_than_as_markup() {
+        assert_eq!(
+            as_literal_markdown("- ship *now*"),
+            r"\- ship \*now\*",
+            "prose that happens to look like markup keeps its own characters"
+        );
+        assert_eq!(
+            as_literal_markdown("Sprint 41 planning"),
+            "Sprint 41 planning",
+            "ordinary prose is passed through untouched"
+        );
+    }
+
+    #[test]
+    fn the_sources_block_is_one_quiet_line_until_a_source_exists()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let empty = SourceContext::resolve(false, None);
+        let SourceContext::Quiet(line) = empty else {
+            return Err(std::io::Error::other(
+                "with nothing configured the block must be one quiet line, not a policy essay",
+            )
+            .into());
+        };
+        assert!(
+            !line.contains("read-only"),
+            "a capability nobody is using is not explained at length: {line}"
+        );
+        assert!(
+            line.contains("Settings"),
+            "the quiet line still says where a source would be added: {line}"
+        );
+
+        let configured = SourceContext::resolve(true, None);
+        let SourceContext::Configured { policy, receipt } = configured else {
+            return Err(std::io::Error::other(
+                "with a source configured the policy governs live controls and must be stated",
+            )
+            .into());
+        };
+        assert!(
+            policy.contains("read-only"),
+            "the disclosure appears where the reader can act on it: {policy}"
+        );
+        assert!(
+            receipt.contains("Select a recording"),
+            "the retrieval receipt still reports its own state: {receipt}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_pending_state_says_what_summarizing_will_do() {
+        let view = SummaryView::resolve(NotesState::Disabled, false);
+
+        assert_eq!(view.meta, "not summarized yet", "the head states the state");
+        let pending = view
+            .pending
+            .unwrap_or_else(|| "no pending copy was produced".to_owned());
+        assert!(
+            pending.contains("only the sections this recording supports"),
+            "the pending state explains adaptivity: {pending}"
+        );
+        assert!(
+            pending.contains("timecode on every claim"),
+            "the pending state promises citations: {pending}"
+        );
+        assert!(
+            view.sections.is_empty(),
+            "nothing may be rendered as a summary before one exists"
+        );
+    }
+
+    #[test]
+    fn a_live_recording_is_told_the_summary_comes_after_it_stops() {
+        let view = SummaryView::resolve(NotesState::NoMeeting, true);
+
+        assert_eq!(
+            view.meta, "summary comes after you stop",
+            "the head is live"
+        );
+        assert!(
+            view.pending
+                .unwrap_or_default()
+                .contains("written after you stop"),
+            "a live recording must not be told a summary is missing"
+        );
+    }
+
+    #[test]
+    fn a_failed_summary_names_its_cause() {
+        let view = SummaryView::resolve(
+            NotesState::Failed("the Summarizer backend refused the request".to_owned()),
+            false,
+        );
+
+        let caution = view
+            .caution
+            .unwrap_or_else(|| "no cause was named".to_owned());
+        assert!(
+            caution.contains("the Summarizer backend refused the request"),
+            "the failure must name its cause: {caution}"
+        );
+        assert!(
+            view.sections.is_empty(),
+            "a failed run renders no sections at all"
+        );
+    }
+
+    #[test]
+    fn a_stale_summary_says_what_is_wrong_with_it_and_still_renders() {
+        let view = SummaryView::resolve(
+            NotesState::Stale {
+                notes: Box::new(GroundedMeetingNotes {
+                    decisions: vec![note("Ship on Friday.", 1)],
+                    ..GroundedMeetingNotes::default()
+                }),
+                bundle: mcp::ContextBundle::empty(),
+                source_status: insight::SourceStatus::NotSelected,
+                model: "gpt-5.4-codex".to_owned(),
+            },
+            false,
+        );
+
+        assert_eq!(view.sections.len(), 1, "a stale summary is still readable");
+        assert!(
+            view.caution.unwrap_or_default().contains("predates"),
+            "a stale summary must say why it is stale"
+        );
+        assert!(
+            view.provenance
+                .iter()
+                .any(|line| line.contains("gpt-5.4-codex")),
+            "the model that produced the summary is named: {:?}",
+            view.provenance
+        );
+    }
+
+    #[test]
+    fn a_fresh_summary_names_its_model_and_its_source_footing() {
+        let view = SummaryView::resolve(
+            NotesState::Ready {
+                notes: Box::new(GroundedMeetingNotes {
+                    overview: vec![note("Planning.", 1)],
+                    ..GroundedMeetingNotes::default()
+                }),
+                bundle: mcp::ContextBundle::empty(),
+                source_status: insight::SourceStatus::Unavailable,
+                cached: false,
+                model: "gpt-5.4-codex".to_owned(),
+            },
+            false,
+        );
+
+        assert_eq!(
+            view.provenance,
+            vec![
+                "Summarized just now · gpt-5.4-codex".to_owned(),
+                "Sources: unavailable; the summary fell back to this recording alone.".to_owned(),
+            ],
+            "the column states who wrote the summary and on what footing"
+        );
+    }
+
+    #[test]
+    fn a_summary_with_no_supported_section_says_so_instead_of_counting_zero() {
+        let view = SummaryView::resolve(
+            NotesState::Ready {
+                notes: Box::new(GroundedMeetingNotes::default()),
+                bundle: mcp::ContextBundle::empty(),
+                source_status: insight::SourceStatus::NotSelected,
+                cached: false,
+                model: "gpt-5.4-codex".to_owned(),
+            },
+            false,
+        );
+
+        assert_eq!(
+            view.meta, "no sections supported",
+            "an empty summary never reports a section count of zero"
+        );
+        assert!(
+            view.provenance
+                .iter()
+                .any(|line| line.contains("gpt-5.4-codex")),
+            "an empty result still names the model that produced it"
+        );
+    }
+
+    #[test]
+    fn empty_notes_copy_is_honest() {
+        let view = SummaryView::resolve(NotesState::Disabled, false);
+        assert!(
+            view.pending.unwrap_or_default().contains("No summary yet"),
+            "the empty state must not imply a summary exists"
+        );
+    }
+
+    #[test]
+    fn annotation_projection_keeps_only_the_active_edit_at_its_anchor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut timeline = TimelineBuilder::new(Session::new(SessionId::new(51), target(), 0));
+        let anchor = timeline.append(
+            Duration::ZERO,
+            EventPayload::UtteranceFinal(Utterance {
+                source: Source::Mic,
+                start: Duration::ZERO,
+                end: Duration::from_secs(1),
+                text: "Anchor".to_owned(),
+                avg_logprob: -0.1,
+                annotations: vec![],
+            }),
+        );
+        let first = timeline.append_user_annotation(
+            Duration::from_secs(1),
+            anchor.id(),
+            "First",
+            MarkKind::Note,
+        )?;
+        let edit = timeline.supersede_user_annotation(
+            Duration::from_secs(2),
+            "Edited",
+            MarkKind::Important,
+            first.id(),
+        )?;
+
+        let annotations = active_annotations(timeline.events());
+        assert_eq!(annotations.len(), 1, "one active version per typed note");
+        assert_eq!(annotations[0].event_id, edit.id(), "the edit is active");
+        assert_eq!(annotations[0].text, "Edited", "the edit's text is shown");
+        assert_eq!(
+            annotations_by_anchor(timeline.events())
+                .get(&anchor.id())
+                .map(Vec::len),
+            Some(1),
+            "the note stays pinned under its anchor"
+        );
+        assert_eq!(
+            latest_anchor(timeline.events()),
+            Some(anchor.id()),
+            "the anchor is the latest transcript row"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composer_anchor_waits_for_a_transcript_row() {
+        let mut timeline = TimelineBuilder::new(Session::new(SessionId::new(52), target(), 0));
+        timeline.append(
+            Duration::ZERO,
+            EventPayload::Vad(VadSegment {
+                source: Source::Mic,
+                start: Duration::ZERO,
+                end: None,
+                kind: SpeechState::SpeechStart,
+            }),
+        );
+        assert_eq!(
+            latest_anchor(timeline.events()),
+            None,
+            "speech detection alone is not a transcript row"
+        );
+    }
+
+    #[test]
+    fn the_composer_is_labelled_with_the_moment_it_will_attach_to() {
+        let mut times = CitationTimes::new();
+        times.insert(EventId::new(4), Duration::from_secs(125));
+        times.insert(EventId::new(9), Duration::from_secs(1_802));
+
+        assert_eq!(
+            composer_anchor_label(Some(EventId::new(4)), Some(EventId::new(9)), &times),
+            "Attaches at 02:05"
+        );
+        assert_eq!(
+            composer_anchor_label(None, Some(EventId::new(9)), &times),
+            "Attaches at 30:02"
+        );
+        assert_eq!(
+            composer_anchor_label(None, None, &times),
+            "Attaches once this recording has its first transcript row"
+        );
+    }
+
+    #[test]
+    fn post_meeting_default_anchor_ignores_a_trailing_partial() {
+        let mut timeline = TimelineBuilder::new(Session::new(SessionId::new(54), target(), 0));
+        let final_row = timeline.append(
+            Duration::ZERO,
+            EventPayload::UtteranceFinal(Utterance {
+                source: Source::Mic,
+                start: Duration::ZERO,
+                end: Duration::from_secs(1),
+                text: "Final".to_owned(),
+                avg_logprob: -0.1,
+                annotations: vec![],
+            }),
+        );
+        timeline.append(
+            Duration::from_secs(1),
+            EventPayload::UtterancePartial(Utterance {
+                source: Source::Mic,
+                start: Duration::from_secs(1),
+                end: Duration::from_secs(2),
+                text: "Draft".to_owned(),
+                avg_logprob: -0.1,
+                annotations: vec![],
+            }),
+        );
+        assert_eq!(
+            last_final_anchor(timeline.events()),
+            Some(final_row.id()),
+            "a stopped recording anchors on its last settled row"
+        );
+    }
+
+    #[test]
+    fn partial_annotation_follows_supersession_chain_into_final_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut timeline = TimelineBuilder::new(Session::new(SessionId::new(53), target(), 0));
+        let first_partial = timeline.append(
+            Duration::from_millis(500),
+            EventPayload::UtterancePartial(Utterance {
+                source: Source::System,
+                start: Duration::ZERO,
+                end: Duration::from_millis(500),
+                text: "we should".to_owned(),
+                avg_logprob: -0.1,
+                annotations: vec![],
+            }),
+        );
+        let annotation = timeline.append_user_annotation(
+            Duration::from_millis(600),
+            first_partial.id(),
+            "Remember this",
+            MarkKind::Important,
+        )?;
+        let second_partial = timeline.supersede(
+            Duration::from_secs(1),
+            EventPayload::UtterancePartial(Utterance {
+                source: Source::System,
+                start: Duration::ZERO,
+                end: Duration::from_secs(1),
+                text: "we should ship".to_owned(),
+                avg_logprob: -0.1,
+                annotations: vec![],
+            }),
+            &first_partial,
+        )?;
+
+        assert_eq!(
+            resolve_transcript_anchor(timeline.events(), first_partial.id()),
+            Some(second_partial.id()),
+            "the anchor follows the supersession chain"
+        );
+        assert_eq!(
+            annotations_by_anchor(timeline.events())
+                .get(&second_partial.id())
+                .and_then(|values| values.first())
+                .map(|value| (value.event_id, value.anchor)),
+            Some((annotation.id(), first_partial.id())),
+            "the note keeps its original anchor for audit"
+        );
+
+        let final_event = timeline.supersede(
+            Duration::from_millis(1_500),
+            EventPayload::UtteranceFinal(Utterance {
+                source: Source::System,
+                start: Duration::ZERO,
+                end: Duration::from_millis(1_500),
+                text: "we should ship Friday".to_owned(),
+                avg_logprob: -0.1,
+                annotations: vec![],
+            }),
+            &second_partial,
+        )?;
+
+        assert_eq!(
+            resolve_transcript_anchor(timeline.events(), first_partial.id()),
+            Some(final_event.id()),
+            "the anchor settles on the final row"
+        );
+        assert_eq!(
+            annotations_by_anchor(timeline.events())
+                .get(&final_event.id())
+                .and_then(|values| values.first())
+                .map(|value| (value.event_id, value.anchor)),
+            Some((annotation.id(), first_partial.id())),
+            "the note is presented under the settled row"
+        );
+        Ok(())
+    }
+
+    /// The column must be built as a real render tree, not merely as strings.
+    ///
+    /// Five workspace tasks passed their suites while the app aborted on launch, because no test
+    /// built one. This one persists a summary, opens the workspace over it, and reads back the
+    /// bounds of every control the column draws.
+    mod rendered {
+        use std::{sync::Arc, time::Duration};
+
+        use futures_util::stream;
+        use gpui::{AppContext as _, Entity, Modifiers, TestAppContext, px, size};
+        use insight::MeetingNotesGenerator;
+        use providers::{
+            AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendFingerprint,
+            BackendId,
+        };
+        use rag::Store;
+        use secrecy::SecretString;
+        use sotto_core::{
+            BoxFuture, BoxStream, CancellationToken, CaptureTarget, CompletionProvider,
+            CompletionRequest, Delta, EventId, EventPayload, ProviderError, Session, SessionId,
+            Source, StopReason, TargetKind, TimelineBuilder, Usage, Utterance,
+        };
+
+        use crate::{mcp, reasoning, session};
+
+        /// The width the shipped window refuses to go below.
+        const MIN_WORKSPACE_WIDTH: gpui::Pixels = px(680.0);
+
+        struct NoOpenAiCredentials;
+
+        impl reasoning::OpenAiCredentialStore for NoOpenAiCredentials {
+            fn store(&self, _: &SecretString) -> Result<(), ProviderError> {
+                Ok(())
+            }
+
+            fn load(&self) -> Result<Option<SecretString>, ProviderError> {
+                Ok(None)
+            }
+
+            fn delete(&self) -> Result<(), ProviderError> {
+                Ok(())
+            }
+        }
+
+        struct NoMcpCredentials;
+
+        impl mcp::McpCredentialStore for NoMcpCredentials {
+            fn store(
+                &self,
+                _: &::mcp::ServerId,
+                _: &::mcp::HttpEndpoint,
+                _: &SecretString,
+            ) -> Result<(), mcp::McpUiError> {
+                Ok(())
+            }
+
+            fn load(
+                &self,
+                _: &::mcp::ServerId,
+                _: &::mcp::HttpEndpoint,
+            ) -> Result<Option<SecretString>, mcp::McpUiError> {
+                Ok(None)
+            }
+
+            fn delete(
+                &self,
+                _: &::mcp::ServerId,
+                _: &::mcp::HttpEndpoint,
+            ) -> Result<(), mcp::McpUiError> {
+                Ok(())
+            }
+        }
+
+        /// Replays one prepared summary so the persisted artifact is real, not hand-written JSON.
+        struct ReplayProvider(String);
+
+        impl CompletionProvider for ReplayProvider {
+            fn stream(
+                &self,
+                _request: CompletionRequest,
+                _cancellation: CancellationToken,
+            ) -> BoxFuture<
+                '_,
+                Result<BoxStream<'static, Result<Delta, ProviderError>>, ProviderError>,
+            > {
+                let text = self.0.clone();
+                Box::pin(async move {
+                    Ok(Box::pin(stream::iter([Ok(Delta {
+                        text,
+                        is_final: true,
+                        usage: Some(Usage::default()),
+                        stop_reason: Some(StopReason::EndTurn),
+                    })])) as BoxStream<'static, _>)
+                })
+            }
+
+            fn model_id(&self) -> &str {
+                "replay-model"
+            }
+        }
+
+        fn fingerprint() -> Result<BackendFingerprint, Box<dyn std::error::Error>> {
+            Ok(BackendDescriptor::new(
+                BackendId::new("test.replay")?,
+                "Replay",
+                "replay-model",
+                1,
+                BackendCapabilities::reasoning_baseline(),
+                AuthKind::None,
+                AuthStatus::Ready,
+            )?
+            .fingerprint()
+            .clone())
+        }
+
+        /// Persists a stopped recording with three transcript rows and no summary.
+        fn persist_recording(
+            database: &std::path::Path,
+        ) -> Result<Vec<EventId>, Box<dyn std::error::Error>> {
+            let store = Store::open(database)?;
+            let session_id = SessionId::new(41);
+            let mut record = Session::new(
+                session_id,
+                CaptureTarget {
+                    bundle_id: Some("us.zoom.xos".to_owned()),
+                    display_name: "Zoom".to_owned(),
+                    window_title: Some("Sprint 41 planning".to_owned()),
+                    kind: TargetKind::Window,
+                    audio_scoped: true,
+                },
+                1,
+            );
+            record.end(2);
+            store.save_session(&record)?;
+            let mut timeline = TimelineBuilder::new(record);
+            let mut ids = Vec::new();
+            for (index, text) in [
+                "Carry-over first: the payments retry work slipped because staging was down.",
+                "Then we're agreed — the search rewrite waits until 42.",
+                "I'll own the retry rollout checklist and have it reviewed by Thursday.",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let step = u64::try_from(index)?.saturating_add(1);
+                let offset = Duration::from_secs(120_u64.saturating_mul(step));
+                ids.push(
+                    timeline
+                        .append(
+                            offset,
+                            EventPayload::UtteranceFinal(Utterance {
+                                source: Source::System,
+                                start: offset,
+                                end: offset + Duration::from_secs(4),
+                                text: text.to_owned(),
+                                avg_logprob: -0.1,
+                                annotations: Vec::new(),
+                            }),
+                        )
+                        .id(),
+                );
+            }
+            store.append_events(timeline.events())?;
+            Ok(ids)
+        }
+
+        /// Persists a stopped recording whose summary has three sections and four citations.
+        fn recording_with_summary(
+            database: &std::path::Path,
+        ) -> Result<EventId, Box<dyn std::error::Error>> {
+            let ids = persist_recording(database)?;
+            let store = Store::open(database)?;
+            let artifact = format!(
+                r#"{{"overview":[{{"text":"Sprint 41 is scoped to payment retries and audit fixes after the staging outage pushed the retry work into the following sprint.","basis":"meeting","meeting_citations":[{first},{second}],"external_citations":[]}}],"topics":[],"decisions":[{{"text":"The search rewrite is deferred to sprint 42.","basis":"meeting","meeting_citations":[{second}],"external_citations":[]}}],"action_items":[{{"text":"Retry rollout checklist, reviewed by Thursday.","basis":"meeting","meeting_citations":[{third}],"external_citations":[],"owner":"Dana","owner_basis":"meeting","owner_meeting_citations":[{third}],"owner_external_citations":[],"due_date":"Thursday","due_date_basis":"meeting","due_date_meeting_citations":[{third}],"due_date_external_citations":[]}}],"open_questions":[],"risks":[],"follow_ups":[]}}"#,
+                first = ids[0].get(),
+                second = ids[1].get(),
+                third = ids[2].get(),
+            );
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(
+                    MeetingNotesGenerator::new(&store, Arc::new(ReplayProvider(artifact)))
+                        .with_backend_fingerprint(fingerprint()?)
+                        .generate_grounded_with_cancellation(
+                            SessionId::new(41),
+                            None,
+                            CancellationToken::new(),
+                        ),
+                )?;
+            Ok(ids[1])
+        }
+
+        /// Opens the workspace over the persisted summary at the narrowest supported width.
+        fn open_summarized_workspace<'window>(
+            cx: &'window mut TestAppContext,
+            dir: &std::path::Path,
+            database: std::path::PathBuf,
+        ) -> (
+            Entity<crate::workspace::MeetingWorkspace>,
+            &'window mut gpui::VisualTestContext,
+        ) {
+            cx.update(gpui_component::init);
+            let reasoning_path = dir.join("reasoning.json");
+            let mcp_path = dir.join("mcp.json");
+            let (ingress, timeline) = cx.update(|cx| crate::devwindow::attach_ingress(cx, 16));
+            let session = cx.new(|_| session::SessionController::new(ingress));
+            let reasoning = cx.new(|_| {
+                reasoning::ReasoningController::load(reasoning_path, Arc::new(NoOpenAiCredentials))
+            });
+            let mcp_controller =
+                cx.new(|_| mcp::McpController::load(Some(mcp_path), Arc::new(NoMcpCredentials)));
+            cx.add_window_view(move |window, cx| {
+                crate::workspace::MeetingWorkspace::new(
+                    database,
+                    timeline,
+                    reasoning,
+                    session,
+                    mcp_controller,
+                    window,
+                    cx,
+                )
+            })
+        }
+
+        /// Asserts every named control renders wholly inside the notes column.
+        fn assert_in_column(
+            visual: &mut gpui::VisualTestContext,
+            selectors: &[&'static str],
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            for selector in selectors {
+                let column = visual
+                    .debug_bounds("notes-column")
+                    .ok_or_else(|| std::io::Error::other("the summary column must render"))?;
+                let bounds = visual.debug_bounds(selector).ok_or_else(|| {
+                    std::io::Error::other(format!("{selector} must render in the column"))
+                })?;
+                assert!(
+                    bounds.size.width > px(0.0),
+                    "{selector} must keep a visible width"
+                );
+                assert!(
+                    bounds.left() >= column.left() && bounds.right() <= column.right(),
+                    "{selector} must stay wholly inside the column at the minimum window width"
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn the_summary_reads_as_prose_and_gives_up_its_evidence_only_when_asked()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let dir = tempfile::tempdir()?;
+            let database = dir.path().join("sotto.sqlite3");
+            let cited = recording_with_summary(&database)?;
+
+            let mut cx = TestAppContext::single();
+            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
+            visual.simulate_resize(size(MIN_WORKSPACE_WIDTH, px(720.0)));
+            // A stopped session must be open for the review stage to mount the notes column.
+            visual.update(|_, cx| {
+                workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
+            });
+            visual.refresh()?;
+            visual.run_until_parked();
+
+            // The default is prose. Three claims, four citations between them, no chip drawn.
+            for hidden in [
+                "summary-citation-0-0",
+                "summary-citation-0-1",
+                "summary-citation-1-0",
+                "summary-citation-2-0",
+            ] {
+                assert!(
+                    visual.debug_bounds(hidden).is_none(),
+                    "{hidden} must stay hidden until a reader asks for it"
+                );
+            }
+            assert_in_column(
+                visual,
+                &[
+                    "notes-head-row",
+                    "summarize-control",
+                    "your-notes-block",
+                    "summary-area",
+                    "notes-composer",
+                    "append-note-control",
+                    "summary-evidence-toggle",
+                    "summary-claim-0",
+                    "summary-claim-1",
+                    "summary-claim-2",
+                    // No MCP source is configured in this fixture, so the block is one quiet line.
+                    "source-context-quiet",
+                ],
+            )?;
+            assert!(
+                visual.debug_bounds("summary-pending").is_none(),
+                "a summarized recording must not also render the pending state"
+            );
+            assert!(
+                visual.debug_bounds("source-context-block").is_none(),
+                "with nothing configured the sources policy must not be drawn over an empty list"
+            );
+
+            // A per-claim control would be a second way to do this. There is exactly one, because
+            // twenty of them cost more vertical space than the chips they were hiding.
+            for absent in [
+                "summary-evidence-0",
+                "summary-evidence-1",
+                "summary-evidence-2",
+            ] {
+                assert!(
+                    visual.debug_bounds(absent).is_none(),
+                    "{absent} must not exist: one control governs the whole summary"
+                );
+            }
+
+            // The one toggle reveals every claim's evidence at once.
+            let toggle = visual
+                .debug_bounds("summary-evidence-toggle")
+                .ok_or_else(|| std::io::Error::other("the summary evidence toggle must render"))?;
+            visual.simulate_click(toggle.center(), Modifiers::none());
+            visual.run_until_parked();
+            assert_in_column(
+                visual,
+                &[
+                    "summary-citation-0-0",
+                    "summary-citation-0-1",
+                    "summary-citation-1-0",
+                    "summary-citation-2-0",
+                ],
+            )?;
+
+            // Every revealed chip still resolves to the transcript row it cites.
+            let chip = visual.debug_bounds("summary-citation-0-1").ok_or_else(|| {
+                std::io::Error::other("the overview's second citation chip must render")
+            })?;
+            visual.simulate_click(chip.center(), Modifiers::none());
+            visual.run_until_parked();
+            assert_eq!(
+                visual.update(|_, cx| workspace.read(cx).focused_event),
+                Some(cited),
+                "following a citation must land on the transcript row it cites"
+            );
+            Ok(())
+        }
+
+        /// With a source configured, the policy governs live controls and is stated over them.
+        #[test]
+        fn a_configured_source_states_its_policy_where_the_controls_are()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let dir = tempfile::tempdir()?;
+            let database = dir.path().join("sotto.sqlite3");
+            let _ = recording_with_summary(&database)?;
+            std::fs::write(
+                dir.path().join("mcp.json"),
+                r#"{"version":1,"servers":[{"id":"project-docs","display_name":"Project docs","endpoint":"https://sources.example/mcp"}],"grants":[]}"#,
+            )?;
+
+            let mut cx = TestAppContext::single();
+            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
+            visual.simulate_resize(size(MIN_WORKSPACE_WIDTH, px(720.0)));
+            visual.update(|_, cx| {
+                workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
+            });
+            visual.refresh()?;
+            visual.run_until_parked();
+
+            assert!(
+                visual.debug_bounds("source-context-quiet").is_none(),
+                "with a source configured the quiet line gives way to the policy it replaces"
+            );
+            assert_in_column(visual, &["source-context-block"])?;
+            Ok(())
+        }
+
+        /// Summary and typed-note text can be selected with the mouse and copied to the clipboard.
+        ///
+        /// The maintainer's complaint was that a line could not be lifted out of a summary. This
+        /// drags across a rendered claim and presses the copy binding, then reads the real
+        /// clipboard — a selectable flag asserted in isolation would prove nothing about whether
+        /// the text is reachable in the tree the column actually builds.
+        #[test]
+        fn a_summary_claim_can_be_selected_and_copied() -> Result<(), Box<dyn std::error::Error>> {
+            let dir = tempfile::tempdir()?;
+            let database = dir.path().join("sotto.sqlite3");
+            let _ = recording_with_summary(&database)?;
+
+            let mut cx = TestAppContext::single();
+            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
+            visual.simulate_resize(size(px(900.0), px(720.0)));
+            visual.update(|_, cx| {
+                workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
+            });
+            visual.refresh()?;
+            visual.run_until_parked();
+            // The markdown parse is debounced off the render thread; let it land.
+            visual.executor().advance_clock(Duration::from_millis(500));
+            visual.run_until_parked();
+            visual.refresh()?;
+            visual.run_until_parked();
+
+            let claim = visual
+                .debug_bounds("summary-claim-0")
+                .ok_or_else(|| std::io::Error::other("the first claim must render"))?;
+            let start = gpui::point(claim.left() + px(2.0), claim.top() + px(4.0));
+            let end = gpui::point(claim.right() - px(2.0), claim.bottom() - px(4.0));
+            visual.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+            visual.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+            visual.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+            visual.run_until_parked();
+            visual.simulate_keystrokes("cmd-c");
+            visual.run_until_parked();
+
+            let copied = visual
+                .update(|_, cx| cx.read_from_clipboard())
+                .and_then(|item| item.text())
+                .unwrap_or_default();
+            assert!(
+                copied.contains("Sprint 41"),
+                "a reader must be able to copy a line out of the summary, got {copied:?}"
+            );
+            Ok(())
+        }
+
+        /// The display toggle is not a licence to relax the evidence contract.
+        ///
+        /// T076 hides chips by default, which would be a quiet disaster if it also softened what a
+        /// claim must carry. This runs the real generator over the real store twice: once with a
+        /// claim that cites nothing, and once with a claim citing a transcript row that does not
+        /// exist. Neither may become notes the column could draw.
+        #[test]
+        fn an_unsupported_claim_still_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+            let dir = tempfile::tempdir()?;
+            let database = dir.path().join("sotto.sqlite3");
+            let ids = persist_recording(&database)?;
+            let store = Store::open(&database)?;
+
+            let generate = |artifact: String| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(Box::<dyn std::error::Error>::from)
+                    .and_then(|runtime| {
+                        Ok(runtime.block_on(
+                            MeetingNotesGenerator::new(&store, Arc::new(ReplayProvider(artifact)))
+                                .with_backend_fingerprint(fingerprint()?)
+                                .generate_grounded_with_cancellation(
+                                    SessionId::new(41),
+                                    None,
+                                    CancellationToken::new(),
+                                ),
+                        ))
+                    })
+            };
+
+            let uncited = generate(claim_artifact("The team agreed to ship on Friday.", ""))?;
+            let Err(uncited) = uncited else {
+                return Err(std::io::Error::other(
+                    "a claim carrying no evidence must never become notes",
+                )
+                .into());
+            };
+            assert!(
+                matches!(
+                    uncited,
+                    insight::MeetingNotesError::MissingCitation { .. }
+                        | insight::MeetingNotesError::InvalidEvidenceBasis { .. }
+                ),
+                "an uncited claim must be rejected as unevidenced, got {uncited}"
+            );
+
+            let phantom = ids
+                .iter()
+                .map(|id| id.get())
+                .max()
+                .unwrap_or_default()
+                .saturating_add(500);
+            let unknown = generate(claim_artifact(
+                "The team agreed to ship on Friday.",
+                &phantom.to_string(),
+            ))?;
+            let Err(unknown) = unknown else {
+                return Err(std::io::Error::other(
+                    "a claim citing a row that does not exist must never become notes",
+                )
+                .into());
+            };
+            assert!(
+                matches!(unknown, insight::MeetingNotesError::UnknownCitation { .. }),
+                "every citation must resolve to a real transcript row, got {unknown}"
+            );
+            Ok(())
+        }
+
+        /// One overview claim with exactly the citation list given.
+        fn claim_artifact(text: &str, citations: &str) -> String {
+            format!(
+                r#"{{"overview":[{{"text":"{text}","basis":"meeting","meeting_citations":[{citations}],"external_citations":[]}}],"topics":[],"decisions":[],"action_items":[],"open_questions":[],"risks":[],"follow_ups":[]}}"#
+            )
+        }
+    }
+}

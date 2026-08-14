@@ -1,11 +1,12 @@
 //! macOS ScreenCaptureKit system-audio/frame capture plus a CPAL microphone.
 
 use std::{
-    ffi::{CStr, c_char, c_float, c_int, c_uchar, c_void},
+    ffi::{CStr, CString, c_char, c_float, c_int, c_uchar, c_void},
+    path::{Path, PathBuf},
     slice,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -25,7 +26,7 @@ const AUDIO_POOL_SIZE: usize = 32;
 const MAX_AUDIO_PACKET_SAMPLES: usize = 16_384;
 
 type AudioCallback = unsafe extern "C" fn(*mut c_void, *const c_float, usize, u64, u64);
-type ErrorCallback = unsafe extern "C" fn(*mut c_void, c_int);
+type ErrorCallback = unsafe extern "C" fn(*mut c_void, c_int, *const c_char);
 type FrameCallback =
     unsafe extern "C" fn(*mut c_void, *const c_uchar, usize, u32, u32, u32, u32, u64, u64);
 type TargetCallback = unsafe extern "C" fn(
@@ -44,6 +45,7 @@ struct BridgeConfig {
     error: ErrorCallback,
     frame: FrameCallback,
     context: *mut c_void,
+    recording_path: *const c_char,
 }
 
 unsafe extern "C" {
@@ -53,7 +55,30 @@ unsafe extern "C" {
         config: *const BridgeConfig,
         target: *mut c_void,
     ) -> *mut c_void;
+    fn sotto_capture_start_microphone_only(config: *const BridgeConfig) -> *mut c_void;
     fn sotto_capture_stop(handle: *mut c_void);
+    fn sotto_capture_append_microphone(
+        handle: *mut c_void,
+        samples: *const c_float,
+        count: usize,
+        sample_rate: u32,
+        channels: u32,
+        stream_time_ns: u64,
+    );
+    fn sotto_recording_probe(
+        path: *const c_char,
+        duration_ns: *mut u64,
+        byte_size: *mut u64,
+        first_video_ns: *mut u64,
+        seek_video_ns: *mut u64,
+    ) -> bool;
+    fn sotto_recording_committed_duration(
+        path: *const c_char,
+        duration_ns: *mut u64,
+        byte_size: *mut u64,
+    ) -> bool;
+    #[cfg(test)]
+    fn sotto_recording_append_pts_probe(input: *const i64, output: *mut i64, count: usize) -> bool;
     fn sotto_capture_permission_status() -> c_int;
     fn sotto_capture_request_permission() -> bool;
     fn sotto_capture_open_permission_settings() -> bool;
@@ -138,6 +163,30 @@ struct CallbackState {
     free_frames: Arc<ArrayQueue<RawFrame>>,
     ready_frames: Arc<ArrayQueue<RawFrame>>,
     dropped_frames: Arc<AtomicU64>,
+    session_clock: SessionClock,
+}
+
+/// One Rust-owned monotonic epoch shared by every capture callback in a session.
+/// Native device/SCK timestamps remain source metadata and never become timeline time.
+#[derive(Clone, Copy)]
+struct SessionClock {
+    origin: Instant,
+}
+
+impl SessionClock {
+    fn start() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+
+    fn now(self) -> (Instant, Duration) {
+        let captured_at = Instant::now();
+        (
+            captured_at,
+            captured_at.saturating_duration_since(self.origin),
+        )
+    }
 }
 
 /// Observable native capture lifecycle used by consent indicators and pipeline wiring.
@@ -210,6 +259,8 @@ pub struct MacCapture {
     dropped_frames: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
     audio_worker: Option<JoinHandle<()>>,
+    recording_path: Option<CString>,
+    native_handle: Arc<AtomicPtr<c_void>>,
 }
 
 /// A macOS capture backend carrying proof of a system-picker selection.
@@ -218,6 +269,27 @@ pub struct MacCapture {
 pub struct PickedMacCapture {
     capture: MacCapture,
     target: PickedTarget,
+}
+
+/// Media metadata read from a finalized or fragmented recording on disk.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordingProbe {
+    pub path: PathBuf,
+    pub duration: Duration,
+    pub byte_size: u64,
+    /// Presentation timestamp of the first frame successfully decoded by AVAssetReader.
+    pub first_video_timestamp: Option<Duration>,
+    /// First presentation timestamp returned after requesting a range near the media end.
+    /// AVAssetReader may return the preceding sync sample, so this can predate the range start.
+    pub seek_video_timestamp: Option<Duration>,
+}
+
+/// Metadata available from the committed prefix of a recording that is still growing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedRecordingProbe {
+    pub path: PathBuf,
+    pub duration: Duration,
+    pub byte_size: u64,
 }
 
 // SAFETY: the native handle is only passed back to the bridge; callback state is synchronized.
@@ -239,7 +311,16 @@ impl MacCapture {
             dropped_frames: Arc::new(AtomicU64::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             audio_worker: None,
+            recording_path: None,
+            native_handle: Arc::new(AtomicPtr::new(std::ptr::null_mut())),
         }
+    }
+
+    /// Creates the strictly smaller capture mode that uses CPAL only: no picker,
+    /// ScreenCaptureKit filter, application audio, or screen frames.
+    #[must_use]
+    pub fn microphone_only() -> Self {
+        Self::new()
     }
 
     pub fn subscribe_errors(&self) -> broadcast::Receiver<CaptureError> {
@@ -274,6 +355,9 @@ impl MacCapture {
     /// on a runtime that owns the main thread deadlocks, because the thread that
     /// would deliver the choice is the thread that is waiting for it.
     pub async fn pick_target() -> Option<PickedTarget> {
+        if !Self::ensure_permission() {
+            return None;
+        }
         let (sender, receiver) = oneshot::channel();
         let state = Box::into_raw(Box::new(TargetCallbackState(Some(sender))));
         // SAFETY: the callback reclaims `state`; the bridge invokes it exactly once.
@@ -288,6 +372,9 @@ impl MacCapture {
     /// is no timeout, because waiting on a person is not a stall.
     #[must_use]
     pub fn pick_target_blocking() -> Option<PickedTarget> {
+        if !Self::ensure_permission() {
+            return None;
+        }
         let (sender, mut receiver) = oneshot::channel();
         let state = Box::into_raw(Box::new(TargetCallbackState(Some(sender))));
         // SAFETY: the callback reclaims `state`; the bridge invokes it exactly once.
@@ -320,6 +407,10 @@ impl MacCapture {
         unsafe { sotto_capture_request_permission() }
     }
 
+    fn ensure_permission() -> bool {
+        Self::permission_status() == PermissionStatus::Authorized || Self::request_permission()
+    }
+
     /// Opens the Screen & System Audio Recording pane for re-grant after denial/revocation.
     #[must_use]
     pub fn open_permission_settings() -> bool {
@@ -338,6 +429,7 @@ impl MacCapture {
         &mut self,
         free_audio: Arc<ArrayQueue<AudioPacket>>,
         ready_audio: Arc<ArrayQueue<AudioPacket>>,
+        session_clock: SessionClock,
     ) -> Result<(), CaptureError> {
         let host = cpal::default_host();
         let device =
@@ -350,10 +442,10 @@ impl MacCapture {
         })?;
         let sample_rate = supported.sample_rate();
         let channels = usize::from(supported.channels());
-        let mut mic_origin = None;
         let sequence = Arc::new(AtomicU64::new(0));
         let sequence_callback = Arc::clone(&sequence);
         let errors = self.error_tx.clone();
+        let native_handle = Arc::clone(&self.native_handle);
         let error_callback = move |error| {
             let _ = errors.send(CaptureError::StreamFailed(format!(
                 "microphone stream: {error}"
@@ -363,9 +455,8 @@ impl MacCapture {
         let stream = match supported.sample_format() {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 config,
-                move |data: &[f32], info| {
-                    let captured = info.timestamp().capture;
-                    let origin = *mic_origin.get_or_insert(captured);
+                move |data: &[f32], _info| {
+                    let (capture_ts, stream_offset) = session_clock.now();
                     queue_audio(
                         &free_audio,
                         &ready_audio,
@@ -375,10 +466,27 @@ impl MacCapture {
                             sample_rate,
                             channels,
                             sequence: sequence_callback.fetch_add(1, Ordering::Relaxed),
-                            stream_offset: captured.duration_since(origin),
-                            capture_ts: Instant::now(),
+                            stream_offset,
+                            capture_ts,
                         },
-                    )
+                    );
+                    let handle = native_handle.load(Ordering::Acquire);
+                    if !handle.is_null() {
+                        let channel_count = u32::try_from(channels).unwrap_or(u32::MAX);
+                        let stream_ns = u64::try_from(stream_offset.as_nanos()).unwrap_or(u64::MAX);
+                        // SAFETY: the bridge copies callback-scoped samples synchronously. The
+                        // native handle remains retained until the mic stream is stopped.
+                        unsafe {
+                            sotto_capture_append_microphone(
+                                handle,
+                                data.as_ptr(),
+                                data.len(),
+                                sample_rate,
+                                channel_count,
+                                stream_ns,
+                            );
+                        }
+                    }
                 },
                 error_callback,
                 None,
@@ -397,9 +505,9 @@ impl MacCapture {
         Ok(())
     }
 
-    fn start(
+    fn start_capture(
         &mut self,
-        target: &PickedTarget,
+        target: Option<&PickedTarget>,
         sink: broadcast::Sender<AudioFrame>,
     ) -> Result<(), CaptureError> {
         if self.status() != CaptureStatus::Stopped {
@@ -407,6 +515,7 @@ impl MacCapture {
                 "capture is already active".to_owned(),
             ));
         }
+        let session_clock = SessionClock::start();
         let free_audio = Arc::new(ArrayQueue::new(AUDIO_POOL_SIZE));
         let ready_audio = Arc::new(ArrayQueue::new(AUDIO_POOL_SIZE));
         for _ in 0..AUDIO_POOL_SIZE {
@@ -439,7 +548,11 @@ impl MacCapture {
             }
         };
         self.audio_worker = Some(worker);
-        if let Err(error) = self.start_mic(Arc::clone(&free_audio), Arc::clone(&ready_audio)) {
+        if let Err(error) = self.start_mic(
+            Arc::clone(&free_audio),
+            Arc::clone(&ready_audio),
+            session_clock,
+        ) {
             self.reset_local_start();
             let _ = self.audio_worker.take();
             return Err(error);
@@ -467,6 +580,7 @@ impl MacCapture {
             free_frames: Arc::clone(&free_frames),
             ready_frames: Arc::clone(&ready_frames),
             dropped_frames: Arc::clone(&self.dropped_frames),
+            session_clock,
         });
         let state_ptr = Box::into_raw(state);
         let config = BridgeConfig {
@@ -474,9 +588,22 @@ impl MacCapture {
             error: error_callback,
             frame: frame_callback,
             context: state_ptr.cast(),
+            recording_path: self
+                .recording_path
+                .as_ref()
+                .map_or(std::ptr::null(), |path| path.as_ptr()),
         };
         // SAFETY: config is read synchronously and state remains boxed until stop.
-        let handle = unsafe { sotto_capture_start_with_target(&raw const config, target.handle) };
+        let handle = match target {
+            Some(target) => {
+                // SAFETY: config is read synchronously and the picker retains target.filter.
+                unsafe { sotto_capture_start_with_target(&raw const config, target.handle) }
+            }
+            None => {
+                // SAFETY: config is read synchronously; this entrypoint creates no SCK objects.
+                unsafe { sotto_capture_start_microphone_only(&raw const config) }
+            }
+        };
         if handle.is_null() {
             // SAFETY: the bridge rejected the config synchronously and cannot retain the context.
             unsafe { drop(Box::from_raw(state_ptr)) };
@@ -486,15 +613,19 @@ impl MacCapture {
                 "ScreenCaptureKit start rejected configuration".to_owned(),
             ));
         }
-        self.frame_receiver = Some(FrameReceiver {
+        self.frame_receiver = target.map(|_| FrameReceiver {
             free: free_frames,
             ready: ready_frames,
         });
         self.handle = handle;
+        self.native_handle.store(handle, Ordering::Release);
         Ok(())
     }
 
     fn stop_inner(&mut self) {
+        self.mic_stream = None;
+        self.native_handle
+            .store(std::ptr::null_mut(), Ordering::Release);
         if !self.handle.is_null() {
             self.status
                 .store(CaptureStatus::Stopping.code(), Ordering::Release);
@@ -503,13 +634,31 @@ impl MacCapture {
             unsafe { sotto_capture_stop(self.handle) };
             self.handle = std::ptr::null_mut();
         }
-        self.mic_stream = None;
         // The stopped callback owns context reclamation and terminates the audio worker.
         let _ = self.audio_worker.take();
+    }
+
+    /// Selects the managed audio-only MP4 path before microphone capture starts.
+    pub fn record_to(&mut self, path: &Path) -> Result<(), CaptureError> {
+        if self.status() != CaptureStatus::Stopped {
+            return Err(CaptureError::StreamFailed(
+                "recording path cannot change after capture starts".to_owned(),
+            ));
+        }
+        let encoded = path.to_string_lossy();
+        self.recording_path = Some(CString::new(encoded.as_bytes()).map_err(|_| {
+            CaptureError::Unsupported("recording path contains a NUL byte".to_owned())
+        })?);
+        Ok(())
     }
 }
 
 impl PickedMacCapture {
+    /// Selects the managed MP4 path before capture starts.
+    pub fn record_to(&mut self, path: &Path) -> Result<(), CaptureError> {
+        self.capture.record_to(path)
+    }
+
     pub fn subscribe_errors(&self) -> broadcast::Receiver<CaptureError> {
         self.capture.subscribe_errors()
     }
@@ -533,9 +682,73 @@ impl PickedMacCapture {
     }
 }
 
+/// Reads the actual media duration and byte size from a playable recording.
+pub fn probe_recording(path: &Path) -> Result<RecordingProbe, CaptureError> {
+    let encoded = path.to_string_lossy();
+    let path_c = CString::new(encoded.as_bytes())
+        .map_err(|_| CaptureError::Unsupported("recording path contains a NUL byte".to_owned()))?;
+    let mut duration_ns = 0_u64;
+    let mut byte_size = 0_u64;
+    let mut first_video_ns = 0_u64;
+    let mut seek_video_ns = 0_u64;
+    // SAFETY: the path is NUL-terminated and output pointers are valid for this call.
+    let readable = unsafe {
+        sotto_recording_probe(
+            path_c.as_ptr(),
+            &raw mut duration_ns,
+            &raw mut byte_size,
+            &raw mut first_video_ns,
+            &raw mut seek_video_ns,
+        )
+    };
+    if !readable {
+        return Err(CaptureError::StreamFailed(format!(
+            "recording is not playable: {}",
+            path.display()
+        )));
+    }
+    Ok(RecordingProbe {
+        path: path.to_path_buf(),
+        duration: Duration::from_nanos(duration_ns),
+        byte_size,
+        first_video_timestamp: (first_video_ns != u64::MAX)
+            .then(|| Duration::from_nanos(first_video_ns)),
+        seek_video_timestamp: (seek_video_ns != u64::MAX)
+            .then(|| Duration::from_nanos(seek_video_ns)),
+    })
+}
+
+/// Reads the duration and current size of a growing recording without requiring an end seek.
+pub fn probe_committed_recording(path: &Path) -> Result<CommittedRecordingProbe, CaptureError> {
+    let encoded = path.to_string_lossy();
+    let path_c = CString::new(encoded.as_bytes())
+        .map_err(|_| CaptureError::Unsupported("recording path contains a NUL byte".to_owned()))?;
+    let mut duration_ns = 0_u64;
+    let mut byte_size = 0_u64;
+    // SAFETY: the path is NUL-terminated and output pointers are valid for this call.
+    let readable = unsafe {
+        sotto_recording_committed_duration(
+            path_c.as_ptr(),
+            &raw mut duration_ns,
+            &raw mut byte_size,
+        )
+    };
+    if !readable {
+        return Err(CaptureError::StreamFailed(format!(
+            "recording has no readable committed duration: {}",
+            path.display()
+        )));
+    }
+    Ok(CommittedRecordingProbe {
+        path: path.to_path_buf(),
+        duration: Duration::from_nanos(duration_ns),
+        byte_size,
+    })
+}
+
 impl CaptureBackend for PickedMacCapture {
     fn start(&mut self, sink: broadcast::Sender<AudioFrame>) -> Result<(), CaptureError> {
-        self.capture.start(&self.target, sink)
+        self.capture.start_capture(Some(&self.target), sink)
     }
 
     fn stop(&mut self) {
@@ -544,6 +757,22 @@ impl CaptureBackend for PickedMacCapture {
 
     fn permission_status(&self) -> PermissionStatus {
         MacCapture::permission_status()
+    }
+}
+
+impl CaptureBackend for MacCapture {
+    fn start(&mut self, sink: broadcast::Sender<AudioFrame>) -> Result<(), CaptureError> {
+        self.start_capture(None, sink)
+    }
+
+    fn stop(&mut self) {
+        self.stop_inner();
+    }
+
+    fn permission_status(&self) -> PermissionStatus {
+        // CPAL owns the microphone permission prompt/error. This mode deliberately never queries
+        // ScreenCaptureKit's Screen & System Audio Recording permission.
+        PermissionStatus::Authorized
     }
 }
 
@@ -765,7 +994,7 @@ unsafe extern "C" fn audio_callback(
     samples: *const c_float,
     count: usize,
     sequence: u64,
-    stream_ns: u64,
+    _native_stream_ns: u64,
 ) {
     if context.is_null() || samples.is_null() {
         return;
@@ -777,22 +1006,25 @@ unsafe extern "C" fn audio_callback(
             slice::from_raw_parts(samples, count),
         )
     };
+    let (capture_ts, stream_offset) = state.session_clock.now();
     queue_audio(
         &state.free_audio,
         &state.ready_audio,
         input,
         AudioPacketMeta {
             source: Source::System,
+            // The bridge validates the actual CMAudioFormatDescription and emits -7
+            // instead of invoking this metadata-free callback unless it is exactly 48 kHz.
             sample_rate: 48_000,
             channels: 1,
             sequence,
-            stream_offset: Duration::from_nanos(stream_ns),
-            capture_ts: Instant::now(),
+            stream_offset,
+            capture_ts,
         },
     );
 }
 
-unsafe extern "C" fn error_callback(context: *mut c_void, code: c_int) {
+unsafe extern "C" fn error_callback(context: *mut c_void, code: c_int, detail: *const c_char) {
     if context.is_null() {
         return;
     }
@@ -847,15 +1079,46 @@ unsafe extern "C" fn error_callback(context: *mut c_void, code: c_int) {
                 .store(CaptureStatus::UserStopped.code(), Ordering::Release);
             let _ = state.status_sink.send(CaptureStatus::UserStopped);
         }
+        -7 => {
+            state.running.store(false, Ordering::Release);
+            state
+                .status
+                .store(CaptureStatus::Failed.code(), Ordering::Release);
+            let _ = state.status_sink.send(CaptureStatus::Failed);
+            let _ = state.error_sink.send(CaptureError::StreamFailed(
+                "ScreenCaptureKit supplied an unsupported system-audio buffer".to_owned(),
+            ));
+        }
+        -8 => {
+            state.running.store(false, Ordering::Release);
+            state
+                .status
+                .store(CaptureStatus::Failed.code(), Ordering::Release);
+            let detail = if detail.is_null() {
+                "the native media writer reported an unknown failure".to_owned()
+            } else {
+                // SAFETY: the bridge guarantees callback-scoped, NUL-terminated UTF-8 detail.
+                unsafe { CStr::from_ptr(detail) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let _ = state.error_sink.send(CaptureError::StreamFailed(format!(
+                "Local recording stopped because {detail}. Capture stopped; the committed recording prefix was kept."
+            )));
+            let _ = state.status_sink.send(CaptureStatus::Failed);
+        }
         _ => {
             state.running.store(false, Ordering::Release);
             state
                 .status
                 .store(CaptureStatus::Failed.code(), Ordering::Release);
             let _ = state.status_sink.send(CaptureStatus::Failed);
-            let _ = state.error_sink.send(CaptureError::StreamFailed(format!(
-                "ScreenCaptureKit error {code}"
-            )));
+            let detail = copy_callback_string(detail);
+            let message = detail.map_or_else(
+                || format!("ScreenCaptureKit error {code}"),
+                |detail| format!("ScreenCaptureKit error {code}: {detail}"),
+            );
+            let _ = state.error_sink.send(CaptureError::StreamFailed(message));
         }
     }
 }
@@ -868,8 +1131,8 @@ unsafe extern "C" fn frame_callback(
     height: u32,
     stride: u32,
     pixel_format: u32,
-    stream_time_ns: u64,
-    host_time_ns: u64,
+    _native_stream_time_ns: u64,
+    _native_host_time_ns: u64,
 ) {
     if context.is_null() || bytes.is_null() || length > MAX_FRAME_BYTES {
         return;
@@ -891,8 +1154,10 @@ unsafe extern "C" fn frame_callback(
     frame.height = height;
     frame.stride = stride;
     frame.pixel_format = pixel_format;
-    frame.stream_time_ns = stream_time_ns;
-    frame.host_time_ns = host_time_ns;
+    let (_, session_time) = state.session_clock.now();
+    let session_time_ns = u64::try_from(session_time.as_nanos()).unwrap_or(u64::MAX);
+    frame.stream_time_ns = session_time_ns;
+    frame.host_time_ns = session_time_ns;
     if state.ready_frames.push(frame).is_err() {
         state.dropped_frames.fetch_add(1, Ordering::Relaxed);
     }
@@ -900,7 +1165,7 @@ unsafe extern "C" fn frame_callback(
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureStatus, Resampler};
+    use super::*;
 
     #[test]
     fn capture_status_codes_round_trip() {
@@ -979,5 +1244,197 @@ mod tests {
             whole.iter().zip(&split).all(|(a, b)| (a - b).abs() < 0.001),
             "packet boundaries must not perturb interpolation"
         );
+    }
+
+    #[test]
+    fn repeated_and_out_of_order_pts_are_nudged_before_writer_append() {
+        let input = [0_i64, 0, -1, 1_000_000_000, 500_000_000];
+        let mut writer_pts = [0_i64; 5];
+
+        // SAFETY: both arrays remain valid for the complete synchronous native probe call.
+        let accepted = unsafe {
+            sotto_recording_append_pts_probe(input.as_ptr(), writer_pts.as_mut_ptr(), input.len())
+        };
+
+        assert!(
+            accepted,
+            "the native append timestamp gate should accept valid PTS values"
+        );
+        assert_eq!(writer_pts, [0, 1, 2, 1_000_000_000, 1_000_000_001]);
+        assert!(
+            writer_pts.windows(2).all(|pair| pair[0] < pair[1]),
+            "AVAssetWriter must only receive strictly increasing per-input PTS values"
+        );
+    }
+
+    #[test]
+    fn native_uptime_timestamps_cannot_enter_session_timeline_time() {
+        let (error_sink, _) = broadcast::channel(1);
+        let (status_sink, _) = broadcast::channel(1);
+        let free_audio = Arc::new(ArrayQueue::new(1));
+        let ready_audio = Arc::new(ArrayQueue::new(1));
+        let free_frames = Arc::new(ArrayQueue::new(1));
+        let ready_frames = Arc::new(ArrayQueue::new(1));
+        let _ = free_audio.push(AudioPacket {
+            samples: Vec::with_capacity(1),
+            source: Source::Mic,
+            sample_rate: OUTPUT_RATE,
+            channels: 1,
+            sequence: 0,
+            stream_offset: Duration::ZERO,
+            capture_ts: Instant::now(),
+        });
+        let _ = free_frames.push(RawFrame {
+            bytes: Vec::with_capacity(4),
+            width: 0,
+            height: 0,
+            stride: 0,
+            pixel_format: 0,
+            stream_time_ns: 0,
+            host_time_ns: 0,
+        });
+        let session_clock = SessionClock {
+            origin: Instant::now() - Duration::from_secs(2),
+        };
+        let state = Box::into_raw(Box::new(CallbackState {
+            error_sink,
+            status_sink,
+            status: Arc::new(AtomicU8::new(CaptureStatus::Running.code())),
+            running: Arc::new(AtomicBool::new(true)),
+            free_audio,
+            ready_audio: Arc::clone(&ready_audio),
+            free_frames,
+            ready_frames: Arc::clone(&ready_frames),
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+            session_clock,
+        }));
+        let sample = [0.25_f32];
+        let frame_bytes = [0_u8; 4];
+        let uptime_ns = 223_547_000_000_000_u64;
+
+        // SAFETY: callback state and both input arrays remain live for these synchronous calls.
+        unsafe {
+            audio_callback(state.cast(), sample.as_ptr(), sample.len(), 7, uptime_ns);
+            frame_callback(
+                state.cast(),
+                frame_bytes.as_ptr(),
+                frame_bytes.len(),
+                1,
+                1,
+                4,
+                0,
+                uptime_ns,
+                uptime_ns,
+            );
+        }
+
+        let audio = ready_audio
+            .pop()
+            .ok_or("system audio callback did not queue a packet");
+        let frame = ready_frames
+            .pop()
+            .ok_or("screen callback did not queue a frame");
+        assert!(audio.is_ok(), "system audio must reach the capture seam");
+        assert!(frame.is_ok(), "screen frame must reach the capture seam");
+        if let (Ok(audio), Ok(frame)) = (audio, frame) {
+            let elapsed = session_clock.origin.elapsed();
+            assert_eq!(audio.source, Source::System);
+            assert!(audio.stream_offset <= elapsed);
+            assert!(Duration::from_nanos(frame.stream_time_ns) <= elapsed);
+            assert!(Duration::from_nanos(frame.host_time_ns) <= elapsed);
+            assert_ne!(audio.stream_offset, Duration::from_nanos(uptime_ns));
+            assert_ne!(frame.stream_time_ns, uptime_ns);
+            assert_ne!(frame.host_time_ns, uptime_ns);
+        }
+        // SAFETY: no terminal callback reclaimed the state; this test remains its sole owner.
+        unsafe { drop(Box::from_raw(state)) };
+    }
+
+    #[test]
+    fn unreadable_system_audio_fails_closed_with_typed_error() {
+        let (error_sink, mut errors) = broadcast::channel(1);
+        let (status_sink, mut statuses) = broadcast::channel(1);
+        let running = Arc::new(AtomicBool::new(true));
+        let status = Arc::new(AtomicU8::new(CaptureStatus::Running.code()));
+        let state = Box::new(CallbackState {
+            error_sink,
+            status_sink,
+            status: Arc::clone(&status),
+            running: Arc::clone(&running),
+            free_audio: Arc::new(ArrayQueue::new(1)),
+            ready_audio: Arc::new(ArrayQueue::new(1)),
+            free_frames: Arc::new(ArrayQueue::new(1)),
+            ready_frames: Arc::new(ArrayQueue::new(1)),
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+            session_clock: SessionClock::start(),
+        });
+        let state = Box::into_raw(state);
+
+        // SAFETY: the boxed callback state remains live through this synchronous callback.
+        unsafe { error_callback(state.cast(), -7, std::ptr::null()) };
+
+        assert!(!running.load(Ordering::Acquire));
+        assert_eq!(
+            CaptureStatus::from_code(status.load(Ordering::Acquire)),
+            CaptureStatus::Failed
+        );
+        assert_eq!(statuses.try_recv(), Ok(CaptureStatus::Failed));
+        assert!(matches!(
+            errors.try_recv(),
+            Ok(CaptureError::StreamFailed(reason)) if reason.contains("system-audio buffer")
+        ));
+        // SAFETY: error -7 does not reclaim callback state; this test remains its sole owner.
+        unsafe { drop(Box::from_raw(state)) };
+    }
+
+    #[test]
+    fn recording_failure_preserves_native_cause_before_failed_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (error_sink, mut errors) = broadcast::channel(1);
+        let (status_sink, mut statuses) = broadcast::channel(1);
+        let running = Arc::new(AtomicBool::new(true));
+        let status = Arc::new(AtomicU8::new(CaptureStatus::Running.code()));
+        let state = Box::into_raw(Box::new(CallbackState {
+            error_sink,
+            status_sink,
+            status: Arc::clone(&status),
+            running: Arc::clone(&running),
+            free_audio: Arc::new(ArrayQueue::new(1)),
+            ready_audio: Arc::new(ArrayQueue::new(1)),
+            free_frames: Arc::new(ArrayQueue::new(1)),
+            ready_frames: Arc::new(ArrayQueue::new(1)),
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+            session_clock: SessionClock::start(),
+        }));
+
+        let detail = CString::new(
+            "system audio: input.append returned false; NSOSStatusErrorDomain code=-16341",
+        )?;
+        // SAFETY: the boxed callback state and detail remain live through this synchronous call.
+        unsafe { error_callback(state.cast(), -8, detail.as_ptr()) };
+
+        assert!(
+            !running.load(Ordering::Acquire),
+            "recording writer failure must stop delivery"
+        );
+        assert_eq!(
+            CaptureStatus::from_code(status.load(Ordering::Acquire)),
+            CaptureStatus::Failed,
+            "recording writer failure must be terminal"
+        );
+        assert!(matches!(
+            errors.try_recv(),
+            Ok(CaptureError::StreamFailed(reason))
+                if reason.contains("NSOSStatusErrorDomain code=-16341")
+                    && reason.contains("prefix was kept")
+        ));
+        assert_eq!(
+            statuses.try_recv(),
+            Ok(CaptureStatus::Failed),
+            "status must follow the actionable error publication"
+        );
+        // SAFETY: error -8 does not reclaim callback state; this test remains its sole owner.
+        unsafe { drop(Box::from_raw(state)) };
+        Ok(())
     }
 }

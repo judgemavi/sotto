@@ -1,4 +1,4 @@
-//! Low-rate screen sampling, perceptual change detection, OCR, and bounded frame storage.
+//! Low-rate screen sampling, change detection, bounded frame storage, and explicit inspection.
 //!
 //! Capture owns the ScreenCaptureKit session. This crate intentionally accepts owned BGRA
 //! frames so capture callbacks can hand work to a background consumer without importing a
@@ -23,6 +23,22 @@ mod vision;
 #[cfg(target_os = "macos")]
 pub use vision::VisionOcr;
 
+pub mod recording;
+pub use recording::{
+    DecodedRecordingFrame, PlatformFrameDecoder, RecordingBackedScreenInspector,
+    RecordingFrameDecoder, RecordingFrameProvenance, RecordingFrameUnavailable,
+    RecordingFrameUnavailableReason, extract_recording_frame,
+};
+
+pub mod inspection;
+pub use inspection::{
+    AuthorizedImageMediaType, AuthorizedImageProvenance, AuthorizedReasoningImage,
+    ImageInspectionPolicy, InspectScreenRequest, MAX_AUTHORIZED_IMAGE_BYTES,
+    RecordingScreenProvenance, RetainedScreenInspector, ScreenEvidence, ScreenInspection,
+    ScreenInspectionSource, ScreenPrecision, ScreenProvenance, ScreenSelector,
+    ScreenUnavailableReason,
+};
+
 const HASH_EDGE: usize = 16;
 
 #[derive(Debug, Error)]
@@ -33,8 +49,14 @@ pub enum ScreenError {
     Io(#[from] std::io::Error),
     #[error("PNG encoding: {0}")]
     Png(#[from] png::EncodingError),
+    #[error("PNG decoding: {0}")]
+    PngDecode(String),
     #[error("OCR: {0}")]
     Ocr(String),
+    #[error("recording frame decode: {0}")]
+    RecordingDecode(String),
+    #[error("recording frame extraction is unsupported on this platform")]
+    UnsupportedPlatform,
 }
 
 /// An owned BGRA frame suitable for processing away from the capture callback.
@@ -60,7 +82,7 @@ pub trait OcrEngine: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub struct SamplerConfig {
-    /// Minimum interval between frames considered for hashing and OCR.
+    /// Minimum interval between frames considered for hashing and retention.
     pub min_interval: Duration,
     /// Mean absolute luma-hash difference that denotes a meaningful visual change.
     /// The default of 12/255 ignores cursor movement but detects typical slide changes.
@@ -81,7 +103,6 @@ impl Default for SamplerConfig {
 
 struct PendingSnapshot {
     frame_ref: FrameRef,
-    ocr_text: String,
     metadata: FrameMetadata,
     visible_from: Duration,
     hash: [u8; HASH_EDGE * HASH_EDGE],
@@ -97,7 +118,7 @@ pub struct ScreenSampler<O> {
     config: SamplerConfig,
     cache_dir: PathBuf,
     target: CaptureTarget,
-    ocr: O,
+    _ocr: O,
     pending: Option<PendingSnapshot>,
     last_considered: Option<Duration>,
     cache: VecDeque<CacheEntry>,
@@ -117,7 +138,7 @@ impl<O: OcrEngine> ScreenSampler<O> {
             config,
             cache_dir,
             target,
-            ocr,
+            _ocr: ocr,
             pending: None,
             last_considered: None,
             cache: VecDeque::new(),
@@ -155,14 +176,12 @@ impl<O: OcrEngine> ScreenSampler<O> {
             metadata.window_title = self.target.window_title.clone();
         }
         let frame_ref = self.store_frame(&frame)?;
-        let ocr_text = self.ocr.recognize(&frame)?;
         let completed = self
             .pending
             .take()
             .map(|pending| payload(pending, Some(frame.captured_at)));
         self.pending = Some(PendingSnapshot {
             frame_ref,
-            ocr_text,
             metadata,
             visible_from: frame.captured_at,
             hash,
@@ -230,7 +249,8 @@ impl<O: OcrEngine> ScreenSampler<O> {
 fn payload(pending: PendingSnapshot, visible_to: Option<Duration>) -> EventPayload {
     EventPayload::ScreenSnapshot(ScreenSnapshot {
         frame_ref: pending.frame_ref,
-        ocr_text: pending.ocr_text,
+        // Kept empty for schema compatibility. OCR is derived only through `inspect_screen`.
+        ocr_text: String::new(),
         active_app: pending.metadata.active_app,
         window_title: pending.metadata.window_title,
         visible_from: pending.visible_from,
