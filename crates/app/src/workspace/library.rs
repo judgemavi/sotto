@@ -32,7 +32,7 @@ use gpui_component::{
     scroll::ScrollableElement,
     tooltip::Tooltip,
 };
-use insight::load_latest_grounded_notes;
+use insight::{RecordingNotes, RecordingNotesBlock, load_latest_grounded_notes};
 use rag::{SessionSummary, Store};
 use sotto_core::{EventPayload, SessionId, types::RecordingTitle};
 
@@ -172,12 +172,44 @@ pub(crate) fn search_index(
                 }
             }
             if let Ok(Some(report)) = load_latest_grounded_notes(&store, meeting.id) {
-                text.push(' ');
-                text.push_str(&format!("{:?}", report.notes).to_lowercase());
+                append_notes_search_text(&mut text, &report.artifact);
             }
             (meeting.id, text)
         })
         .collect()
+}
+
+/// Adds only user-visible summary content to the rail's search corpus.
+///
+/// `Debug` output also contains Rust field and enum names. Indexing it made a query such as
+/// `risk` match every recording that had any summary at all, even when no risk was written.
+fn append_notes_search_text(out: &mut String, notes: &RecordingNotes) {
+    for section in &notes.sections {
+        for block in &section.blocks {
+            match block {
+                RecordingNotesBlock::Claim { text, .. } => {
+                    out.push(' ');
+                    out.push_str(&text.to_lowercase());
+                }
+                RecordingNotesBlock::Action {
+                    text,
+                    owner,
+                    due_date,
+                    ..
+                } => {
+                    out.push(' ');
+                    out.push_str(&text.to_lowercase());
+                    for detail in [owner.as_deref(), due_date.as_deref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        out.push(' ');
+                        out.push_str(&detail.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// One presented library entry, resolved before any element is built so grouping, labelling, and
@@ -1080,13 +1112,14 @@ mod tests {
         WindowOptions, point, px, size,
     };
     use gpui_component::Root;
+    use insight::RecordingNotes;
     use rag::{SessionSummary, Store};
     use secrecy::SecretString;
     use sotto_core::{CaptureTarget, Session, SessionId, TargetKind, types::RecordingTitle};
 
     use super::{
-        LibraryFootprint, START_CHOICES, StartChoice, day_label, format_duration, group_rail,
-        icons, recording_name, target_title,
+        LibraryFootprint, START_CHOICES, StartChoice, append_notes_search_text, day_label,
+        format_duration, group_rail, icons, recording_name, target_title,
     };
     use crate::{mcp, reasoning, session};
 
@@ -1358,6 +1391,27 @@ mod tests {
             "a search with no match must show no rows rather than everything"
         );
         Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic,
+        reason = "a fixture that fails to parse is a test bug; stop immediately"
+    )]
+    fn summary_search_indexes_written_content_not_schema_field_names() {
+        let mut text = "recording".to_owned();
+        let empty = RecordingNotes::default();
+        append_notes_search_text(&mut text, &empty);
+        assert_eq!(text, "recording");
+        assert!(!text.contains("risk"));
+        assert!(!text.contains("topic"));
+
+        let notes: RecordingNotes = serde_json::from_str(
+            r#"{"sections":[{"kind":"overview","blocks":[{"type":"claim","id":"note-1","text":"Launch hazard reviewed","meeting_citations":[1],"external_citations":[]}]}]}"#,
+        )
+        .unwrap_or_else(|error| panic!("test fixture must parse as RecordingNotes: {error}"));
+        append_notes_search_text(&mut text, &notes);
+        assert!(text.contains("launch hazard reviewed"));
     }
 
     /// The rename must not cost someone the name they already know the recording by.

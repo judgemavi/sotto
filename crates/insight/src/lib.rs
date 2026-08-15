@@ -20,10 +20,10 @@ pub use clustering::{
 };
 
 pub use notes::{
-    ActionItem, CachedGroundedMeetingNotes, EvidenceBasis, GroundedActionItem,
-    GroundedMeetingNotes, GroundedMeetingNotesReport, GroundedNoteItem, GroundingInput,
-    MeetingNotes, MeetingNotesError, MeetingNotesGenerator, MeetingNotesReport, NoteItem,
-    SourceStatus, load_latest_grounded_notes, load_latest_grounded_notes_status,
+    CachedGroundedMeetingNotes, GroundedMeetingNotesReport, GroundingInput, MeetingNotesError,
+    MeetingNotesGenerator, RecordingNotes, RecordingNotesBlock, RecordingNotesBlockId,
+    RecordingNotesSection, RecordingNotesSectionKind, SourceStatus, load_latest_grounded_notes,
+    load_latest_grounded_notes_status,
 };
 
 pub use summarizer::{

@@ -7,7 +7,7 @@ use std::{
 };
 
 use insight::{
-    GroundedMeetingNotes, GroundedMeetingNotesReport, GroundingInput, MeetingNotesGenerator,
+    GroundedMeetingNotesReport, GroundingInput, MeetingNotesGenerator, RecordingNotes,
     SourceStatus, load_latest_grounded_notes_status,
 };
 use providers::{BackendFingerprint, ReasoningProvider, ResolvedBackend};
@@ -26,14 +26,14 @@ pub enum NotesState {
     Disabled,
     Generating,
     Ready {
-        notes: Box<GroundedMeetingNotes>,
+        notes: Box<RecordingNotes>,
         bundle: mcp::ContextBundle,
         source_status: SourceStatus,
         cached: bool,
         model: String,
     },
     Stale {
-        notes: Box<GroundedMeetingNotes>,
+        notes: Box<RecordingNotes>,
         bundle: mcp::ContextBundle,
         source_status: SourceStatus,
         model: String,
@@ -263,7 +263,7 @@ impl NotesController {
         self.screen_consultations = result.consultations;
         self.state = match result.result {
             Ok(report) => NotesState::Ready {
-                notes: Box::new(report.notes),
+                notes: Box::new(report.artifact),
                 bundle: report.bundle,
                 source_status: report.source_status,
                 cached: report.cached,
@@ -315,13 +315,13 @@ impl NotesController {
                 .map_err(|error| sotto_core::RagError::Storage(error.to_string()))
         }) {
             Ok(Some(cached)) if cached.stale => NotesState::Stale {
-                notes: Box::new(cached.report.notes),
+                notes: Box::new(cached.report.artifact),
                 bundle: cached.report.bundle,
                 source_status: cached.report.source_status,
                 model: cached.report.model,
             },
             Ok(Some(cached)) => NotesState::Ready {
-                notes: Box::new(cached.report.notes),
+                notes: Box::new(cached.report.artifact),
                 bundle: cached.report.bundle,
                 source_status: cached.report.source_status,
                 cached: true,
@@ -621,7 +621,7 @@ mod tests {
             self.0.store(true, Ordering::Release);
             Box::pin(async {
                 Ok(Box::pin(stream::iter([Ok(Delta {
-                    text: r#"{"overview":[{"text":"Planning","basis":"meeting","meeting_citations":[1],"external_citations":[]}],"topics":[],"decisions":[],"action_items":[],"open_questions":[],"risks":[],"follow_ups":[]}"#.to_owned(),
+                    text: r#"{"sections":[{"kind":"overview","blocks":[{"type":"claim","text":"Planning","meeting_citations":[1],"external_citations":[]}]}]}"#.to_owned(),
                     is_final: true,
                     usage: Some(Usage::default()),
                     stop_reason: Some(StopReason::EndTurn),
@@ -949,7 +949,7 @@ mod tests {
 
         fn notes_json(event_id: EventId) -> String {
             format!(
-                r#"{{"overview":[{{"text":"The slide showed the revised number","basis":"meeting","meeting_citations":[{}],"external_citations":[]}}],"topics":[],"decisions":[],"action_items":[],"open_questions":[],"risks":[],"follow_ups":[]}}"#,
+                r#"{{"sections":[{{"kind":"overview","blocks":[{{"type":"claim","text":"The slide showed the revised number","meeting_citations":[{}],"external_citations":[]}}]}}]}}"#,
                 event_id.get()
             )
         }

@@ -1,6 +1,6 @@
 # T068 — Stop failing finalization on capture startup overhead
 
-**Status:** todo
+**Status:** done
 
 **Wave:** M4 — recording
 
@@ -68,3 +68,27 @@ finalization failed:" — which means one layer is wrapping a string that alread
 
 The capture writer (T061), the transcription reader, retention policy, and the Settings presentation
 of failed recordings (T069).
+
+---
+
+## Result — 2026-08-14
+
+The duration check now starts on the first `CaptureStatus::Running` edge, after
+ScreenCaptureKit's asynchronous stream negotiation completes, and freezes before pipeline stop,
+recording flush, probing, complete-file ASR, or tail persistence. A repeated Running status cannot
+move that boundary. If no Running edge was observed, Sotto keeps the playable recording and omits
+the wall-clock discrepancy instead of inventing a capture interval.
+
+The five-second tolerance remains documented as a loose bound over two-second fMP4 segment
+rounding/flush, not a fitted allowance for startup. A genuine mixed-clock mismatch is still
+reported after the recording is persisted as available. Finalization failure prefixes remain
+idempotent, so the user-facing reason is never doubled.
+
+Verification:
+
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test -p app --lib session::tests` — 31 passed.
+- The focused startup fixture includes 2.3 seconds of pre-Running negotiation and proves it is not
+  charged to the media interval.
+- The existing genuine-mismatch, usable-recording, and prefix tests remain green.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test --workspace --locked` and strict workspace Clippy
+  over all targets/features — passed; live/model/performance gates remain explicitly ignored.

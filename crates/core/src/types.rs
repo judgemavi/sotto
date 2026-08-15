@@ -12,6 +12,77 @@ use std::{
 
 use crate::{EventId, SessionId};
 
+/// Stable identity of one library entry.
+///
+/// An entry is the document-bearing object above recording sessions. Keeping its identity
+/// distinct from [`SessionId`] prevents callers from accidentally hanging captured facts from a
+/// document or treating a prepared entry as though a recording already exists.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct EntryId(u128);
+
+impl EntryId {
+    #[must_use]
+    pub const fn new(value: u128) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u128 {
+        self.0
+    }
+}
+
+/// The library object that may exist before capture and may hold several recording sessions.
+///
+/// Captured facts remain on the referenced sessions. The title and future notes document belong
+/// to this entry; the session ids are only the attachment relation between those two layers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Entry {
+    id: EntryId,
+    created_at_unix_ms: u64,
+    title: Option<RecordingTitle>,
+    session_ids: Vec<SessionId>,
+}
+
+impl Entry {
+    #[must_use]
+    pub const fn new(id: EntryId, created_at_unix_ms: u64, title: Option<RecordingTitle>) -> Self {
+        Self {
+            id,
+            created_at_unix_ms,
+            title,
+            session_ids: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> EntryId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn created_at_unix_ms(&self) -> u64 {
+        self.created_at_unix_ms
+    }
+
+    #[must_use]
+    pub const fn title(&self) -> Option<&RecordingTitle> {
+        self.title.as_ref()
+    }
+
+    #[must_use]
+    pub fn session_ids(&self) -> &[SessionId] {
+        &self.session_ids
+    }
+
+    pub fn attach_session(&mut self, session_id: SessionId) {
+        if !self.session_ids.contains(&session_id) {
+            self.session_ids.push(session_id);
+        }
+    }
+}
+
 /// Container written for one retained local meeting recording.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
@@ -786,8 +857,21 @@ pub enum PermissionStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{Annotation, MediaTimeMapping, RecordingTitle, Source, Utterance};
+    use super::{Annotation, Entry, EntryId, MediaTimeMapping, RecordingTitle, Source, Utterance};
+    use crate::SessionId;
     use std::time::Duration;
+
+    #[test]
+    fn entry_identity_and_session_attachments_stay_distinct() {
+        let mut entry = Entry::new(EntryId::new(7), 1_700_000_000_000, None);
+        entry.attach_session(SessionId::new(7));
+        entry.attach_session(SessionId::new(8));
+        entry.attach_session(SessionId::new(7));
+
+        assert_eq!(entry.id(), EntryId::new(7));
+        assert_eq!(entry.created_at_unix_ms(), 1_700_000_000_000);
+        assert_eq!(entry.session_ids(), &[SessionId::new(7), SessionId::new(8)]);
+    }
 
     #[test]
     fn a_chosen_title_is_normalized_and_never_blank() {

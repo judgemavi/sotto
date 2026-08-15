@@ -43,6 +43,22 @@ const RECORDING_FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 // for picker, capture-start negotiation, shutdown drain, or ASR finalization.
 const RECORDING_DURATION_TOLERANCE: Duration = Duration::from_secs(5);
 
+#[derive(Default)]
+struct CaptureRunClock {
+    started: Option<std::time::Instant>,
+}
+
+impl CaptureRunClock {
+    fn observe_running(&mut self, observed_at: std::time::Instant) {
+        self.started.get_or_insert(observed_at);
+    }
+
+    fn elapsed_at(&self, stopped_at: std::time::Instant) -> Option<Duration> {
+        self.started
+            .map(|started| stopped_at.saturating_duration_since(started))
+    }
+}
+
 /// The single user-visible map-session lifecycle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionLifecycle {
@@ -1028,9 +1044,6 @@ async fn run(
             )?;
             return Err(failure);
         }
-        // Bracket the call that starts both capture streams. The session record and growing media
-        // reference intentionally exist first, but their setup time is not capture run time.
-        let capture_started = std::time::Instant::now();
         match Pipeline::builder(session)
             .capture(capture)
             .vad(mic_vad, system_vad)
@@ -1039,7 +1052,7 @@ async fn run(
             .persistence(persistence)
             .start()
         {
-            Ok(pipeline) => Ok((pipeline, capture_started)),
+            Ok(pipeline) => Ok(pipeline),
             Err(error) => {
                 store
                     .mark_recording_finalization_failed(
@@ -1057,7 +1070,7 @@ async fn run(
             }
         }
     });
-    let (pipeline, capture_started) = match start_result {
+    let pipeline = match start_result {
         Ok(Some(started)) => started,
         Ok(None) => {
             return Err(SessionFailure::new(
@@ -1069,6 +1082,7 @@ async fn run(
     };
     let mut events = pipeline.events().subscribe("app-timeline-ingress");
     let mut reported_running = false;
+    let mut capture_run_clock = CaptureRunClock::default();
     let mut annotation_open = true;
     let terminal = loop {
         tokio::select! {
@@ -1103,9 +1117,17 @@ async fn run(
             }
             status = statuses.recv() => {
                 match status {
-                    Ok(CaptureStatus::Running) if !reported_running => {
-                        reported_running = true;
-                        let _ = sender.send(WorkerEvent::Running);
+                    Ok(CaptureStatus::Running) => {
+                        // `Pipeline::start()` returns after launching the bridge's asynchronous
+                        // startup task, before ScreenCaptureKit finishes negotiation. The bridge
+                        // emits `Running` only after `SCStream.startCapture()` completes, so this
+                        // lifecycle edge is the first honest control-shell boundary for comparing
+                        // wall-clock capture time with finalized media duration.
+                        capture_run_clock.observe_running(std::time::Instant::now());
+                        if !reported_running {
+                            reported_running = true;
+                            let _ = sender.send(WorkerEvent::Running);
+                        }
                     }
                     Ok(status) => {
                         if let Some(status) = terminal_status(status) {
@@ -1135,7 +1157,7 @@ async fn run(
     };
     // Freeze the interval before pipeline shutdown, recording flush, probing, complete-file ASR,
     // and tail persistence. None of that work produces live capture media.
-    let capture_elapsed = capture_started.elapsed();
+    let capture_elapsed = capture_run_clock.elapsed_at(std::time::Instant::now());
     let _ = sender.send(WorkerEvent::Finalizing);
     let mut stopping = tokio::spawn(pipeline.stop());
     if tokio::time::timeout(
@@ -1309,8 +1331,9 @@ fn retained_recording_message(
 
 fn recording_duration_discrepancy(
     media_duration: Duration,
-    capture_elapsed: Duration,
+    capture_elapsed: Option<Duration>,
 ) -> Option<String> {
+    let capture_elapsed = capture_elapsed?;
     (media_duration.abs_diff(capture_elapsed) > RECORDING_DURATION_TOLERANCE).then(|| {
         format!(
             "Recording duration {:?} disagreed with capture run time {:?} beyond {:?}.",
@@ -1323,7 +1346,7 @@ fn settle_recording(
     store: &Store,
     recording: &SessionRecording,
     media_duration: Duration,
-    capture_elapsed: Duration,
+    capture_elapsed: Option<Duration>,
 ) -> Result<Option<String>, SessionFailure> {
     let discrepancy = recording_duration_discrepancy(media_duration, capture_elapsed);
     // A duration disagreement is diagnostic metadata, not evidence that playable local media
@@ -1689,10 +1712,10 @@ mod tests {
     };
 
     use super::{
-        LifecycleModel, SessionController, SessionEnd, SessionFailure, SessionFailureKind,
-        SessionLifecycle, StartGate, Store, WorkerEvent, assert_timeline_within_session,
-        capture_error_end, completion_message, drain_ready, drain_until_closed,
-        ensure_not_cancelled, finalization_failure_reason, finish_state,
+        CaptureRunClock, LifecycleModel, SessionController, SessionEnd, SessionFailure,
+        SessionFailureKind, SessionLifecycle, StartGate, Store, WorkerEvent,
+        assert_timeline_within_session, capture_error_end, completion_message, drain_ready,
+        drain_until_closed, ensure_not_cancelled, finalization_failure_reason, finish_state,
         preserve_failed_finalization, recording_duration_discrepancy, retained_recording_message,
         send_finished, send_phase_progress, settle_recording, terminal_status,
     };
@@ -1743,18 +1766,37 @@ mod tests {
 
     #[test]
     fn capture_startup_overhead_is_not_part_of_the_duration_check() {
+        let pipeline_start = std::time::Instant::now();
+        let capture_running = pipeline_start + Duration::from_secs_f64(2.3);
+        let capture_stopped = capture_running + Duration::from_secs_f64(67.4);
+        let mut clock = CaptureRunClock::default();
+        clock.observe_running(capture_running);
+
         let media_duration = Duration::from_secs_f64(67.177_333_333);
-        let capture_elapsed = Duration::from_secs_f64(67.4);
-        let session_object_elapsed = Duration::from_secs_f64(69.476_324_333);
+        let capture_elapsed = clock.elapsed_at(capture_stopped);
+        let pipeline_bracket_elapsed = capture_stopped.duration_since(pipeline_start);
 
         assert!(
-            media_duration.abs_diff(session_object_elapsed) > Duration::from_secs(2),
-            "fixture must reproduce the old false failure"
+            media_duration.abs_diff(pipeline_bracket_elapsed) > Duration::from_secs(2),
+            "fixture must reproduce startup negotiation contaminating the old bracket"
         );
         assert!(
             recording_duration_discrepancy(media_duration, capture_elapsed).is_none(),
-            "startup time before capture ran must not fail recording finalization"
+            "startup negotiation before the Running edge must not fail recording finalization"
         );
+    }
+
+    #[test]
+    fn capture_run_clock_keeps_the_first_running_edge() {
+        let first_running = std::time::Instant::now();
+        let duplicate_running = first_running + Duration::from_secs(9);
+        let stopped = first_running + Duration::from_secs(20);
+        let mut clock = CaptureRunClock::default();
+
+        clock.observe_running(first_running);
+        clock.observe_running(duplicate_running);
+
+        assert_eq!(clock.elapsed_at(stopped), Some(Duration::from_secs(20)));
     }
 
     #[test]
@@ -1781,7 +1823,7 @@ mod tests {
             &store,
             &recording,
             Duration::from_secs(223_555),
-            Duration::from_secs_f64(19.9),
+            Some(Duration::from_secs_f64(19.9)),
         )
         .map_err(|error| std::io::Error::other(error.message))?
         .ok_or("mixed-clock duration unexpectedly passed")?;

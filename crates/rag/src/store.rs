@@ -17,8 +17,8 @@ use sotto_core::types::{
     MediaTimeMapping, RecordingContainer, RecordingMissingReason, RecordingTitle, SessionRecording,
 };
 use sotto_core::{
-    BoxFuture, CaptureTarget, Chunk, EventPayload, PersistenceSink, RagError, Retriever, Session,
-    SessionId, Source, TargetKind, TimelineEvent, Utterance,
+    BoxFuture, CaptureTarget, Chunk, Entry, EntryId, EventPayload, PersistenceSink, RagError,
+    Retriever, Session, SessionId, Source, TargetKind, TimelineEvent, Utterance,
 };
 
 use crate::schema::{configure, migrate, storage};
@@ -293,13 +293,227 @@ impl Store {
                 "session capture target has an invalid scope combination".to_owned(),
             ));
         }
-        self.writer.lock().map_err(poisoned)?.execute(
+        let mut connection = self.writer.lock().map_err(poisoned)?;
+        let transaction = connection.transaction().map_err(storage)?;
+        transaction.execute(
             "INSERT INTO sessions VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET ended_at_unix_ms=excluded.ended_at_unix_ms",
             params![session.id().get().to_string(), session.started_at_unix_ms(),
                 session.ended_at_unix_ms(), target.bundle_id, target.display_name,
                 target.window_title, target_kind(target.kind), target.audio_scoped],
         ).map_err(storage)?;
+        ensure_session_entry(&transaction, session)?;
+        transaction.commit().map_err(storage)
+    }
+
+    /// Saves a newly captured session directly into an existing prepared entry.
+    ///
+    /// This is the explicit counterpart to [`Self::save_session`], which creates an entry when no
+    /// destination was chosen. The relation is inserted in the same transaction as the captured
+    /// facts, so no durable session can briefly appear outside its selected entry.
+    pub fn save_session_in_entry(
+        &self,
+        session: &Session,
+        entry_id: EntryId,
+    ) -> Result<(), RagError> {
+        let target = session.capture_target();
+        if !target.has_valid_scope() {
+            return Err(RagError::Storage(
+                "session capture target has an invalid scope combination".to_owned(),
+            ));
+        }
+        let mut connection = self.writer.lock().map_err(poisoned)?;
+        let transaction = connection.transaction().map_err(storage)?;
+        transaction
+            .execute(
+                "INSERT INTO sessions VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET ended_at_unix_ms=excluded.ended_at_unix_ms",
+                params![
+                    session.id().get().to_string(),
+                    session.started_at_unix_ms(),
+                    session.ended_at_unix_ms(),
+                    target.bundle_id,
+                    target.display_name,
+                    target.window_title,
+                    target_kind(target.kind),
+                    target.audio_scoped
+                ],
+            )
+            .map_err(storage)?;
+        attach_session_relation(&transaction, entry_id, session.id())?;
+        transaction.commit().map_err(storage)
+    }
+
+    /// Creates a prepared entry. Recording sessions are attached separately and never detached.
+    pub fn create_entry(&self, entry: &Entry) -> Result<(), RagError> {
+        if !entry.session_ids().is_empty() {
+            return Err(RagError::Storage(
+                "create an entry before attaching recording sessions".to_owned(),
+            ));
+        }
+        self.writer
+            .lock()
+            .map_err(poisoned)?
+            .execute(
+                "INSERT INTO entries(id,created_at_unix_ms,title) VALUES(?1,?2,?3)",
+                params![
+                    entry.id().get().to_string(),
+                    entry.created_at_unix_ms(),
+                    entry.title().map(RecordingTitle::as_str)
+                ],
+            )
+            .map_err(storage)?;
         Ok(())
+    }
+
+    /// Lists entries newest first, including prepared entries with no recording sessions.
+    pub fn list_entries(&self) -> Result<Vec<Entry>, RagError> {
+        let connection = self.reader.lock().map_err(poisoned)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT e.id,e.created_at_unix_ms,e.title,es.session_id \
+                 FROM entries e LEFT JOIN entry_sessions es ON es.entry_id=e.id \
+                 LEFT JOIN sessions s ON s.id=es.session_id \
+                 ORDER BY e.created_at_unix_ms DESC,e.id DESC,s.started_at_unix_ms,es.session_id",
+            )
+            .map_err(storage)?;
+        let mut rows = statement.query([]).map_err(storage)?;
+        let mut entries = Vec::<Entry>::new();
+        while let Some(row) = rows.next().map_err(storage)? {
+            let entry_id = parse_entry_id(&row.get::<_, String>(0).map_err(storage)?)?;
+            if entries.last().map(Entry::id) != Some(entry_id) {
+                entries.push(Entry::new(
+                    entry_id,
+                    row.get(1).map_err(storage)?,
+                    row.get::<_, Option<String>>(2)
+                        .map_err(storage)?
+                        .as_deref()
+                        .and_then(RecordingTitle::new),
+                ));
+            }
+            if let Some(session_id) = row.get::<_, Option<String>>(3).map_err(storage)? {
+                let session_id = parse_session_id(&session_id)?;
+                if let Some(entry) = entries.last_mut() {
+                    entry.attach_session(session_id);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Renames an entry without changing any captured session fact.
+    pub fn set_entry_title(
+        &self,
+        entry_id: EntryId,
+        title: Option<&RecordingTitle>,
+    ) -> Result<(), RagError> {
+        let changed = self
+            .writer
+            .lock()
+            .map_err(poisoned)?
+            .execute(
+                "UPDATE entries SET title=?2 WHERE id=?1",
+                params![
+                    entry_id.get().to_string(),
+                    title.map(RecordingTitle::as_str)
+                ],
+            )
+            .map_err(storage)?;
+        if changed == 0 {
+            return Err(RagError::NotFound {
+                id: entry_id.get().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Attaches one existing session. Its timeline, recording, and captured scope are untouched.
+    pub fn attach_session(&self, entry_id: EntryId, session_id: SessionId) -> Result<(), RagError> {
+        let mut connection = self.writer.lock().map_err(poisoned)?;
+        let transaction = connection.transaction().map_err(storage)?;
+        attach_session_relation(&transaction, entry_id, session_id)?;
+        transaction.commit().map_err(storage)
+    }
+
+    /// Answers which entry owns a recording in one query.
+    pub fn entry_for_session(&self, session_id: SessionId) -> Result<EntryId, RagError> {
+        self.reader
+            .lock()
+            .map_err(poisoned)?
+            .query_row(
+                "SELECT entry_id FROM entry_sessions WHERE session_id=?1",
+                [session_id.get().to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?
+            .ok_or_else(|| RagError::NotFound {
+                id: session_id.get().to_string(),
+            })
+            .and_then(|value| parse_entry_id(&value))
+    }
+
+    /// Deletes an entry, its managed recording files, and every session-owned persisted row.
+    pub fn delete_entry(
+        &self,
+        entry_id: EntryId,
+        recording_directory: &Path,
+    ) -> Result<(), RagError> {
+        let session_ids = {
+            let connection = self.reader.lock().map_err(poisoned)?;
+            let mut statement = connection
+                .prepare("SELECT session_id FROM entry_sessions WHERE entry_id=?1")
+                .map_err(storage)?;
+            statement
+                .query_map([entry_id.get().to_string()], |row| row.get::<_, String>(0))
+                .map_err(storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage)?
+                .into_iter()
+                .map(|id| parse_session_id(&id))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for session_id in session_ids {
+            self.remove_recording_media(
+                session_id,
+                RecordingMissingReason::Deleted,
+                recording_directory,
+            )?;
+        }
+        let mut connection = self.writer.lock().map_err(poisoned)?;
+        let transaction = connection.transaction().map_err(storage)?;
+        let id = entry_id.get().to_string();
+        transaction
+            .execute(
+                "DELETE FROM vec_chunks WHERE chunk_id IN (\
+                   SELECT c.id FROM chunks c JOIN documents d ON d.id=c.doc_id \
+                   JOIN entry_sessions es ON es.session_id=d.source_session_id \
+                   WHERE es.entry_id=?1\
+                 )",
+                [&id],
+            )
+            .map_err(storage)?;
+        transaction
+            .execute(
+                "DELETE FROM events WHERE session_id IN (\
+                   SELECT session_id FROM entry_sessions WHERE entry_id=?1\
+                 )",
+                [&id],
+            )
+            .map_err(storage)?;
+        transaction
+            .execute(
+                "DELETE FROM sessions WHERE id IN (\
+                   SELECT session_id FROM entry_sessions WHERE entry_id=?1\
+                 )",
+                [&id],
+            )
+            .map_err(storage)?;
+        let changed = transaction
+            .execute("DELETE FROM entries WHERE id=?1", [&id])
+            .map_err(storage)?;
+        if changed == 0 {
+            return Err(RagError::NotFound { id });
+        }
+        transaction.commit().map_err(storage)
     }
 
     /// Inserts only; duplicate identities fail rather than mutating the append-only log.
@@ -990,28 +1204,43 @@ impl Store {
         ).optional().map_err(storage)
     }
 
-    /// Deletes the meeting record and every cascading timeline/derived evidence row.
+    /// Deletes one recording session and removes its entry only when that entry becomes empty.
+    ///
+    /// A multi-session entry survives loss of one recording. The implicit one-session entry that
+    /// ordinary capture creates does not become a phantom prepared entry after its only session is
+    /// deleted.
     pub fn delete_session(&self, session_id: SessionId) -> Result<(), RagError> {
         let mut connection = self.writer.lock().map_err(poisoned)?;
         let transaction = connection.transaction().map_err(storage)?;
+        let id = session_id.get().to_string();
+        let entry_id = transaction
+            .query_row(
+                "SELECT entry_id FROM entry_sessions WHERE session_id=?1",
+                [&id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage)?;
         transaction
             .execute(
                 "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT c.id FROM chunks c JOIN documents d ON d.id=c.doc_id WHERE d.source_session_id=?1)",
-                [session_id.get().to_string()],
+                [&id],
             )
             .map_err(storage)?;
         transaction
-            .execute(
-                "DELETE FROM events WHERE session_id=?1",
-                [session_id.get().to_string()],
-            )
+            .execute("DELETE FROM events WHERE session_id=?1", [&id])
             .map_err(storage)?;
         transaction
-            .execute(
-                "DELETE FROM sessions WHERE id=?1",
-                [session_id.get().to_string()],
-            )
+            .execute("DELETE FROM sessions WHERE id=?1", [&id])
             .map_err(storage)?;
+        if let Some(entry_id) = entry_id {
+            transaction
+                .execute(
+                    "DELETE FROM entries WHERE id=?1 AND NOT EXISTS (SELECT 1 FROM entry_sessions WHERE entry_id=?1)",
+                    [&entry_id],
+                )
+                .map_err(storage)?;
+        }
         transaction.commit().map_err(storage)
     }
 
@@ -1763,6 +1992,96 @@ fn parse_session_id(value: &str) -> Result<SessionId, RagError> {
         .parse::<u128>()
         .map(SessionId::new)
         .map_err(|error| RagError::Storage(format!("invalid source session id: {error}")))
+}
+
+fn parse_entry_id(value: &str) -> Result<EntryId, RagError> {
+    value
+        .parse::<u128>()
+        .map(EntryId::new)
+        .map_err(|error| RagError::Storage(format!("invalid entry id: {error}")))
+}
+
+fn ensure_session_entry(
+    transaction: &rusqlite::Transaction<'_>,
+    session: &Session,
+) -> Result<(), RagError> {
+    let session_id = session.id().get().to_string();
+    let attached = transaction
+        .query_row(
+            "SELECT 1 FROM entry_sessions WHERE session_id=?1",
+            [&session_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(storage)?
+        .is_some();
+    if attached {
+        return Ok(());
+    }
+    let mut candidate = session.id().get();
+    loop {
+        let candidate_text = candidate.to_string();
+        let occupied = transaction
+            .query_row(
+                "SELECT 1 FROM entries WHERE id=?1",
+                [&candidate_text],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(storage)?
+            .is_some();
+        if !occupied {
+            transaction
+                .execute(
+                    "INSERT INTO entries(id,created_at_unix_ms,title) VALUES(?1,?2,NULL)",
+                    params![candidate_text, session.started_at_unix_ms()],
+                )
+                .map_err(storage)?;
+            transaction
+                .execute(
+                    "INSERT INTO entry_sessions(session_id,entry_id) VALUES(?1,?2)",
+                    params![session_id, candidate.to_string()],
+                )
+                .map_err(storage)?;
+            return Ok(());
+        }
+        candidate = candidate.checked_add(1).ok_or_else(|| {
+            RagError::Storage("could not allocate an implicit entry identity".to_owned())
+        })?;
+    }
+}
+
+fn attach_session_relation(
+    transaction: &rusqlite::Transaction<'_>,
+    entry_id: EntryId,
+    session_id: SessionId,
+) -> Result<(), RagError> {
+    let session_id = session_id.get().to_string();
+    let existing = transaction
+        .query_row(
+            "SELECT entry_id FROM entry_sessions WHERE session_id=?1",
+            [&session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    if let Some(existing) = existing {
+        let existing = parse_entry_id(&existing)?;
+        if existing == entry_id {
+            return Ok(());
+        }
+        return Err(RagError::Storage(format!(
+            "session {session_id} already belongs to entry {} and cannot be detached",
+            existing.get()
+        )));
+    }
+    transaction
+        .execute(
+            "INSERT INTO entry_sessions(session_id,entry_id) VALUES(?1,?2)",
+            params![session_id, entry_id.get().to_string()],
+        )
+        .map_err(storage)?;
+    Ok(())
 }
 
 fn chunk_markdown(text: &str) -> Vec<String> {

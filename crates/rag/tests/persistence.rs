@@ -9,8 +9,9 @@ mod tests {
     use rag::{DEFAULT_RECORDING_BUDGET_BYTES, DocumentKind, LocalProvenance, Store};
     use rusqlite::{Connection, params};
     use sotto_core::{
-        CaptureTarget, EventPayload, MarkKind, Session, SessionId, Source, SpeechState, TargetKind,
-        TimelineBuilder, Utterance, VadSegment, replay_lenient, types::RecordingTitle,
+        CaptureTarget, Entry, EntryId, EventPayload, MarkKind, Session, SessionId, Source,
+        SpeechState, TargetKind, TimelineBuilder, Utterance, VadSegment, replay_lenient,
+        types::RecordingTitle,
     };
 
     fn session() -> Session {
@@ -52,7 +53,7 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            12,
+            13,
             "recording retention and retranscription migration must reach the current schema"
         );
         Ok(())
@@ -299,6 +300,87 @@ mod tests {
     }
 
     #[test]
+    fn prepared_entry_is_creatable_listable_renameable_and_deletable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = Store::open_in_memory()?;
+        let entry = Entry::new(EntryId::new(40), 1_900_000_000_000, None);
+        store.create_entry(&entry)?;
+
+        let listed = store.list_entries()?;
+        assert_eq!(listed, vec![entry.clone()]);
+        assert!(listed[0].session_ids().is_empty());
+
+        let title = RecordingTitle::new("Prepared planning").ok_or("title")?;
+        store.set_entry_title(entry.id(), Some(&title))?;
+        assert_eq!(store.list_entries()?[0].title(), Some(&title));
+
+        store.delete_entry(entry.id(), directory.path())?;
+        assert!(store.list_entries()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn several_sessions_share_one_entry_without_changing_captured_facts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = Store::open_in_memory()?;
+        let entry = Entry::new(EntryId::new(41), 1_900_000_000_000, None);
+        store.create_entry(&entry)?;
+        let first = session();
+        let second = Session::new(
+            SessionId::new(8),
+            CaptureTarget::microphone_only(),
+            1_700_000_060_000,
+        );
+        store.save_session_in_entry(&first, entry.id())?;
+        store.save_session_in_entry(&second, entry.id())?;
+        store.save_session_in_entry(&second, entry.id())?;
+
+        assert_eq!(store.entry_for_session(first.id())?, entry.id());
+        assert_eq!(store.entry_for_session(second.id())?, entry.id());
+        assert_eq!(
+            store.list_entries()?[0].session_ids(),
+            &[first.id(), second.id()]
+        );
+        assert_eq!(
+            store.load_session_record(first.id())?.capture_target(),
+            first.capture_target()
+        );
+        assert_eq!(
+            store.load_session_record(second.id())?.capture_target(),
+            second.capture_target()
+        );
+
+        let other = Entry::new(EntryId::new(42), 1_900_000_000_001, None);
+        store.create_entry(&other)?;
+        assert!(
+            store.attach_session(other.id(), second.id()).is_err(),
+            "an attached session cannot be detached into another entry"
+        );
+        assert_eq!(store.entry_for_session(second.id())?, entry.id());
+
+        store.delete_session(first.id())?;
+        let remaining = store.list_entries()?;
+        let original = remaining
+            .iter()
+            .find(|listed| listed.id() == entry.id())
+            .ok_or("session deletion must keep its entry")?;
+        assert_eq!(original.session_ids(), &[second.id()]);
+
+        store.delete_session(second.id())?;
+        let remaining = store.list_entries()?;
+        assert!(
+            remaining.iter().all(|listed| listed.id() != entry.id()),
+            "deleting an entry's final session must not leave an orphan library row"
+        );
+        assert!(
+            remaining.iter().any(|listed| listed.id() == other.id()),
+            "deleting a session must not remove an unrelated prepared entry"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn microphone_only_scope_round_trips_through_session_persistence()
     -> Result<(), Box<dyn std::error::Error>> {
         let store = Store::open_in_memory()?;
@@ -445,8 +527,124 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            12,
+            13,
             "the title migration must land on the current schema version"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migrating_version_twelve_creates_one_entry_per_session_idempotently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("rag-v12.sqlite3");
+        let title = RecordingTitle::new("Named before entries").ok_or("title")?;
+        {
+            let store = Store::open(&path)?;
+            store.save_session(&session())?;
+            store.set_session_title(SessionId::new(7), Some(&title))?;
+        }
+        {
+            let connection = Connection::open(&path)?;
+            connection.execute_batch(
+                "DROP TABLE entry_sessions;
+                 DROP TABLE entries;
+                 PRAGMA user_version=12;",
+            )?;
+        }
+
+        let migrated = Store::open(&path)?;
+        let entries = migrated.list_entries()?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id(), EntryId::new(7));
+        assert_eq!(entries[0].session_ids(), &[SessionId::new(7)]);
+        assert_eq!(
+            migrated.load_session_title(SessionId::new(7))?,
+            Some(title),
+            "the in-review title path stays intact until its ownership closes"
+        );
+        drop(migrated);
+
+        let reopened = Store::open(&path)?;
+        assert_eq!(
+            reopened.list_entries()?.len(),
+            1,
+            "re-running migration must be a no-op"
+        );
+        assert_eq!(
+            Connection::open(path)?
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+            13
+        );
+        Ok(())
+    }
+
+    /// `meeting_notes.v2` rows are unreadable dead data now that only `recording_notes.v1` is ever
+    /// read back. Leaving them in place would make `load_latest_grounded_notes_status` silently
+    /// return `Ok(None)` for a session whose only artifact is one of these, which is worse than no
+    /// cached summary at all — so the v13 pass deletes them rather than migrating them forward.
+    #[test]
+    fn migrating_version_twelve_deletes_retired_v2_grounded_notes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("rag-v12-v2-cleanup.sqlite3");
+        {
+            let store = Store::open(&path)?;
+            store.save_session(&session())?;
+            store.save_grounded_derived_view(
+                SessionId::new(7),
+                "meeting_notes.v2",
+                "backend",
+                "content",
+                "{}",
+                "{}",
+                "model",
+                None,
+                "not_selected",
+                r#"{"excerpts":[]}"#,
+            )?;
+            store.save_grounded_derived_view(
+                SessionId::new(7),
+                "recording_notes.v1",
+                "backend",
+                "content",
+                "{}",
+                "{}",
+                "model",
+                None,
+                "not_selected",
+                r#"{"excerpts":[]}"#,
+            )?;
+        }
+        Connection::open(&path)?.pragma_update(None, "user_version", 12)?;
+
+        let migrated = Store::open(&path)?;
+        assert!(
+            migrated
+                .load_grounded_derived_view(
+                    SessionId::new(7),
+                    "meeting_notes.v2",
+                    "backend",
+                    "content"
+                )?
+                .is_none(),
+            "the retired v2 kind must not survive the v13 migration"
+        );
+        assert!(
+            migrated
+                .load_grounded_derived_view(
+                    SessionId::new(7),
+                    "recording_notes.v1",
+                    "backend",
+                    "content"
+                )?
+                .is_some(),
+            "the cleanup must be scoped to meeting_notes.v2 and leave the current kind alone"
+        );
+        assert_eq!(
+            Connection::open(path)?
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+            13
         );
         Ok(())
     }
@@ -484,7 +682,7 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            12
+            13
         );
         Ok(())
     }
@@ -518,7 +716,7 @@ mod tests {
         let connection = Connection::open(path)?;
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            12
+            13
         );
         Ok(())
     }
@@ -572,7 +770,7 @@ mod tests {
         let connection = Connection::open(path)?;
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            12
+            13
         );
         Ok(())
     }
@@ -725,7 +923,7 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            12
+            13
         );
         Ok(())
     }
@@ -742,7 +940,7 @@ mod tests {
             store.save_session(&source_session)?;
             store.save_grounded_derived_view(
                 SessionId::new(7),
-                "meeting_notes.v2",
+                "recording_notes.v1",
                 "backend",
                 "content",
                 "{}",
@@ -791,7 +989,7 @@ mod tests {
         let connection = Connection::open(&path)?;
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            12
+            13
         );
         assert_eq!(
             connection.query_row(
@@ -844,11 +1042,15 @@ mod tests {
                 (ordinal >= 2).then_some("legacy_unlinked")
             );
         }
+        // `meeting_notes.v2` is deliberately not used as the fixture kind here: the same v13 pass
+        // this test exercises also purges that retired kind (see the v13 migration block), so a
+        // still-current kind is what actually proves a grounded artifact survives this document
+        // migration untouched.
         assert_eq!(
             migrated
                 .load_grounded_derived_view(
                     SessionId::new(7),
-                    "meeting_notes.v2",
+                    "recording_notes.v1",
                     "backend",
                     "content"
                 )?
@@ -952,7 +1154,7 @@ mod tests {
         let connection = Connection::open(path)?;
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            12
+            13
         );
         assert_eq!(
             connection.query_row("SELECT kind FROM documents WHERE id='current'", [], |row| {
@@ -960,6 +1162,112 @@ mod tests {
             })?,
             "resource_document"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_entry_cascades_every_owned_recording_artifact_and_index_document()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("entry-delete.sqlite3");
+        let store = Store::open(&path)?;
+        let entry = Entry::new(EntryId::new(99), 1_700_000_000_000, None);
+        store.create_entry(&entry)?;
+        let first = session();
+        let second = Session::new(
+            SessionId::new(8),
+            CaptureTarget::microphone_only(),
+            1_700_000_060_000,
+        );
+        for captured in [&first, &second] {
+            store.save_session_in_entry(captured, entry.id())?;
+            let recording_path = directory
+                .path()
+                .join(format!("{}.mp4", captured.id().get()));
+            std::fs::write(&recording_path, b"retained meeting media")?;
+            store.save_growing_recording(captured.id(), &recording_path)?;
+            store.save_derived_view(
+                captured.id(),
+                "meeting_notes.v1",
+                "backend",
+                "content",
+                "{}",
+                "{}",
+            )?;
+        }
+        for recorded in [
+            session(),
+            Session::new(
+                SessionId::new(8),
+                CaptureTarget::microphone_only(),
+                1_700_000_060_000,
+            ),
+        ] {
+            let mut timeline = TimelineBuilder::new(recorded);
+            timeline.append(
+                Duration::from_secs(1),
+                EventPayload::Vad(VadSegment {
+                    source: Source::Mic,
+                    start: Duration::ZERO,
+                    end: None,
+                    kind: SpeechState::SpeechStart,
+                }),
+            );
+            store.append_events(timeline.events())?;
+        }
+
+        let connection = Connection::open(&path)?;
+        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+        for captured in [&first, &second] {
+            let id = captured.id().get();
+            connection.execute(
+                "INSERT INTO documents(id,kind,title,source_session_id,provenance_status,ingested_at,content_hash) VALUES(?1,'prior_meeting','Meeting',?2,'native',0,?3)",
+                params![format!("document-{id}"), id.to_string(), format!("hash-{id}")],
+            )?;
+            connection.execute(
+                "INSERT INTO chunks(id,doc_id,ordinal,text,token_count,metadata,embedding) VALUES(?1,?2,0,'meeting text',2,'{}',zeroblob(1536))",
+                params![format!("chunk-{id}"), format!("document-{id}")],
+            )?;
+            connection.execute(
+                "INSERT INTO vec_chunks(chunk_id,embedding) VALUES(?1,zeroblob(1536))",
+                [format!("chunk-{id}")],
+            )?;
+        }
+
+        store.delete_entry(entry.id(), directory.path())?;
+        for captured in [&first, &second] {
+            assert!(
+                !directory
+                    .path()
+                    .join(format!("{}.mp4", captured.id().get()))
+                    .exists(),
+                "entry deletion must unlink each managed recording"
+            );
+            assert!(matches!(
+                store.load_session_record(captured.id()),
+                Err(sotto_core::RagError::NotFound { .. })
+            ));
+            assert!(store.load_session(captured.id())?.is_empty());
+            assert!(store.load_recording_reference(captured.id())?.is_none());
+            assert!(
+                store
+                    .load_derived_view(captured.id(), "meeting_notes.v1", "backend", "content")?
+                    .is_none()
+            );
+        }
+        for table in [
+            "entries",
+            "entry_sessions",
+            "documents",
+            "chunks",
+            "vec_chunks",
+        ] {
+            let count =
+                connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, usize>(0)
+                })?;
+            assert_eq!(count, 0, "{table} must not retain entry-owned rows");
+        }
         Ok(())
     }
 

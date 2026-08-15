@@ -15,7 +15,7 @@ mod tests {
 
     use futures_util::stream;
     use insight::{
-        EvidenceBasis, GroundingInput, MeetingNotesError, MeetingNotesGenerator, SourceStatus,
+        GroundingInput, MeetingNotesError, MeetingNotesGenerator, SourceStatus,
         load_latest_grounded_notes, load_latest_grounded_notes_status,
     };
     use mcp::{
@@ -26,11 +26,11 @@ mod tests {
     use providers::{AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendId};
     use sotto_core::{
         BoxFuture, BoxStream, CancellationToken, CaptureTarget, CompletionProvider,
-        CompletionRequest, Delta, EventId, EventPayload, ProviderError, Session, SessionId, Source,
+        CompletionRequest, Delta, EventPayload, ProviderError, Session, SessionId, Source,
         StopReason, TargetKind, TimelineBuilder, Usage, Utterance,
     };
 
-    const MEETING_ONLY: &str = r#"{"overview":[{"text":"Launch planning","basis":"meeting","meeting_citations":[1],"external_citations":[]}],"topics":[],"decisions":[],"action_items":[],"open_questions":[],"risks":[],"follow_ups":[]}"#;
+    const RECORDING_SUMMARY: &str = r#"{"sections":[{"kind":"overview","blocks":[{"type":"claim","text":"Launch planning","meeting_citations":[1],"external_citations":[]}]}]}"#;
 
     struct Provider {
         outputs: Mutex<VecDeque<String>>,
@@ -315,11 +315,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transcript_only_v2_cache_and_reopen_need_no_context_source()
+    async fn transcript_only_recording_summary_cache_and_reopen_need_no_context_source()
     -> Result<(), Box<dyn std::error::Error>> {
         let (store, id) = fixture()?;
         let provider = Arc::new(Provider {
-            outputs: Mutex::new(VecDeque::from([MEETING_ONLY.to_owned()])),
+            outputs: Mutex::new(VecDeque::from([RECORDING_SUMMARY.to_owned()])),
             calls: AtomicUsize::new(0),
         });
         let generator = MeetingNotesGenerator::new(&store, provider.clone())
@@ -336,6 +336,19 @@ mod tests {
         assert_eq!(cached.calls, 0);
         assert_eq!(reopened.model, "mock-grounded");
         assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(first.artifact.sections.len(), 1);
+        assert!(
+            store
+                .load_latest_grounded_derived_view(id, "recording_notes.v1")?
+                .is_some(),
+            "the superseding artifact kind is canonical"
+        );
+        assert!(
+            store
+                .load_latest_grounded_derived_view(id, "meeting_notes.v2")?
+                .is_none(),
+            "new output must not be stored under the legacy kind"
+        );
 
         let session = store.load_session_record(id)?;
         let mut changed = TimelineBuilder::new(session);
@@ -369,7 +382,7 @@ mod tests {
         let stale = load_latest_grounded_notes_status(&store, id)?
             .ok_or("latest stale artifact must remain reviewable")?;
         assert!(stale.stale);
-        assert_eq!(stale.report.notes, first.notes);
+        assert_eq!(stale.report.artifact, first.artifact);
         Ok(())
     }
 
@@ -377,7 +390,7 @@ mod tests {
     async fn unknown_or_vacuous_external_basis_fails_closed()
     -> Result<(), Box<dyn std::error::Error>> {
         let (store, id) = fixture()?;
-        let invalid = r#"{"overview":[{"text":"Claim","basis":"external","meeting_citations":[],"external_citations":["mcp-evidence-v1-unknown"]}],"topics":[],"decisions":[],"action_items":[],"open_questions":[],"risks":[],"follow_ups":[]}"#;
+        let invalid = r#"{"sections":[{"kind":"findings","blocks":[{"type":"claim","text":"Claim","external_citations":["mcp-evidence-v1-unknown"]}]}]}"#;
         let provider = Arc::new(Provider {
             outputs: Mutex::new(VecDeque::from([invalid.to_owned()])),
             calls: AtomicUsize::new(0),
@@ -404,7 +417,7 @@ mod tests {
         let grant_fingerprint =
             mcp::GrantRunFingerprint::from_persisted(format!("mcp-grant-v1-{}", "11".repeat(32)))?;
         let provider = Arc::new(Provider {
-            outputs: Mutex::new(VecDeque::from([MEETING_ONLY.to_owned()])),
+            outputs: Mutex::new(VecDeque::from([RECORDING_SUMMARY.to_owned()])),
             calls: AtomicUsize::new(0),
         });
         let generator =
@@ -473,12 +486,7 @@ mod tests {
             source: Arc::new(FixedSource(bundle.clone())),
         };
         let output = format!(
-            r#"{{"overview":[{{"text":"Launch planning uses the project plan","basis":"mixed","meeting_citations":[1],"external_citations":["{evidence}"]}}],"topics":[],"decisions":[],"action_items":[{{"text":"Prepare launch","basis":"external","meeting_citations":[],"external_citations":["{evidence}"],"owner":"Morgan","owner_basis":"mixed","owner_meeting_citations":[1],"owner_external_citations":["{evidence}"],"due_date":"Friday","due_date_basis":"external","due_date_meeting_citations":[],"due_date_external_citations":["{evidence}"]}}],"open_questions":[],"risks":[],"follow_ups":[]}}"#
-        );
-        let parsed: insight::GroundedMeetingNotes = serde_json::from_str(&output)?;
-        assert_eq!(
-            parsed.overview[0].external_citations[0],
-            bundle.excerpts()[0].evidence_id
+            r#"{{"sections":[{{"kind":"overview","blocks":[{{"type":"claim","text":"Launch planning uses the project plan","meeting_citations":[1],"external_citations":["{evidence}"]}}]}},{{"kind":"action_items","blocks":[{{"type":"action","text":"Prepare launch","external_citations":["{evidence}"],"owner":"Morgan","owner_meeting_citations":[1],"owner_external_citations":["{evidence}"],"due_date":"Friday","due_date_external_citations":["{evidence}"]}}]}}]}}"#
         );
         let provider = Arc::new(Provider {
             outputs: Mutex::new(VecDeque::from([output.clone(), output])),
@@ -525,7 +533,7 @@ mod tests {
     async fn a_claim_with_no_citation_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
         // An owner asserted with neither meeting nor external evidence. No label can rescue this:
         // there is nothing to derive a basis from and nothing for a reader to check.
-        let uncited = r#"{"overview":[],"topics":[],"decisions":[],"action_items":[{"text":"Act","basis":"meeting","meeting_citations":[1],"external_citations":[],"owner":"Morgan","owner_basis":"external","owner_meeting_citations":[],"owner_external_citations":[],"due_date":null,"due_date_basis":null,"due_date_meeting_citations":[],"due_date_external_citations":[]}],"open_questions":[],"risks":[],"follow_ups":[]}"#;
+        let uncited = r#"{"sections":[{"kind":"action_items","blocks":[{"type":"action","text":"Act","meeting_citations":[1],"owner":"Morgan","due_date":null}]}]}"#;
         let (store, id) = fixture()?;
         let provider = Arc::new(Provider {
             outputs: Mutex::new(VecDeque::from([uncited.to_owned()])),
@@ -546,7 +554,7 @@ mod tests {
     async fn a_citation_naming_evidence_that_does_not_exist_still_fails_closed()
     -> Result<(), Box<dyn std::error::Error>> {
         // Deriving the basis must not become a way to launder an unresolvable citation.
-        let unknown = r#"{"overview":[{"text":"Claim","basis":"meeting","meeting_citations":[1],"external_citations":["mcp-evidence-v1-unknown"]}],"topics":[],"decisions":[],"action_items":[],"open_questions":[],"risks":[],"follow_ups":[]}"#;
+        let unknown = r#"{"sections":[{"kind":"findings","blocks":[{"type":"claim","text":"Claim","meeting_citations":[1],"external_citations":["mcp-evidence-v1-unknown"]}]}]}"#;
         let (store, id) = fixture()?;
         let provider = Arc::new(Provider {
             outputs: Mutex::new(VecDeque::from([unknown.to_owned()])),
@@ -564,33 +572,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mislabelled_basis_is_corrected_from_its_own_citations()
+    async fn superseding_wire_rejects_the_retired_basis_field()
     -> Result<(), Box<dyn std::error::Error>> {
-        // A due date cited to a real meeting event, labelled "mixed" — the evidence is sound and
-        // only the label is wrong. Failing the whole summary over it discarded every other correct
-        // claim in the record, which is what a real run did. The label is derived, not believed.
-        let mislabelled = r#"{"overview":[],"topics":[],"decisions":[],"action_items":[{"text":"Act","basis":"mixed","meeting_citations":[1],"external_citations":[],"owner":null,"owner_basis":null,"owner_meeting_citations":[],"owner_external_citations":[],"due_date":"Friday","due_date_basis":"mixed","due_date_meeting_citations":[1],"due_date_external_citations":[]}],"open_questions":[],"risks":[],"follow_ups":[]}"#;
+        let with_basis = r#"{"sections":[{"kind":"findings","blocks":[{"type":"claim","text":"Fact","basis":"meeting","meeting_citations":[1]}]}]}"#;
         let (store, id) = fixture()?;
         let provider = Arc::new(Provider {
-            outputs: Mutex::new(VecDeque::from([mislabelled.to_owned()])),
+            outputs: Mutex::new(VecDeque::from([with_basis.to_owned()])),
             calls: AtomicUsize::new(0),
         });
-        let report = MeetingNotesGenerator::new(&store, provider)
+        let result = MeetingNotesGenerator::new(&store, provider)
             .with_backend_fingerprint(fingerprint()?)
             .generate_grounded_with_cancellation(id, None, CancellationToken::new())
-            .await?;
-        let action = report
-            .notes
-            .action_items
-            .first()
-            .ok_or("the corrected action item must survive")?;
-        assert_eq!(
-            action.basis,
-            EvidenceBasis::Meeting,
-            "a claim citing only the meeting is meeting-based whatever it declared"
-        );
-        assert_eq!(action.due_date_basis, Some(EvidenceBasis::Meeting));
-        assert_eq!(action.due_date_meeting_citations, [EventId::new(1)]);
+            .await;
+        assert!(matches!(result, Err(MeetingNotesError::Context(_))));
         Ok(())
     }
 
@@ -600,7 +594,7 @@ mod tests {
         let (store, id) = fixture()?;
         let provider = Arc::new(CapturingProvider {
             request: Mutex::new(None),
-            output: r#"{"overview":[],"topics":[],"decisions":[],"action_items":[],"open_questions":[],"risks":[],"follow_ups":[],"tools":[{"name":"delete_all"}]}"#.to_owned(),
+            output: r#"{"sections":[],"tools":[{"name":"delete_all"}]}"#.to_owned(),
         });
         let result = MeetingNotesGenerator::new(&store, provider.clone())
             .with_backend_fingerprint(fingerprint()?)

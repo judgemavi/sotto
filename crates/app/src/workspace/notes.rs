@@ -32,7 +32,10 @@ use gpui_component::{
     scroll::ScrollableElement,
     text::TextView,
 };
-use insight::{GroundedActionItem, GroundedMeetingNotes, GroundedNoteItem, SourceStatus};
+use insight::{
+    RecordingNotes, RecordingNotesBlock, RecordingNotesSection, RecordingNotesSectionKind,
+    SourceStatus,
+};
 use sotto_core::{EventId, EventPayload, MarkKind, TimelineEvent, replay_lenient};
 
 use crate::{
@@ -829,85 +832,88 @@ struct SummarySection {
 /// This is the only place a section is named. When the taxonomy changes shape, this function
 /// changes and nothing else does — the renderers below walk whatever `Vec` they are handed. An
 /// empty section never reaches them, so a heading with nothing under it cannot be drawn.
-fn summary_sections(notes: GroundedMeetingNotes) -> Vec<SummarySection> {
-    let GroundedMeetingNotes {
-        overview,
-        topics,
-        decisions,
-        action_items,
-        open_questions,
-        risks,
-        follow_ups,
-    } = notes;
-    let mut sections = Vec::new();
-    push_notes(&mut sections, "Overview", SectionShape::Prose, overview);
-    push_notes(&mut sections, "Topics", SectionShape::Points, topics);
-    push_notes(&mut sections, "Decisions", SectionShape::Points, decisions);
-    push_actions(&mut sections, "Action items", action_items);
-    push_notes(
-        &mut sections,
-        "Open questions",
-        SectionShape::Points,
-        open_questions,
-    );
-    push_notes(&mut sections, "Risks", SectionShape::Points, risks);
-    push_actions(&mut sections, "Follow-ups", follow_ups);
-    sections
+///
+/// `RecordingNotes` is expected to already exclude empty sections — its validation rejects one —
+/// but the filter below does not lean on that alone: a heading with nothing under it must never be
+/// producible from this function no matter what the artifact contains.
+fn summary_sections(notes: RecordingNotes) -> Vec<SummarySection> {
+    notes
+        .sections
+        .into_iter()
+        .filter(|section| !section.blocks.is_empty())
+        .map(summary_section)
+        .collect()
 }
 
-fn push_notes(
-    sections: &mut Vec<SummarySection>,
-    heading: &str,
-    shape: SectionShape,
-    items: Vec<GroundedNoteItem>,
-) {
-    if items.is_empty() {
-        return;
-    }
-    sections.push(SummarySection {
+fn summary_section(section: RecordingNotesSection) -> SummarySection {
+    let (heading, shape) = section_heading(section.kind);
+    SummarySection {
         heading: heading.to_owned(),
         shape,
-        claims: items
-            .into_iter()
-            .map(|item| Claim {
-                lead: None,
-                text: item.text,
-                detail: None,
-                meeting: item.meeting_citations,
-                external: item.external_citations,
-            })
-            .collect(),
-    });
-}
-
-fn push_actions(sections: &mut Vec<SummarySection>, heading: &str, items: Vec<GroundedActionItem>) {
-    if items.is_empty() {
-        return;
+        claims: section.blocks.into_iter().map(block_claim).collect(),
     }
-    sections.push(SummarySection {
-        heading: heading.to_owned(),
-        shape: SectionShape::Points,
-        claims: items.into_iter().map(action_claim).collect(),
-    });
 }
 
-fn action_claim(item: GroundedActionItem) -> Claim {
-    let mut meeting = item.meeting_citations;
-    meeting.extend(item.owner_meeting_citations);
-    meeting.extend(item.due_date_meeting_citations);
-    meeting.sort_unstable();
-    meeting.dedup();
-    let mut external = item.external_citations;
-    external.extend(item.owner_external_citations);
-    external.extend(item.due_date_external_citations);
-    external.sort();
-    external.dedup();
-    Claim {
-        lead: item.owner,
-        text: item.text,
-        detail: item.due_date.map(|date| format!("due {date}")),
-        meeting,
-        external,
+/// Where each recording-supported section kind lands in the column: its heading, in the voice of
+/// `docs/design/workspace-v2-mock.html`, and whether it reads as prose or discrete points.
+const fn section_heading(kind: RecordingNotesSectionKind) -> (&'static str, SectionShape) {
+    match kind {
+        RecordingNotesSectionKind::Overview => ("Overview", SectionShape::Prose),
+        RecordingNotesSectionKind::Topics => ("Topics", SectionShape::Points),
+        RecordingNotesSectionKind::Explanations => ("Explanations", SectionShape::Points),
+        RecordingNotesSectionKind::Findings => ("Findings", SectionShape::Points),
+        RecordingNotesSectionKind::Decisions => ("Decisions", SectionShape::Points),
+        RecordingNotesSectionKind::ActionItems => ("Action items", SectionShape::Points),
+        RecordingNotesSectionKind::OpenQuestions => ("Open questions", SectionShape::Points),
+        RecordingNotesSectionKind::Risks => ("Risks", SectionShape::Points),
+        RecordingNotesSectionKind::FollowUps => ("Follow-ups", SectionShape::Points),
+    }
+}
+
+fn block_claim(block: RecordingNotesBlock) -> Claim {
+    match block {
+        RecordingNotesBlock::Claim {
+            text,
+            meeting_citations,
+            external_citations,
+            ..
+        } => Claim {
+            lead: None,
+            text,
+            detail: None,
+            meeting: meeting_citations,
+            external: external_citations,
+        },
+        RecordingNotesBlock::Action {
+            text,
+            meeting_citations,
+            external_citations,
+            owner,
+            owner_meeting_citations,
+            owner_external_citations,
+            due_date,
+            due_date_meeting_citations,
+            due_date_external_citations,
+            ..
+        } => {
+            let mut meeting = meeting_citations;
+            meeting.extend(owner_meeting_citations);
+            meeting.extend(due_date_meeting_citations);
+            meeting.sort_unstable();
+            meeting.dedup();
+            let mut external = external_citations;
+            external.extend(owner_external_citations);
+            external.extend(due_date_external_citations);
+            external.sort();
+            external.dedup();
+            Claim {
+                lead: owner,
+                text,
+                detail: due_date.map(|date| format!("due {date}")),
+                meeting,
+                external,
+            }
+        }
     }
 }
 
@@ -992,7 +998,7 @@ impl SummaryView {
     }
 
     fn ready(
-        notes: GroundedMeetingNotes,
+        notes: RecordingNotes,
         bundle: mcp::ContextBundle,
         source_status: SourceStatus,
         origin: &str,
@@ -1442,7 +1448,7 @@ fn render_citations(
 mod tests {
     use std::time::Duration;
 
-    use insight::{EvidenceBasis, GroundedActionItem, GroundedMeetingNotes, GroundedNoteItem};
+    use insight::RecordingNotes;
     use sotto_core::{
         CaptureTarget, EventId, EventPayload, MarkKind, Session, SessionId, Source, SpeechState,
         TargetKind, TimelineBuilder, Utterance, VadSegment,
@@ -1456,30 +1462,49 @@ mod tests {
     };
     use crate::notes::NotesState;
 
-    fn note(text: &str, citation: u64) -> GroundedNoteItem {
-        GroundedNoteItem {
-            text: text.to_owned(),
-            basis: EvidenceBasis::Meeting,
-            meeting_citations: vec![EventId::new(citation)],
-            external_citations: Vec::new(),
-        }
+    /// A claim block, cited to `citation` alone. Block ids are Sotto-derived in the real
+    /// pipeline; a fixture only needs one that is unique within the `RecordingNotes` it builds,
+    /// since these tests call `summary_sections` directly rather than `RecordingNotes::validate`.
+    fn note(text: &str, citation: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "claim",
+            "id": format!("test-claim-{citation}"),
+            "text": text,
+            "meeting_citations": [citation],
+            "external_citations": [],
+        })
     }
 
-    fn action(text: &str, citation: u64) -> GroundedActionItem {
-        GroundedActionItem {
-            text: text.to_owned(),
-            basis: EvidenceBasis::Meeting,
-            meeting_citations: vec![EventId::new(citation)],
-            external_citations: Vec::new(),
-            owner: Some("Dana".to_owned()),
-            owner_basis: Some(EvidenceBasis::Meeting),
-            owner_meeting_citations: vec![EventId::new(citation)],
-            owner_external_citations: Vec::new(),
-            due_date: Some("Thursday".to_owned()),
-            due_date_basis: Some(EvidenceBasis::Meeting),
-            due_date_meeting_citations: vec![EventId::new(citation)],
-            due_date_external_citations: Vec::new(),
-        }
+    fn action(text: &str, citation: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "action",
+            "id": format!("test-action-{citation}"),
+            "text": text,
+            "meeting_citations": [citation],
+            "external_citations": [],
+            "owner": "Dana",
+            "owner_meeting_citations": [citation],
+            "owner_external_citations": [],
+            "due_date": "Thursday",
+            "due_date_meeting_citations": [citation],
+            "due_date_external_citations": [],
+        })
+    }
+
+    fn section(kind: &str, blocks: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({ "kind": kind, "blocks": blocks })
+    }
+
+    /// Assembles a `RecordingNotes` fixture from section fragments built by [`section`].
+    /// `RecordingNotesBlockId`'s inner field is private, so a fixture goes through JSON the way a
+    /// real artifact would rather than constructing blocks as Rust struct literals.
+    #[expect(
+        clippy::panic,
+        reason = "a fixture that fails to parse is a test bug; stop immediately"
+    )]
+    fn recording_notes(sections: Vec<serde_json::Value>) -> RecordingNotes {
+        serde_json::from_value(serde_json::json!({ "sections": sections }))
+            .unwrap_or_else(|error| panic!("test fixture must parse as RecordingNotes: {error}"))
     }
 
     fn target() -> CaptureTarget {
@@ -1494,15 +1519,17 @@ mod tests {
 
     #[test]
     fn a_debugging_session_renders_only_the_sections_its_content_supports() {
-        let notes = GroundedMeetingNotes {
-            overview: vec![note("Traced the double charge to a lock-key mismatch.", 1)],
-            topics: vec![note("Lock is keyed on order id.", 2)],
-            decisions: Vec::new(),
-            action_items: Vec::new(),
-            open_questions: Vec::new(),
-            risks: Vec::new(),
-            follow_ups: vec![action("Key both paths on payment intent id.", 3)],
-        };
+        let notes = recording_notes(vec![
+            section(
+                "overview",
+                vec![note("Traced the double charge to a lock-key mismatch.", 1)],
+            ),
+            section("topics", vec![note("Lock is keyed on order id.", 2)]),
+            section(
+                "follow_ups",
+                vec![action("Key both paths on payment intent id.", 3)],
+            ),
+        ]);
 
         let sections = summary_sections(notes);
 
@@ -1528,15 +1555,18 @@ mod tests {
 
     #[test]
     fn a_recording_whose_content_supports_every_section_renders_all_seven() {
-        let notes = GroundedMeetingNotes {
-            overview: vec![note("Sprint 41 planning.", 1)],
-            topics: vec![note("Capacity.", 2)],
-            decisions: vec![note("Search rewrite deferred.", 3)],
-            action_items: vec![action("Retry rollout checklist.", 4)],
-            open_questions: vec![note("Does the exporter live on?", 5)],
-            risks: vec![note("Staging is still fragile.", 6)],
-            follow_ups: vec![action("Book the security review.", 7)],
-        };
+        let notes = recording_notes(vec![
+            section("overview", vec![note("Sprint 41 planning.", 1)]),
+            section("topics", vec![note("Capacity.", 2)]),
+            section("decisions", vec![note("Search rewrite deferred.", 3)]),
+            section("action_items", vec![action("Retry rollout checklist.", 4)]),
+            section(
+                "open_questions",
+                vec![note("Does the exporter live on?", 5)],
+            ),
+            section("risks", vec![note("Staging is still fragile.", 6)]),
+            section("follow_ups", vec![action("Book the security review.", 7)]),
+        ]);
 
         let sections = summary_sections(notes);
 
@@ -1555,10 +1585,10 @@ mod tests {
 
     #[test]
     fn no_section_is_ever_rendered_empty() {
-        let sections = summary_sections(GroundedMeetingNotes {
-            decisions: vec![note("Ship on Friday.", 9)],
-            ..GroundedMeetingNotes::default()
-        });
+        let sections = summary_sections(recording_notes(vec![section(
+            "decisions",
+            vec![note("Ship on Friday.", 9)],
+        )]));
 
         assert_eq!(sections.len(), 1, "one supported section renders one");
         assert!(
@@ -1569,11 +1599,10 @@ mod tests {
 
     #[test]
     fn every_claim_carries_the_evidence_a_chip_is_built_from() {
-        let sections = summary_sections(GroundedMeetingNotes {
-            overview: vec![note("Planning.", 1)],
-            action_items: vec![action("Checklist.", 2)],
-            ..GroundedMeetingNotes::default()
-        });
+        let sections = summary_sections(recording_notes(vec![
+            section("overview", vec![note("Planning.", 1)]),
+            section("action_items", vec![action("Checklist.", 2)]),
+        ]));
 
         for section in &sections {
             for claim in &section.claims {
@@ -1627,11 +1656,10 @@ mod tests {
 
     #[test]
     fn evidence_is_hidden_until_a_reader_asks_for_one_claim_or_for_all_of_them() {
-        let sections = summary_sections(GroundedMeetingNotes {
-            overview: vec![note("Sprint 41 planning.", 1)],
-            decisions: vec![note("Search rewrite deferred.", 2)],
-            ..GroundedMeetingNotes::default()
-        });
+        let sections = summary_sections(recording_notes(vec![
+            section("overview", vec![note("Sprint 41 planning.", 1)]),
+            section("decisions", vec![note("Search rewrite deferred.", 2)]),
+        ]));
         let summary = summary_fingerprint(&sections);
         let mut disclosure = EvidenceDisclosure::default();
 
@@ -1655,14 +1683,14 @@ mod tests {
 
     #[test]
     fn evidence_choices_do_not_carry_over_to_a_different_summary() {
-        let first = summary_fingerprint(&summary_sections(GroundedMeetingNotes {
-            overview: vec![note("Sprint 41 planning.", 1)],
-            ..GroundedMeetingNotes::default()
-        }));
-        let second = summary_fingerprint(&summary_sections(GroundedMeetingNotes {
-            overview: vec![note("A lecture on training dynamics.", 1)],
-            ..GroundedMeetingNotes::default()
-        }));
+        let first = summary_fingerprint(&summary_sections(recording_notes(vec![section(
+            "overview",
+            vec![note("Sprint 41 planning.", 1)],
+        )])));
+        let second = summary_fingerprint(&summary_sections(recording_notes(vec![section(
+            "overview",
+            vec![note("A lecture on training dynamics.", 1)],
+        )])));
         assert_ne!(
             first, second,
             "two different summaries must not share one identity"
@@ -1793,10 +1821,10 @@ mod tests {
     fn a_stale_summary_says_what_is_wrong_with_it_and_still_renders() {
         let view = SummaryView::resolve(
             NotesState::Stale {
-                notes: Box::new(GroundedMeetingNotes {
-                    decisions: vec![note("Ship on Friday.", 1)],
-                    ..GroundedMeetingNotes::default()
-                }),
+                notes: Box::new(recording_notes(vec![section(
+                    "decisions",
+                    vec![note("Ship on Friday.", 1)],
+                )])),
                 bundle: mcp::ContextBundle::empty(),
                 source_status: insight::SourceStatus::NotSelected,
                 model: "gpt-5.4-codex".to_owned(),
@@ -1822,10 +1850,10 @@ mod tests {
     fn a_fresh_summary_names_its_model_and_its_source_footing() {
         let view = SummaryView::resolve(
             NotesState::Ready {
-                notes: Box::new(GroundedMeetingNotes {
-                    overview: vec![note("Planning.", 1)],
-                    ..GroundedMeetingNotes::default()
-                }),
+                notes: Box::new(recording_notes(vec![section(
+                    "overview",
+                    vec![note("Planning.", 1)],
+                )])),
                 bundle: mcp::ContextBundle::empty(),
                 source_status: insight::SourceStatus::Unavailable,
                 cached: false,
@@ -1848,7 +1876,7 @@ mod tests {
     fn a_summary_with_no_supported_section_says_so_instead_of_counting_zero() {
         let view = SummaryView::resolve(
             NotesState::Ready {
-                notes: Box::new(GroundedMeetingNotes::default()),
+                notes: Box::new(RecordingNotes::default()),
                 bundle: mcp::ContextBundle::empty(),
                 source_status: insight::SourceStatus::NotSelected,
                 cached: false,
@@ -2246,7 +2274,7 @@ mod tests {
             let ids = persist_recording(database)?;
             let store = Store::open(database)?;
             let artifact = format!(
-                r#"{{"overview":[{{"text":"Sprint 41 is scoped to payment retries and audit fixes after the staging outage pushed the retry work into the following sprint.","basis":"meeting","meeting_citations":[{first},{second}],"external_citations":[]}}],"topics":[],"decisions":[{{"text":"The search rewrite is deferred to sprint 42.","basis":"meeting","meeting_citations":[{second}],"external_citations":[]}}],"action_items":[{{"text":"Retry rollout checklist, reviewed by Thursday.","basis":"meeting","meeting_citations":[{third}],"external_citations":[],"owner":"Dana","owner_basis":"meeting","owner_meeting_citations":[{third}],"owner_external_citations":[],"due_date":"Thursday","due_date_basis":"meeting","due_date_meeting_citations":[{third}],"due_date_external_citations":[]}}],"open_questions":[],"risks":[],"follow_ups":[]}}"#,
+                r#"{{"sections":[{{"kind":"overview","blocks":[{{"type":"claim","text":"Sprint 41 is scoped to payment retries and audit fixes after the staging outage pushed the retry work into the following sprint.","meeting_citations":[{first},{second}],"external_citations":[]}}]}},{{"kind":"decisions","blocks":[{{"type":"claim","text":"The search rewrite is deferred to sprint 42.","meeting_citations":[{second}],"external_citations":[]}}]}},{{"kind":"action_items","blocks":[{{"type":"action","text":"Retry rollout checklist, reviewed by Thursday.","meeting_citations":[{third}],"external_citations":[],"owner":"Dana","owner_meeting_citations":[{third}],"owner_external_citations":[],"due_date":"Thursday","due_date_meeting_citations":[{third}],"due_date_external_citations":[]}}]}}]}}"#,
                 first = ids[0].get(),
                 second = ids[1].get(),
                 third = ids[2].get(),
@@ -2571,7 +2599,7 @@ mod tests {
         /// One overview claim with exactly the citation list given.
         fn claim_artifact(text: &str, citations: &str) -> String {
             format!(
-                r#"{{"overview":[{{"text":"{text}","basis":"meeting","meeting_citations":[{citations}],"external_citations":[]}}],"topics":[],"decisions":[],"action_items":[],"open_questions":[],"risks":[],"follow_ups":[]}}"#
+                r#"{{"sections":[{{"kind":"overview","blocks":[{{"type":"claim","text":"{text}","meeting_citations":[{citations}],"external_citations":[]}}]}}]}}"#
             )
         }
     }

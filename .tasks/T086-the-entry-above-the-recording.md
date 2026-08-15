@@ -1,6 +1,6 @@
 # T086 — The entry above the recording
 
-**Status:** todo
+**Status:** in-progress
 
 **Wave:** N8 — entry workspace
 
@@ -70,3 +70,49 @@ UI remains session-shaped and nothing user-visible changes.
 
 Rendering entries (T089), the notes document and overlay (T087), the vault projection (T088),
 series pages, prep notes content, and any change to timeline events or capture.
+
+---
+
+## Partial result — independent entry model (2026-08-14)
+
+- Review follow-up: deleting a session removes its automatically-created entry when that was the
+  entry's final session, while preserving an entry that still owns another session.
+- Residual: `delete_entry` still crosses a filesystem/SQLite atomicity boundary by removing managed
+  media before its row transaction. A durable quarantine plus compensating restore needs its own
+  storage contract; this patch does not pretend the two resources can share one transaction.
+
+Schema v13 adds `entries` plus the one-owner `entry_sessions` relation without broadening or
+rebuilding the captured-fact `sessions` row. `core` now distinguishes `EntryId` from `SessionId`
+and exposes an `Entry` with creation time, optional normalized title, and its attached recording
+ids. `rag` can create/list/rename/delete prepared entries, resolve a session's entry in one query,
+save a capture directly into a selected entry, and create an implicit entry when ordinary
+`save_session` has no selected destination. Re-saving into the same entry is idempotent; attempting
+to move a session to another entry is refused because detach is not a supported lifecycle.
+
+The v12-to-v13 migration mechanically creates one entry per existing session and is idempotent.
+Entry deletion lifts the existing session cascade over every attached session, including timeline,
+recording state, derived views, session-owned documents/chunks, and vector rows. Deleting one
+session from a multi-session entry leaves the entry and its other session intact. The
+`prior_meeting` search document deliberately remains per-session; T089/T090 must read it through
+the entry relation, and this task does not rebuild the index.
+
+### Exact T085 handoff still open
+
+T085 remains `in-review` and explicitly owns `session_titles` plus its persistence/catalogue path.
+Therefore v13 leaves `session_titles` byte-for-byte intact and does **not** copy its title into
+`entries.title`; migrated entry titles are temporarily `NULL`. Once T085 closes, the remaining
+step is to adopt `session_titles.title` into the owning entry and redirect/retire the per-session
+title APIs and `list_sessions` join without changing capture-target facts. Until that handoff is
+done, the first acceptance item (titles carried over) is not satisfied and T086 cannot close.
+
+### Verification so far
+
+- `cargo test -p core --lib` — 23 passed.
+- `cargo test -p rag` — 39 passed, 1 ignored performance check.
+- Focused v12 migration, prepared-entry, multi-session, and entry-cascade tests pass.
+- `cargo test --workspace` — passed; live/model/performance gates remained explicitly ignored.
+- `cargo clippy -p core -p rag --all-targets --all-features -- -D warnings` — passed.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo clippy --workspace --all-targets --all-features --
+  -D warnings` — passed after the concurrent T070 lane settled.
+- `cargo fmt --all --check` and `git diff --check` — passed.
+- No file in `crates/app/**` changed in the T086 lane.

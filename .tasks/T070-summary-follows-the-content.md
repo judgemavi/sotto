@@ -1,6 +1,6 @@
 # T070 — Summarize what was recorded, not what a meeting would have been
 
-**Status:** todo
+**Status:** in-progress
 
 **Wave:** R3 — reasoning product
 
@@ -137,3 +137,56 @@ Scope discipline: this task ships the schema and ids only. No overlay, no editin
 markdown — those are T087/T088. If block identity forces a design conflict with adaptivity or
 citations, citations win, then identity, then adaptivity; report the conflict rather than
 weakening the first two.
+
+## Notes — insight/schema handoff, 2026-08-14
+
+- Review follow-up: legacy provider and `meeting_notes.v2` cache projections consolidate
+  same-anchor blocks before stable ids are exposed. Map-reduce projects finalized partials back
+  to the provider draft shape so Sotto-owned ids cannot be echoed. Block identities now use a
+  truncated SHA-256 digest rather than two related FNV passes.
+- Follow-up correction: legacy action ids use only the action text's base citations, matching the
+  adaptive finalizer and persisted-id validator. Owner and due-date citations remain separately
+  validated evidence and do not silently change block identity.
+
+The unblocked schema and prompt half is implemented. `recording_notes.v1` / `recording_notes/v1`
+is now the canonical grounded-summary artifact and cache identity. Its wire format is adaptive
+`sections[]` containing typed claim or structured action blocks; it has no `basis` field. Provider
+responses omit ids, then validation derives each `recording-block-v1-*` id from the recording id,
+section kind, and the block's sorted, deduplicated citation anchors. Rewording and citation order do
+not change identity. Same-section claims with the same anchors consolidate deterministically into
+one addressable block rather than producing duplicate ids; distinct text is retained.
+
+Every claim still requires a known meeting or external citation. Owner and due-date claims retain
+their own separate evidence requirement. Empty sections, duplicate sections, wrong block kinds,
+unknown citations, uncited claims, duplicate persisted ids, and ids that do not match their derived
+address all fail closed. The v3 prompts summarize the content actually recorded and name useful
+non-meeting sections (`explanations`, `findings`) while retaining the meeting-quality sections.
+
+The handoff is explicit: `GroundedMeetingNotesReport.artifact` carries the canonical adaptive
+artifact, while `report.notes` remains a temporary v2 projection so the in-review app compiles
+until the app-owned half can switch the column to `artifact`. New runs persist only
+`recording_notes.v1`. The latest-artifact loader prefers that kind and falls back to a readable
+`meeting_notes.v2`, converting it explicitly to the adaptive representation; the separate legacy
+`MeetingNotesGenerator::generate` path still reads and cache-hits `meeting_notes.v1` unchanged.
+During this app handoff, the provider parser also accepts the former seven-field response and
+canonicalizes it before validation/storage; it never persists that wire shape. This compatibility
+can be removed when the app fixtures and column consume `artifact` directly.
+
+Focused evidence:
+
+- `cargo test -p insight` — 49 passed across unit and integration targets, including stable ids,
+  same-anchor consolidation, no-basis serialization/rejection, citation failures, canonical v3
+  persistence/cache replay, and explicit v2 fallback readability.
+- `cargo clippy -p insight --all-targets --all-features -- -D warnings` — clean.
+- `cargo check -p app --lib` and the transitional `cargo test -p app --lib` — clean; all 230 app
+  tests pass without changing the in-review notes column.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test --workspace --locked` and strict workspace Clippy
+  over all targets/features — clean; live/model/performance gates remain explicitly ignored.
+- `cargo fmt` and scoped `git diff --check` — clean.
+
+Still NOT RUN / blocked on the app-owned handoff: rendering adaptive section kinds directly,
+recording-centric surface vocabulary, downgrade threading in `crates/app/src/notes/controller.rs`,
+the evidence-button minimum-width fix in `crates/app/src/workspace/notes.rs`, rerunning the green
+automated gates after that handoff, the real non-meeting captured-transcript judgment, the
+old/new meeting-quality side-by-side comparison, and signed-app/manual acceptance. T075/T076 remain
+in review, so this pass deliberately touched no `crates/app/**` file.

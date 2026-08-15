@@ -136,3 +136,12 @@ actions are.
 - **The `imported` badge.** Nothing in `SessionSummary` or `CaptureTarget` can express "this session
   came from a file" — that provenance is T071's to add per ADR-0019. No badge was invented, and the
   `⇥` glyph is reserved for it.
+
+### Review follow-up — 2026-08-14
+
+The review found that library search appended `Debug` output for generated notes. That indexed
+Rust schema field names as if a person had written them, so queries such as `risk` or `topic` could
+match an unrelated summary. Search now appends only rendered claim/action text plus visible owner
+and due-date values. `summary_search_indexes_written_content_not_schema_field_names` covers the
+false-positive and content-match paths. The focused test passes; the task remains in review for its
+integrated visual/owner gate.

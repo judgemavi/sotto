@@ -132,3 +132,11 @@ built app, pasted into a real ticket, or judged whether the copied format reads 
 Nor has anyone measured the per-row `TextView` cost on a long live transcript — parsing is
 synchronous on a row's first layout and re-parses only when its text changes, but that is reasoning,
 not a measurement. Both belong to T035's manual gate.
+
+### Review follow-up — 2026-08-14
+
+Review found that the column-level `Copy` action read only committed pacer rows even while the
+provisional strip was visibly rendering `unstable` rows. It now appends the current live unstable
+projection to the copied unit, preserving the provisional warning, and the mounted live test
+asserts both the warning and hypothesis text reach the real clipboard. The direct selection path
+is unchanged. Signed-app drag/paste judgment and long-live `TextView` measurement remain NOT RUN.

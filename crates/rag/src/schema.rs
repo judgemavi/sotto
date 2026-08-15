@@ -1,7 +1,26 @@
 use rusqlite::{Connection, OptionalExtension};
 use sotto_core::{RagError, SQLITE_SCHEMA};
 
-pub(crate) const SCHEMA_VERSION: u32 = 12;
+pub(crate) const SCHEMA_VERSION: u32 = 13;
+
+/// Entries are the document-bearing library objects above captured sessions.
+///
+/// `entry_sessions.session_id` is unique because a recording belongs to exactly one entry for its
+/// whole life. The relation is separate from `sessions` so the captured-fact row is not rebuilt or
+/// broadened. Entry deletion deliberately lifts the store's existing session cascade in code;
+/// deleting a single session merely cascades this relation and leaves the entry intact.
+const ENTRY_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS entries (
+ id TEXT PRIMARY KEY NOT NULL,
+ created_at_unix_ms INTEGER NOT NULL,
+ title TEXT CHECK(title IS NULL OR length(trim(title))>0)
+);
+CREATE TABLE IF NOT EXISTS entry_sessions (
+ session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+ entry_id TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS entry_sessions_entry_idx ON entry_sessions(entry_id,session_id);
+"#;
 
 /// A person's chosen name for a recording, held in its own table rather than as a column on
 /// `sessions`.
@@ -207,6 +226,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
         transaction
             .execute_batch(SESSION_TITLE_SCHEMA)
             .map_err(storage)?;
+        transaction.execute_batch(ENTRY_SCHEMA).map_err(storage)?;
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(storage)?;
@@ -409,6 +429,31 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
         let transaction = connection.transaction().map_err(storage)?;
         transaction
             .execute_batch("DROP TABLE IF EXISTS session_search_policy;")
+            .map_err(storage)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(storage)?;
+        transaction.commit().map_err(storage)?;
+    }
+    // Every existing recording gains one mechanical entry. The ids intentionally match only for
+    // this migration; they remain distinct domain types and future prepared entries have their
+    // own identities. Title adoption waits for T085's title-persistence ownership to close.
+    //
+    // The same pass also drops any `meeting_notes.v2` rows. Retiring that read path made them
+    // unreadable dead data: `load_latest_grounded_notes_status` would silently return `Ok(None)`
+    // for a session whose only artifact was one of these, which is worse than having no cached
+    // summary at all. Deleting them is honest about the state and simply asks for a regenerate.
+    if (1..=12).contains(&version) {
+        let transaction = connection.transaction().map_err(storage)?;
+        transaction.execute_batch(ENTRY_SCHEMA).map_err(storage)?;
+        transaction
+            .execute_batch(
+                "INSERT OR IGNORE INTO entries(id,created_at_unix_ms,title)\
+                 SELECT id,started_at_unix_ms,NULL FROM sessions;\
+                 INSERT OR IGNORE INTO entry_sessions(session_id,entry_id)\
+                 SELECT id,id FROM sessions;\
+                 DELETE FROM grounded_derived_views WHERE kind='meeting_notes.v2';",
+            )
             .map_err(storage)?;
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)

@@ -1172,10 +1172,19 @@ impl MeetingWorkspace {
 
     /// Copies every row the column currently presents.
     ///
-    /// This is the head's `Copy` control. It reads the pacer's rows — the same slice
-    /// [`render`] was handed — so what lands on the clipboard is what is on screen.
+    /// This is the head's `Copy` control. Committed rows come from the pacer; while capture is
+    /// live, the current provisional registers are re-projected from the timeline and appended
+    /// with their warning so the visible unstable strip is represented too.
     fn copy_transcript(&mut self, cx: &mut Context<Self>) {
-        let (text, lines) = copy_text(self.transcript_pacer.rows());
+        let mut rows = self.transcript_pacer.rows().to_vec();
+        if self.transcript_live {
+            let frame = project_frame_for(self.timeline.read(cx).events(), self.transcript_session);
+            rows.extend(frame.transcript.unstable.into_iter().map(|mut row| {
+                row.text = provisional_line(&row.text);
+                row
+            }));
+        }
+        let (text, lines) = copy_text(&rows);
         if lines > 0 {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
@@ -2656,6 +2665,17 @@ mod mounted_tests {
         assert!(
             provisional_line("we key the retry on the ord").starts_with(PROVISIONAL_MARKER),
             "and what it renders is the warning followed by the words, so a copy carries both"
+        );
+        visual.update(|_, cx| {
+            workspace.update(cx, |workspace, cx| workspace.copy_transcript(cx));
+        });
+        let copied = visual
+            .update(|_, cx| cx.read_from_clipboard())
+            .and_then(|item| item.text())
+            .ok_or_else(|| std::io::Error::other("Copy must include the visible live row"))?;
+        assert!(
+            copied.contains(PROVISIONAL_MARKER) && copied.contains("we key the retry on the ord"),
+            "whole-transcript Copy must include the visible hypothesis and its warning: {copied}"
         );
         Ok(())
     }

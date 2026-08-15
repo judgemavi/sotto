@@ -28,7 +28,7 @@ pub use traits::{
     RecordingTranscriber, Retriever, Transcriber, TranscriptUpdate, VoiceActivityDetector,
 };
 pub use types::{
-    Annotation, AudioFrame, Chunk, CompletionMessage, CompletionRequest, Delta,
+    Annotation, AudioFrame, Chunk, CompletionMessage, CompletionRequest, Delta, Entry, EntryId,
     ExternalEvidenceRef, JsonSchemaConstraint, MessageRole, PermissionStatus, Proposal,
     ProposalError, ProposalKind, ProposalTrigger, ReasoningOutput, ReasoningRequest,
     ReasoningRequestError, Source, SpeechState, StopReason, Usage, Utterance, VadSegment,
