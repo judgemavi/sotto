@@ -1,6 +1,6 @@
 # T074 — The transcript column, attributed by source
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N7 — v2 workspace
 
@@ -184,6 +184,26 @@ scroll-and-select without the tab switch, the folded-row redirect, or the flash.
   `whole_non_speech_annotations_are_recognised_and_partial_ones_are_not`,
   `a_citation_into_a_folded_stretch_lands_on_the_line_that_renders_it`,
   `rows_name_their_source_in_adr_0019_vocabulary`.
+
+### Maintainer observation — 2026-08-15
+
+**The citation flash is confirmed by observation.** Following a summary citation chip lands on the
+cited transcript row and that row is visibly highlighted, screenshotted at the 00:23 row of a real
+recording. This is the evidence the acceptance item "a citation from the summary lands on the exact
+cited row, *visibly*" was missing — the landing was already driven end to end by T077/T078's rewire
+through `open_citation` to `reveal_citation`, but the visible state had no test because the flash is
+a spawned timer.
+
+Recorded honestly: the highlight was observed, the 1.4-second decay was not separately timed. The
+acceptance asks for visible, and visible is what was confirmed.
+
+**The legend blocker is resolved** by T095, which threaded the transcript column's real width to the
+head and collapses the legend at the shared threshold, asserting absence rather than a smaller
+width. T095 also found and fixed a second defect this task had not caught: with the legend gone, the
+essential Copy and Follow controls still overflowed the narrow column.
+
+The remaining item — whether one folded aside per quiet stretch reads correctly over a long
+recording with a silent channel — stays assigned to T035's gate, where it was already deferred.
 
 ### NOT RUN
 
