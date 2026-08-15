@@ -207,6 +207,32 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
             )));
         }
     }
+    // Every block below still fires against the single `version` read above, exactly as before —
+    // that is what lets one open() carry an old database through every applicable block in one
+    // call, since a block's own commit never changes what a *later* block in this same call sees.
+    // What changed is what each block stamps: its own literal target checkpoint, never
+    // `SCHEMA_VERSION`, so a crash between any two commits leaves `user_version` at a value that
+    // still satisfies every block that has not yet run. Two properties keep that true:
+    //
+    // - Every target is `own_checkpoint + 1` (or, for a block guarded by an inclusive range, that
+    //   range's upper bound + 1) — never higher — so a target can never leap past a later block's
+    //   own upper bound and take it out of range on the next open.
+    // - Every exact-match block (`version == 1/5/6/8`, each handling a real historical database
+    //   caught at that literal number) is positioned so that no earlier-running block *also*
+    //   applicable to that same origin ever stamps past its trigger value first. `version == 6` in
+    //   particular runs before the `1..=7` retranscription block, not after: originally it came
+    //   second, so a crash right after `1..=7` committed (which can stamp as high as 7) and before
+    //   `version == 6` ran would have made `version == 6`'s own exact match un-satisfiable forever,
+    //   silently losing its recording-retention repair for a real database parked at 6.
+    //
+    // Re-running an already-applied block on resume (e.g. `version == 6` firing again because a
+    // crash landed `user_version` back on 6) is always safe: every statement here is
+    // `CREATE ... IF NOT EXISTS`, `INSERT ... OR IGNORE`, or `DROP ... IF EXISTS`.
+    //
+    // Two blocks (v4 and v9) rebuild a table other rows reference by foreign key and must toggle
+    // `PRAGMA foreign_keys` around that rebuild; the pragma is a documented no-op inside an open
+    // transaction, which is why those two blocks commit on their own rather than folding into one
+    // connection-wide transaction with the rest.
     if version == 0 {
         let transaction = connection.transaction().map_err(storage)?;
         transaction.execute_batch(SQLITE_SCHEMA).map_err(storage)?;
@@ -286,7 +312,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
                 ));
             }
             transaction
-                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .pragma_update(None, "user_version", 6)
                 .map_err(storage)?;
             transaction.commit().map_err(storage)
         })();
@@ -295,13 +321,30 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
             .map_err(storage)?;
         migration?;
     }
+    // The exact-match repair for a real database parked at literal version 6 runs *before* the
+    // `1..=7` retranscription block immediately below, even though historically it was added
+    // after it in this file. Ordering it first is what keeps it reachable: both blocks fire for
+    // the same origin (6), but only the range block can stamp past 6 (up to 7), and if it ran
+    // first and a crash landed right after its commit, this block's `version == 6` condition would
+    // never match again on the next open — silently dropping its recording-retention repair for
+    // good. Running it first means the worst a crash can do is make it (harmlessly) re-fire.
+    if version == 6 {
+        let transaction = connection.transaction().map_err(storage)?;
+        transaction
+            .execute_batch(RECORDING_RETENTION_SCHEMA)
+            .map_err(storage)?;
+        transaction
+            .pragma_update(None, "user_version", 7)
+            .map_err(storage)?;
+        transaction.commit().map_err(storage)?;
+    }
     if version == 5 {
         let transaction = connection.transaction().map_err(storage)?;
         transaction
             .execute_batch(RECORDING_RETENTION_SCHEMA)
             .map_err(storage)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 6)
             .map_err(storage)?;
         transaction.commit().map_err(storage)?;
     }
@@ -311,17 +354,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
             .execute_batch(RETRANSCRIPTION_SCHEMA)
             .map_err(storage)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
-            .map_err(storage)?;
-        transaction.commit().map_err(storage)?;
-    }
-    if version == 6 {
-        let transaction = connection.transaction().map_err(storage)?;
-        transaction
-            .execute_batch(RECORDING_RETENTION_SCHEMA)
-            .map_err(storage)?;
-        transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 8)
             .map_err(storage)?;
         transaction.commit().map_err(storage)?;
     }
@@ -356,7 +389,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
             )
             .map_err(storage)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 9)
             .map_err(storage)?;
         transaction.commit().map_err(storage)?;
     }
@@ -397,7 +430,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
                 ));
             }
             transaction
-                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .pragma_update(None, "user_version", 10)
                 .map_err(storage)?;
             transaction.commit().map_err(storage)
         })();
@@ -415,7 +448,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
             .execute_batch(SESSION_TITLE_SCHEMA)
             .map_err(storage)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 11)
             .map_err(storage)?;
         transaction.commit().map_err(storage)?;
     }
@@ -431,7 +464,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
             .execute_batch("DROP TABLE IF EXISTS session_search_policy;")
             .map_err(storage)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 12)
             .map_err(storage)?;
         transaction.commit().map_err(storage)?;
     }
@@ -443,6 +476,11 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
     // unreadable dead data: `load_latest_grounded_notes_status` would silently return `Ok(None)`
     // for a session whose only artifact was one of these, which is worse than having no cached
     // summary at all. Deleting them is honest about the state and simply asks for a regenerate.
+    //
+    // This is the last step, so its own target genuinely is `SCHEMA_VERSION` — but it is written
+    // as a literal fact about this step (mirroring every step above), not as "whatever the crate
+    // constant currently says", so the very next step added after this one does not silently
+    // reopen the same hazard this migration exists to close.
     if (1..=12).contains(&version) {
         let transaction = connection.transaction().map_err(storage)?;
         transaction.execute_batch(ENTRY_SCHEMA).map_err(storage)?;
@@ -456,7 +494,7 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
             )
             .map_err(storage)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 13)
             .map_err(storage)?;
         transaction.commit().map_err(storage)?;
     }

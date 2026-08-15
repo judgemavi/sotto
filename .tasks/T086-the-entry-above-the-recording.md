@@ -77,9 +77,13 @@ series pages, prep notes content, and any change to timeline events or capture.
 
 - Review follow-up: deleting a session removes its automatically-created entry when that was the
   entry's final session, while preserving an entry that still owns another session.
-- Residual: `delete_entry` still crosses a filesystem/SQLite atomicity boundary by removing managed
-  media before its row transaction. A durable quarantine plus compensating restore needs its own
-  storage contract; this patch does not pretend the two resources can share one transaction.
+- Closed: `delete_entry` now quarantines every managed file (rename to a `.{session_id}.deleting`
+  tombstone) before opening its row transaction, restores every tombstone if that transaction fails
+  or the entry id does not resolve, and only unlinks them for good after it commits. A crash between
+  quarantine and commit is resolved deterministically on the next `enforce_recording_budget` sweep by
+  `Store::recover_quarantined_media`, using the owning row's surviving state (not the tombstone) as
+  the source of truth. See the doc comments on `Store::delete_entry` and
+  `Store::recover_quarantined_media` in `crates/rag/src/store.rs` for the exact contract.
 
 Schema v13 adds `entries` plus the one-owner `entry_sessions` relation without broadening or
 rebuilding the captured-fact `sessions` row. `core` now distinguishes `EntryId` from `SessionId`
@@ -116,3 +120,54 @@ done, the first acceptance item (titles carried over) is not satisfied and T086 
   -D warnings` — passed after the concurrent T070 lane settled.
 - `cargo fmt --all --check` and `git diff --check` — passed.
 - No file in `crates/app/**` changed in the T086 lane.
+
+### Quarantine residual closed (2026-08-15)
+
+`Store::delete_entry` now quarantines before it commits: every session's managed file is renamed to
+a `.{session_id}.deleting` tombstone (`Store::quarantine_recording_media`) before the row transaction
+opens. If any quarantine step fails, or the row transaction fails or rolls back (including the
+`NotFound` path for an entry id that never resolves), every tombstone renamed so far is restored and
+the delete leaves no trace. Only after the row transaction commits are the tombstones unlinked for
+good. `Store::recover_quarantined_media` resolves any tombstone still on disk after a crash between
+those two steps by checking the owning row, not the tombstone: if the session row is gone, or its
+`session_recordings.path` is already cleared, the row-side commit reached disk first and the tombstone
+is finished (unlinked); otherwise the commit never landed and the tombstone is renamed back. It runs
+at the top of `Store::enforce_recording_budget`, which is the one place the app already calls with a
+`recording_directory` on both existing call sites (after a recording settles, and when the retention
+budget changes), so both resolve any leftover tombstone with no new wiring.
+
+Proved by four new tests in `crates/rag/tests/persistence.rs`:
+`deleting_unknown_entry_returns_not_found_and_touches_no_file`,
+`delete_entry_restores_every_file_when_the_row_transaction_fails` (forces the row transaction to fail
+via a `BEFORE DELETE` trigger and asserts every file and row survives intact), and
+`recover_quarantined_media_resolves_each_tombstone_from_the_row_that_survived_a_crash` (three
+tombstones planted by hand — uncommitted, row-cleared, session-gone — resolved in one sweep, exactly
+one restored). The pre-existing `deleting_entry_cascades_every_owned_recording_artifact_and_index_document`
+and delete/entry tests in the same file pass unweakened.
+
+- `cargo test --workspace --locked` — every crate passes except two pre-existing, non-deterministic
+  failures in `providers::codex` process-group timing tests (`timed_out_probe_kills_and_reaps_its_process_group`
+  in one run, `cancellation_interrupts_a_prompt_larger_than_the_stdin_pipe` and
+  `dropping_consumer_interrupts_blocked_stdin_and_kills_process_group` in another) — different tests
+  fail across repeated runs with no code changed, in a crate this task never touches, confirming
+  environmental subprocess-timing flakiness rather than a regression from this change.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` — passed.
+- `cargo fmt --all -- --check` and `git diff --check` — passed.
+- Owns respected: only `crates/rag/src/store.rs`, `crates/rag/src/lib.rs`,
+  `crates/rag/tests/persistence.rs`, and this task file changed.
+
+**App path assessed, not touched (outside Owns):** `crates/app/src/workspace/mod.rs`'s
+`confirm_delete_session` calls `RecordingLibrary::delete` (which wraps `remove_recording_media`) and
+then `Store::delete_session` as two separate calls. This is a materially smaller version of the same
+split — `remove_recording_media` already commits its own row update before unlinking its tombstone,
+so a failure of the *second* call (`delete_session`) never leaves a dangling row pointing at a deleted
+file; `session_recordings` already durably reads `deleted` either way. The residual there is narrower:
+if `delete_session`'s transaction fails after media removal already committed, the session/entry rows
+survive in a "recording deleted" state the user didn't ask to keep — a retryable rough edge, not a
+leak, since nothing is inconsistent and `recover_quarantined_media` was never invoked (no tombstone
+is left behind by that path). Recommend folding `remove_recording_media` into `delete_session` itself
+(taking a `recording_directory` parameter) so both entry points obey the same quarantine-then-commit
+rule `delete_entry` now does, and the app no longer has to sequence two `Store::open` calls correctly
+by hand. Not implemented here: it requires editing `crates/app/src/workspace/mod.rs` and
+`crates/app/src/session/recordings.rs`, both outside this task's Owns list.

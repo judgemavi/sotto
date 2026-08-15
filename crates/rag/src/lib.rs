@@ -10,6 +10,6 @@ mod store;
 
 pub use store::{
     DEFAULT_RECORDING_BUDGET_BYTES, DerivedTranscript, DocumentKind, GroundedDerivedArtifact,
-    GroundedDerivedView, IngestMetadata, LocalEvidenceReceipt, LocalProvenance, RecordingReference,
-    RecordingUsage, SearchFilter, SessionSummary, Store, TimelinePersistence,
+    GroundedDerivedView, IngestMetadata, LocalEvidenceReceipt, LocalProvenance, QuarantineRecovery,
+    RecordingReference, RecordingUsage, SearchFilter, SessionSummary, Store, TimelinePersistence,
 };

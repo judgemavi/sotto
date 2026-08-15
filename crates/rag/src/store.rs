@@ -180,6 +180,15 @@ impl RecordingReference {
     }
 }
 
+/// One on-disk deletion tombstone resolved by [`Store::recover_quarantined_media`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QuarantineRecovery {
+    pub session_id: SessionId,
+    /// `true` when the file was renamed back because its owning row still resolved to it,
+    /// `false` when the tombstone was unlinked because the row had already moved past it.
+    pub restored: bool,
+}
+
 /// The current user-requested transcription projection for a retained recording.
 ///
 /// Original timeline events remain untouched; saving a newer projection atomically replaces only
@@ -452,68 +461,116 @@ impl Store {
     }
 
     /// Deletes an entry, its managed recording files, and every session-owned persisted row.
+    ///
+    /// This crosses a filesystem/SQLite atomicity boundary that a single transaction cannot
+    /// span: unlinking a file and committing a row are two different durability mechanisms, and
+    /// no ordering of "unlink then commit" or "commit then unlink" is safe on its own — whichever
+    /// happens first can survive a crash while the second never runs. The fix is not ordering,
+    /// it is quarantine: every managed file is renamed to a `.{session_id}.deleting` tombstone
+    /// *before* the row transaction opens, so the rename is reversible and the row transaction is
+    /// the single atomic instant that decides whether the rename should stick. If that transaction
+    /// fails, every tombstone is renamed back and nothing is lost. If it commits, every tombstone
+    /// is unlinked for good. If the process dies between the two, [`Self::recover_quarantined_media`]
+    /// (run from [`Self::enforce_recording_budget`]) resolves the leftover tombstone from the row's
+    /// surviving state on the next pass over the recording directory — see its doc comment for
+    /// which way that resolves and why.
     pub fn delete_entry(
         &self,
         entry_id: EntryId,
         recording_directory: &Path,
     ) -> Result<(), RagError> {
+        // Membership is resolved exactly once, inside this same writer transaction, and the
+        // writer lock stays held from that resolution through the row commit. That is what
+        // guarantees the quarantined file set and the deleted row set are the same set: nothing
+        // else can attach a session to this entry in between (every attach path — `save_session`,
+        // `save_session_in_entry`, `attach_session` — also goes through `self.writer`, so it
+        // simply blocks until this call releases the lock), and the DELETE statements below only
+        // ever see the membership this same call already quarantined. Quarantine itself still has
+        // to happen before the commit, per this method's doc comment, so the transaction stays
+        // open (uncommitted) across the filesystem renames rather than being opened fresh
+        // afterward.
+        let mut connection = self.writer.lock().map_err(poisoned)?;
+        let transaction = connection.transaction().map_err(storage)?;
+        let id = entry_id.get().to_string();
         let session_ids = {
-            let connection = self.reader.lock().map_err(poisoned)?;
-            let mut statement = connection
+            let mut statement = transaction
                 .prepare("SELECT session_id FROM entry_sessions WHERE entry_id=?1")
                 .map_err(storage)?;
             statement
-                .query_map([entry_id.get().to_string()], |row| row.get::<_, String>(0))
+                .query_map([&id], |row| row.get::<_, String>(0))
                 .map_err(storage)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(storage)?
                 .into_iter()
-                .map(|id| parse_session_id(&id))
+                .map(|session_id| parse_session_id(&session_id))
                 .collect::<Result<Vec<_>, _>>()?
         };
+
+        let mut quarantined: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(session_ids.len());
         for session_id in session_ids {
-            self.remove_recording_media(
-                session_id,
-                RecordingMissingReason::Deleted,
-                recording_directory,
-            )?;
+            match self.quarantine_recording_media(session_id, recording_directory) {
+                Ok(Some(pair)) => quarantined.push(pair),
+                Ok(None) => {}
+                Err(error) => {
+                    restore_quarantined(&quarantined);
+                    return Err(error);
+                }
+            }
         }
-        let mut connection = self.writer.lock().map_err(poisoned)?;
-        let transaction = connection.transaction().map_err(storage)?;
-        let id = entry_id.get().to_string();
-        transaction
-            .execute(
-                "DELETE FROM vec_chunks WHERE chunk_id IN (\
-                   SELECT c.id FROM chunks c JOIN documents d ON d.id=c.doc_id \
-                   JOIN entry_sessions es ON es.session_id=d.source_session_id \
-                   WHERE es.entry_id=?1\
-                 )",
-                [&id],
-            )
-            .map_err(storage)?;
-        transaction
-            .execute(
-                "DELETE FROM events WHERE session_id IN (\
-                   SELECT session_id FROM entry_sessions WHERE entry_id=?1\
-                 )",
-                [&id],
-            )
-            .map_err(storage)?;
-        transaction
-            .execute(
-                "DELETE FROM sessions WHERE id IN (\
-                   SELECT session_id FROM entry_sessions WHERE entry_id=?1\
-                 )",
-                [&id],
-            )
-            .map_err(storage)?;
-        let changed = transaction
-            .execute("DELETE FROM entries WHERE id=?1", [&id])
-            .map_err(storage)?;
-        if changed == 0 {
-            return Err(RagError::NotFound { id });
+
+        let outcome = (|| {
+            transaction
+                .execute(
+                    "DELETE FROM vec_chunks WHERE chunk_id IN (\
+                       SELECT c.id FROM chunks c JOIN documents d ON d.id=c.doc_id \
+                       JOIN entry_sessions es ON es.session_id=d.source_session_id \
+                       WHERE es.entry_id=?1\
+                     )",
+                    [&id],
+                )
+                .map_err(storage)?;
+            transaction
+                .execute(
+                    "DELETE FROM events WHERE session_id IN (\
+                       SELECT session_id FROM entry_sessions WHERE entry_id=?1\
+                     )",
+                    [&id],
+                )
+                .map_err(storage)?;
+            transaction
+                .execute(
+                    "DELETE FROM sessions WHERE id IN (\
+                       SELECT session_id FROM entry_sessions WHERE entry_id=?1\
+                     )",
+                    [&id],
+                )
+                .map_err(storage)?;
+            let changed = transaction
+                .execute("DELETE FROM entries WHERE id=?1", [&id])
+                .map_err(storage)?;
+            if changed == 0 {
+                return Err(RagError::NotFound { id });
+            }
+            transaction.commit().map_err(storage)
+        })();
+
+        match outcome {
+            Ok(()) => {
+                for (_, tombstone) in &quarantined {
+                    if let Err(error) = std::fs::remove_file(tombstone) {
+                        eprintln!(
+                            "Entry deletion committed but tombstone {} could not be unlinked: {error}",
+                            tombstone.display()
+                        );
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => {
+                restore_quarantined(&quarantined);
+                Err(error)
+            }
         }
-        transaction.commit().map_err(storage)
     }
 
     /// Inserts only; duplicate identities fail rather than mutating the append-only log.
@@ -1023,10 +1080,128 @@ impl Store {
         Ok(true)
     }
 
+    /// Renames one session's managed file to its `.{session_id}.deleting` tombstone without
+    /// touching any row.
+    ///
+    /// This is the quarantine half of [`Self::delete_entry`]'s two-phase delete: unlike
+    /// [`Self::remove_recording_media`], which owns both the rename and the row update for the
+    /// single-session case, this method only ever moves the file. The caller decides the row
+    /// outcome for every quarantined session in one transaction, then either unlinks every
+    /// tombstone (commit) or renames every one back (rollback) — see [`Self::delete_entry`].
+    ///
+    /// Returns `Ok(None)` when the session has no recording, or its recording is already
+    /// `Missing`; there is nothing to quarantine either way.
+    fn quarantine_recording_media(
+        &self,
+        session_id: SessionId,
+        recording_directory: &Path,
+    ) -> Result<Option<(PathBuf, PathBuf)>, RagError> {
+        let Some(reference) = self.load_recording_reference(session_id)? else {
+            return Ok(None);
+        };
+        let path = match reference {
+            RecordingReference::Growing { path, .. } => PathBuf::from(path),
+            RecordingReference::Settled(SessionRecording::Available { path, .. }) => {
+                PathBuf::from(path)
+            }
+            RecordingReference::Settled(SessionRecording::Missing { .. }) => return Ok(None),
+        };
+        validate_recording_path(session_id, recording_directory, &path)?;
+        let tombstone = recording_directory.join(format!(".{}.deleting", session_id.get()));
+        match std::fs::rename(&path, &tombstone) {
+            Ok(()) => Ok(Some((path, tombstone))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(io_error(error)),
+        }
+    }
+
+    /// Resolves every on-disk `.{session_id}.deleting` tombstone left by an interrupted
+    /// [`Self::delete_entry`] or [`Self::remove_recording_media`] that crashed between renaming
+    /// the file away and committing (or rolling back) the row change that was meant to decide its
+    /// fate.
+    ///
+    /// The row is the only durable record of which side of that line a crash landed on, so it is
+    /// the sole input to the decision, checked against a session's `sessions` row and its
+    /// `session_recordings.path` column rather than trusting anything about the tombstone itself:
+    ///
+    /// - The session row is gone, or its recording row survives with `path` already cleared (the
+    ///   `deleted`/`pruned` terminal state) — the row-side commit reached disk before the crash.
+    ///   Finish what it started: unlink the tombstone. Restoring here would resurrect a file whose
+    ///   owning record has already moved past it, which is a worse outcome than losing the file.
+    /// - The session row still exists and its recording row still carries a path — the commit
+    ///   never reached disk, so from the row's perspective the file was never removed. Rename the
+    ///   tombstone back, leaving the state exactly as if the deletion had not been attempted.
+    ///
+    /// Deliberately not run inside [`Self::open`]: opening a database has no `recording_directory`
+    /// to scan. Instead this runs at the top of [`Self::enforce_recording_budget`], the one place
+    /// already given a recording directory on every call site the app has today (after a recording
+    /// settles, and whenever the retention budget changes) — so both existing callers resolve any
+    /// leftover tombstone before they measure or prune anything, with no separate wiring required.
+    pub fn recover_quarantined_media(
+        &self,
+        recording_directory: &Path,
+    ) -> Result<Vec<QuarantineRecovery>, RagError> {
+        let mut resolved = Vec::new();
+        let entries = match std::fs::read_dir(recording_directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(resolved),
+            Err(error) => return Err(io_error(error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(io_error)?;
+            let file_name = entry.file_name();
+            let Some(session_id) = file_name.to_str().and_then(parse_tombstone_session_id) else {
+                continue;
+            };
+            let tombstone = entry.path();
+            let original = recording_directory.join(format!("{}.mp4", session_id.get()));
+            let session_exists = self
+                .reader
+                .lock()
+                .map_err(poisoned)?
+                .query_row(
+                    "SELECT 1 FROM sessions WHERE id=?1",
+                    [session_id.get().to_string()],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(storage)?
+                .is_some();
+            let recording_path_present = session_exists
+                && self
+                    .reader
+                    .lock()
+                    .map_err(poisoned)?
+                    .query_row(
+                        "SELECT 1 FROM session_recordings WHERE session_id=?1 AND path IS NOT NULL",
+                        [session_id.get().to_string()],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(storage)?
+                    .is_some();
+            if session_exists && recording_path_present {
+                std::fs::rename(&tombstone, &original).map_err(io_error)?;
+                resolved.push(QuarantineRecovery {
+                    session_id,
+                    restored: true,
+                });
+            } else {
+                std::fs::remove_file(&tombstone).map_err(io_error)?;
+                resolved.push(QuarantineRecovery {
+                    session_id,
+                    restored: false,
+                });
+            }
+        }
+        Ok(resolved)
+    }
+
     pub fn enforce_recording_budget(
         &self,
         recording_directory: &Path,
     ) -> Result<Vec<SessionId>, RagError> {
+        self.recover_quarantined_media(recording_directory)?;
         let budget = self.recording_usage()?.budget_bytes;
         let connection = self.reader.lock().map_err(poisoned)?;
         let mut statement = connection
@@ -1930,6 +2105,33 @@ fn wall_clock_unix_ms() -> Result<u64, RagError> {
 
 fn io_error(error: io::Error) -> RagError {
     RagError::Storage(error.to_string())
+}
+
+/// Renames every quarantined file back to where [`Store::quarantine_recording_media`] found it.
+///
+/// Used on every failure path out of [`Store::delete_entry`] after quarantine has begun — a
+/// filesystem error partway through quarantining the entry's sessions, or the row transaction
+/// itself failing. A rename-back failure here is not escalated: it leaves a tombstone that
+/// [`Store::recover_quarantined_media`] resolves on the next pass, because the row it belongs to
+/// was never touched and still carries the original path.
+fn restore_quarantined(quarantined: &[(PathBuf, PathBuf)]) {
+    for (original, tombstone) in quarantined {
+        if let Err(error) = std::fs::rename(tombstone, original) {
+            eprintln!(
+                "Could not restore quarantined recording {} from {}: {error}",
+                original.display(),
+                tombstone.display()
+            );
+        }
+    }
+}
+
+fn parse_tombstone_session_id(file_name: &str) -> Option<SessionId> {
+    file_name
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".deleting"))
+        .and_then(|middle| middle.parse::<u128>().ok())
+        .map(SessionId::new)
 }
 
 fn validate_recording_path(

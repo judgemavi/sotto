@@ -1272,6 +1272,216 @@ mod tests {
     }
 
     #[test]
+    fn deleting_unknown_entry_returns_not_found_and_touches_no_file()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let store = Store::open_in_memory()?;
+        let entry = Entry::new(EntryId::new(900), 1_900_000_000_000, None);
+        store.create_entry(&entry)?;
+        let recorded = session();
+        store.save_session_in_entry(&recorded, entry.id())?;
+        let recording_path = directory
+            .path()
+            .join(format!("{}.mp4", recorded.id().get()));
+        std::fs::write(&recording_path, b"retained meeting media")?;
+        store.save_growing_recording(recorded.id(), &recording_path)?;
+
+        let missing = EntryId::new(901);
+        let outcome = store.delete_entry(missing, directory.path());
+        assert!(
+            matches!(outcome, Err(sotto_core::RagError::NotFound { .. })),
+            "an unknown entry id must report NotFound, not a storage failure"
+        );
+        assert!(
+            recording_path.exists(),
+            "a delete that never resolves a real entry must not touch any file"
+        );
+        assert_eq!(
+            store.list_entries()?.len(),
+            1,
+            "the real entry must survive a delete request for a different id"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delete_entry_restores_every_file_when_the_row_transaction_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("entry-delete-rollback.sqlite3");
+        let store = Store::open(&path)?;
+        let entry = Entry::new(EntryId::new(120), 1_700_000_000_000, None);
+        store.create_entry(&entry)?;
+        let first = session();
+        let second = Session::new(
+            SessionId::new(8),
+            CaptureTarget::microphone_only(),
+            1_700_000_060_000,
+        );
+        let mut paths = Vec::new();
+        for captured in [&first, &second] {
+            store.save_session_in_entry(captured, entry.id())?;
+            let recording_path = directory
+                .path()
+                .join(format!("{}.mp4", captured.id().get()));
+            std::fs::write(&recording_path, b"retained meeting media")?;
+            store.save_growing_recording(captured.id(), &recording_path)?;
+            paths.push(recording_path);
+        }
+
+        // Force the row transaction to fail after quarantine has already renamed both files away,
+        // simulating any mid-transaction failure (constraint, lock, disk) unrelated to the file
+        // system half of the delete.
+        let connection = Connection::open(&path)?;
+        connection.execute_batch(&format!(
+            "CREATE TRIGGER refuse_entry_delete BEFORE DELETE ON entries WHEN old.id='{}' \
+             BEGIN SELECT RAISE(ABORT, 'simulated row-transaction failure'); END;",
+            entry.id().get()
+        ))?;
+
+        let outcome = store.delete_entry(entry.id(), directory.path());
+        assert!(
+            matches!(outcome, Err(sotto_core::RagError::Storage(_))),
+            "a rejected row transaction must fail the whole delete"
+        );
+
+        for recording_path in &paths {
+            assert!(
+                recording_path.exists(),
+                "quarantined media must be restored when the row transaction fails"
+            );
+        }
+        let tombstones = std::fs::read_dir(directory.path())?
+            .filter_map(Result::ok)
+            .filter(|item| item.file_name().to_string_lossy().ends_with(".deleting"))
+            .count();
+        assert_eq!(
+            tombstones, 0,
+            "no tombstone may survive a delete that restored every file"
+        );
+
+        assert_eq!(store.entry_for_session(first.id())?, entry.id());
+        assert_eq!(store.entry_for_session(second.id())?, entry.id());
+        assert_eq!(
+            store.list_entries()?[0].session_ids(),
+            &[first.id(), second.id()],
+            "the entry must resolve fully intact, not half-deleted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recover_quarantined_media_resolves_each_tombstone_from_the_row_that_survived_a_crash()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("recover.sqlite3");
+        let store = Store::open(&path)?;
+
+        // Case 1: the crash happened before the row-side commit reached disk. The session and its
+        // recording's path both still resolve to this file, so recovery must restore it.
+        let uncommitted = Session::new(
+            SessionId::new(30),
+            CaptureTarget::microphone_only(),
+            1_700_000_000_000,
+        );
+        store.save_session(&uncommitted)?;
+        let uncommitted_path = directory
+            .path()
+            .join(format!("{}.mp4", uncommitted.id().get()));
+        std::fs::write(&uncommitted_path, b"still referenced media")?;
+        store.save_growing_recording(uncommitted.id(), &uncommitted_path)?;
+        let uncommitted_tombstone = directory
+            .path()
+            .join(format!(".{}.deleting", uncommitted.id().get()));
+        std::fs::rename(&uncommitted_path, &uncommitted_tombstone)?;
+
+        // Case 2: the crash happened after the row-side commit reached disk but before the final
+        // unlink. The recording row already shows no path, so recovery must finish the unlink.
+        let cleared_row = Session::new(
+            SessionId::new(31),
+            CaptureTarget::microphone_only(),
+            1_700_000_000_001,
+        );
+        store.save_session(&cleared_row)?;
+        let cleared_row_path = directory
+            .path()
+            .join(format!("{}.mp4", cleared_row.id().get()));
+        std::fs::write(&cleared_row_path, b"already-deleted-per-row media")?;
+        store.save_growing_recording(cleared_row.id(), &cleared_row_path)?;
+        let cleared_row_tombstone = directory
+            .path()
+            .join(format!(".{}.deleting", cleared_row.id().get()));
+        std::fs::rename(&cleared_row_path, &cleared_row_tombstone)?;
+        Connection::open(&path)?.execute(
+            "UPDATE session_recordings SET state='deleted',path=NULL,container=NULL WHERE session_id=?1",
+            [cleared_row.id().get().to_string()],
+        )?;
+
+        // Case 3: an entry-level delete's row transaction committed and removed the session row
+        // entirely before the crash. There is nothing left to restore to, so recovery must finish
+        // the unlink exactly as it does when only the recording row was cleared.
+        let gone = Session::new(
+            SessionId::new(32),
+            CaptureTarget::microphone_only(),
+            1_700_000_000_002,
+        );
+        store.save_session(&gone)?;
+        let gone_path = directory.path().join(format!("{}.mp4", gone.id().get()));
+        std::fs::write(&gone_path, b"orphaned media")?;
+        store.save_growing_recording(gone.id(), &gone_path)?;
+        let gone_tombstone = directory
+            .path()
+            .join(format!(".{}.deleting", gone.id().get()));
+        std::fs::rename(&gone_path, &gone_tombstone)?;
+        store.delete_session(gone.id())?;
+
+        drop(store);
+        let restarted = Store::open(&path)?;
+        let resolved = restarted.recover_quarantined_media(directory.path())?;
+        assert_eq!(
+            resolved.len(),
+            3,
+            "one sweep must resolve every tombstone left behind"
+        );
+
+        assert!(
+            uncommitted_path.exists(),
+            "an uncommitted delete must restore its file"
+        );
+        assert!(!uncommitted_tombstone.exists());
+        assert_eq!(
+            restarted
+                .load_recording_reference(uncommitted.id())?
+                .map(|reference| reference.session_id()),
+            Some(uncommitted.id())
+        );
+
+        assert!(
+            !cleared_row_path.exists(),
+            "a recording row already marked deleted must not resurrect its file"
+        );
+        assert!(!cleared_row_tombstone.exists());
+
+        assert!(
+            !gone_path.exists(),
+            "a fully deleted session must not resurrect its file"
+        );
+        assert!(!gone_tombstone.exists());
+
+        let restored_ids: Vec<_> = resolved
+            .iter()
+            .filter(|resolution| resolution.restored)
+            .map(|resolution| resolution.session_id)
+            .collect();
+        assert_eq!(
+            restored_ids,
+            vec![uncommitted.id()],
+            "only the uncommitted case may resolve as a restore"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn deleting_meeting_removes_only_session_owned_local_knowledge_and_vectors()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
@@ -1390,6 +1600,202 @@ mod tests {
                 .load_derived_view(SessionId::new(7), "meeting_notes.v1", "backend", "content")?
                 .is_none()
         );
+        Ok(())
+    }
+
+    /// Regression for the migration-versioning hazard: a step that has not reached its result
+    /// must never leave `user_version` stamped at the final schema version, or a crash right
+    /// after it commits strands the database forever (the next open sees `version == SCHEMA_
+    /// VERSION`, so no migration block's condition ever matches again).
+    ///
+    /// This forces the v12 -> v13 step (create/backfill `entries`) to fail outright by seeding a
+    /// stub `entries` table the backfill's column list does not match, which simulates a crash
+    /// landing between the v11 -> v12 commit (drop `session_search_policy`) and the v12 -> v13
+    /// commit: the earlier step succeeds and commits, the later one never does. The earlier
+    /// commit must be found parked at its own v12 checkpoint, not at 13 — and clearing the
+    /// conflict must let the very next open finish the walk to a complete, correct v13 schema,
+    /// including a working `entries` table (the concrete failure this hazard produces is
+    /// `Store::save_session`'s `ensure_session_entry` failing with "no such table: entries" on
+    /// the very next recording).
+    #[test]
+    fn a_migration_step_that_fails_does_not_strand_the_earlier_commit_at_the_final_version()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("rag-v11-interrupted.sqlite3");
+        {
+            let store = Store::open(&path)?;
+            store.save_session(&session())?;
+        }
+        {
+            let connection = Connection::open(&path)?;
+            connection.execute_batch(
+                "DROP TABLE entry_sessions;
+                 DROP TABLE entries;
+                 CREATE TABLE entries(id TEXT PRIMARY KEY NOT NULL);
+                 PRAGMA user_version=11;",
+            )?;
+        }
+
+        assert!(
+            Store::open(&path).is_err(),
+            "a genuine schema conflict in the last migration step must surface as an error, not \
+             a silently skipped step"
+        );
+        assert_eq!(
+            Connection::open(&path)?
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+            12,
+            "the session_search_policy drop (v11 -> v12) must be durably parked at its own \
+             checkpoint, not stranded at the final schema version by a step that never committed"
+        );
+
+        Connection::open(&path)?.execute_batch("DROP TABLE entries;")?;
+        let recovered = Store::open(&path)?;
+        assert_eq!(
+            Connection::open(&path)?
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+            13,
+            "resuming from the correctly-parked intermediate version must converge to the \
+             current schema"
+        );
+        let entries = recovered.list_entries()?;
+        assert_eq!(
+            entries.len(),
+            1,
+            "the entries backfill must run to completion on the next open"
+        );
+
+        let another = Session::new(
+            SessionId::new(42),
+            CaptureTarget::microphone_only(),
+            1_800_000_000_000,
+        );
+        recovered.save_session(&another)?;
+        assert_eq!(
+            recovered.list_entries()?.len(),
+            2,
+            "a fresh recording must succeed once entries is genuinely complete — this is exactly \
+             the 'no such table: entries' failure a stranded version would have produced"
+        );
+        Ok(())
+    }
+
+    /// Regression for the `delete_entry` quarantine race: the set of sessions whose media is
+    /// quarantined and the set whose rows are deleted must be the same set even when another
+    /// thread attaches a session to the entry at the same moment. Before the fix, membership was
+    /// resolved once under the reader lock (snapshotting only `first`), released, and re-resolved
+    /// live inside the row transaction — so a session attached in that gap had its row deleted
+    /// without its media ever being quarantined, permanently orphaning the file.
+    ///
+    /// `second` is inserted directly (bypassing the usual implicit-entry creation) so it starts
+    /// out fully formed — row, registered growing recording, file on disk — but attached to no
+    /// entry, which is exactly what lets a single `attach_session` call race `delete_entry`
+    /// without any secondary "row exists but recording not yet registered" gap confusing the
+    /// result. Because `delete_entry` now holds the writer lock across membership resolution,
+    /// quarantine, and the row commit, the two calls can never interleave: either the attach
+    /// commits first (and `second` must vanish, row and file together) or `delete_entry` commits
+    /// first, `second`'s entry has gone by the time the attach runs, and it is refused outright
+    /// (and `second` must survive, row and file together). Both outcomes are asserted; only a
+    /// split result — file gone but row alive, or row gone but file alive — is a failure.
+    #[test]
+    fn deleting_an_entry_cannot_diverge_the_quarantined_set_from_the_deleted_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for attempt in 0_u128..8 {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("race.sqlite3");
+            let store = std::sync::Arc::new(Store::open(&path)?);
+
+            let entry = Entry::new(EntryId::new(500 + attempt), 1_700_000_000_000, None);
+            store.create_entry(&entry)?;
+            let first = Session::new(
+                SessionId::new(1000 + attempt * 10),
+                CaptureTarget::microphone_only(),
+                1_700_000_000_000,
+            );
+            store.save_session_in_entry(&first, entry.id())?;
+            let first_path = directory.path().join(format!("{}.mp4", first.id().get()));
+            std::fs::write(&first_path, b"first retained media")?;
+            store.save_growing_recording(first.id(), &first_path)?;
+
+            let second_id = SessionId::new(1000 + attempt * 10 + 1);
+            Connection::open(&path)?.execute(
+                "INSERT INTO sessions VALUES(?1,?2,NULL,NULL,'Microphone only',NULL,'microphone',1)",
+                params![second_id.get().to_string(), 1_700_000_000_001_i64],
+            )?;
+            let second_path = directory.path().join(format!("{}.mp4", second_id.get()));
+            std::fs::write(&second_path, b"second retained media")?;
+            store.save_growing_recording(second_id, &second_path)?;
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let attach_outcome = {
+                let store = std::sync::Arc::clone(&store);
+                let barrier = std::sync::Arc::clone(&barrier);
+                let entry_id = entry.id();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.attach_session(entry_id, second_id)
+                })
+            };
+            let delete_outcome = {
+                let store = std::sync::Arc::clone(&store);
+                let barrier = std::sync::Arc::clone(&barrier);
+                let entry_id = entry.id();
+                let recording_directory = directory.path().to_path_buf();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.delete_entry(entry_id, &recording_directory)
+                })
+            };
+            let attach_outcome = attach_outcome
+                .join()
+                .map_err(|_| "attach thread panicked")?;
+            let delete_outcome = delete_outcome
+                .join()
+                .map_err(|_| "delete thread panicked")?;
+
+            assert!(
+                delete_outcome.is_ok(),
+                "attempt {attempt}: deleting the entry's own original member must always succeed"
+            );
+            assert!(
+                !first_path.exists(),
+                "attempt {attempt}: the entry's original member must always be cascaded away"
+            );
+
+            let second_row_survives = store.load_session_record(second_id).is_ok();
+            let second_file_survives = second_path.exists();
+            match attach_outcome {
+                Ok(()) => {
+                    assert!(
+                        !second_row_survives,
+                        "attempt {attempt}: the attach committed first, so `second` was a real \
+                         member and must be cascaded away with the entry"
+                    );
+                    assert!(
+                        !second_file_survives,
+                        "attempt {attempt}: `second`'s media must be quarantined and unlinked \
+                         exactly when its row is deleted, not left orphaned on disk"
+                    );
+                }
+                Err(_) => {
+                    assert!(
+                        second_row_survives,
+                        "attempt {attempt}: the attach was refused because the entry was \
+                         already gone, so `second`'s own row must be untouched"
+                    );
+                    assert!(
+                        second_file_survives,
+                        "attempt {attempt}: a refused attach must leave `second`'s media exactly \
+                         where it was, never quarantined for an entry it never joined"
+                    );
+                }
+            }
+            assert_eq!(
+                second_row_survives, second_file_survives,
+                "attempt {attempt}: `second`'s row and media must agree on whether it was ever \
+                 part of the deleted entry — a split result is an orphaned or lost file"
+            );
+        }
         Ok(())
     }
 }
