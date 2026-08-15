@@ -56,6 +56,24 @@ Say which one is chosen by default and why. `ModelSize::default()` resolves to `
 **The choice is the user's and it persists.** Picking a model downloads that one. A user who wants
 `MediumEn` should not have to take `SmallEn` first.
 
+**Everything that needs Whisper is disabled until a model exists.** That is start-recording, import,
+and re-transcribe — the same three paths listed above, which is not a coincidence: they are exactly
+the actions that would otherwise trigger a silent download. Reading a transcript, browsing the
+library, renaming, deleting, and Ask over existing material all stay available.
+
+This deliberately contradicts a rule the codebase otherwise holds, so the distinction has to be
+right. T079 removed the Pause control rather than ship it disabled, reasoning that *"a permanently
+disabled control is worse than an absent one: a person reads it as a capability that is momentarily
+unavailable and waits for it, where an absent control simply tells the truth."*
+
+Here the person would be reading it correctly. Recording **is** momentarily unavailable, and waiting
+**is** the right response — the wait is a download the same surface is offering. Pause was
+permanently unavailable, which is why absence was honest there and would be dishonest here.
+
+So follow the pattern T079 cites as the counter-example done correctly: present, inert, and saying
+in place why. A disabled record button that explains nothing fails this as badly as a silent
+download does — it must name the reason and point at the choice that resolves it.
+
 ## Two defects to fix while here
 
 1. **The capture bar discards progress it already has.** `crates/app/src/workspace/layout.rs:545`
@@ -76,6 +94,10 @@ import discards progress entirely.
 - Launching with no model present shows the choice on the home surface, and the app remains usable
   for everything that does not need transcription — reading an existing transcript, browsing the
   library, deleting a recording.
+- With no model present, start-recording, import, and re-transcribe are inert and each says in place
+  why, pointing at the choice that resolves it. None of them silently triggers a download, and none
+  is merely greyed out without a reason.
+- Once a model is present those three are live, with no relaunch required.
 - Every offered model shows its real download size, sourced from `ModelSize::spec()` rather than
   restated.
 - Any runtime-cost figure shown is measured, with its method recorded in this task. No invented
