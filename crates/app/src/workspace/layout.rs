@@ -555,11 +555,13 @@ fn render_capture_bar(
                 .text_size(TypeScale::CLOCK)
                 .child(format_clock(elapsed)),
         )
-        // No Pause control. The mock draws one, but nothing in `capture` or `session` can suspend a
-        // recording — it was rendered permanently disabled, which is worse than absent: a person
-        // reads it as a capability that is momentarily unavailable rather than one that does not
-        // exist. Pausing is not free under ADR-0018 either, because the recording is the source of
-        // truth and a gap in media time moves every timestamp after it. T079 owns that decision.
+        // No Pause control, decided (not deferred) by T079. Compressing the timeline to keep
+        // ADR-0018's transcript-time-is-media-time identity intact is buildable, but the writer,
+        // origin tracking, and segment sink already carry real ScreenCaptureKit/AVFoundation
+        // fragility (see ADR-0018's amendments), and pause behaviour can only be proven against a
+        // real signed capture — infrastructure this codebase does not yet have outside a manual
+        // maintainer run. Stop-and-start-a-new-recording is the supported way to break up a
+        // session; two recordings are a more honest record than one with an unverified hole in it.
         .child(
             ControlRole::Essential,
             div()

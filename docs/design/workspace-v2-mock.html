@@ -182,8 +182,10 @@ input, textarea { font: inherit; color: inherit; }
   font-size: 11px; padding: 2px 8px; border-radius: 20px;
   background: var(--surface); border: 1px solid var(--live-line); color: var(--muted);
 }
-/* shrink order while recording: chips drop first, then pause; the
-   target name ellipsizes; Stop and the clock never move or clip */
+/* shrink order while recording: chips drop first; the target name
+   ellipsizes; Stop and the clock never move or clip. There is no Pause
+   control (T079: stop-and-start-again is the supported way to break up
+   a recording, not an in-place suspend). */
 @media (max-width: 900px) { .scopechips { display: none; } }
 @media (max-width: 700px) { .capturebar .collapses { display: none; } }
 
@@ -537,14 +539,16 @@ input, textarea { font: inherit; color: inherit; }
   </div>
 
   <!-- Recording: Stop and the clock are .keep — they can never shrink
-       or clip at any window width. Chips drop first, then Pause. -->
+       or clip at any window width. Chips drop first. No Pause control:
+       T079 decided against it (see the ADR-0018 media-time discussion in
+       that task's history) — stop-and-start-a-new-recording is the
+       supported way to break up a session. -->
   <div class="capturebar" id="captureBar" hidden>
     <span class="recdot keep"></span>
     <span class="kind keep" id="capKind">Recording</span>
     <span class="target ellip" id="capTarget">Zoom — Weekly sync</span>
     <div class="scopechips" id="capChips"></div>
     <span class="clock tc keep" id="capClock">00:00</span>
-    <button class="btn ghost collapses" id="pauseBtn" type="button">Pause</button>
     <button class="btn stop keep" id="stopBtn" type="button">■ Stop</button>
   </div>
 
@@ -1199,10 +1203,6 @@ $("demoIdle").onclick = goIdle;
 $("demoLive").onclick = function () { startLive({ title: "Weekly sync", target: "Zoom" }); };
 $("demoDone").onclick = function () { openSession("s1"); };
 $("stopBtn").onclick = stopLive;
-$("pauseBtn").onclick = function () {
-  var paused = this.textContent === "Resume";
-  this.textContent = paused ? "Pause" : "Resume";
-};
 $("libList").onclick = function (e) {
   var row = e.target.closest("[data-open]");
   if (!row) return;
