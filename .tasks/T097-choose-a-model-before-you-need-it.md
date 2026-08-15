@@ -1,0 +1,102 @@
+# T097 — Choose a transcription model before you need it
+
+**Status:** todo
+
+**Wave:** M4 — recording
+
+**Depends on:** T078's home surface, which is where this lands. Coordinate with it — T078 owns
+`layout.rs`, `mod.rs`, and `library.rs` and is `in-review`.
+
+**Owns:** the launch-time model check and its home-surface presentation, the model-choice state in
+`crates/app/src/settings/**` if a persisted choice needs a home, the progress plumbing in
+`crates/app/src/session/**`, and this task. `crates/asr/**` is read-only here: `ModelSize::spec()`
+already exposes everything this needs.
+
+## Why this exists
+
+Whisper weights are downloaded by exactly three code paths, and every one of them is triggered by
+an action the user takes because they want something to happen *right now*:
+
+- `crates/app/src/session/mod.rs:1077` — pressing record
+- `crates/app/src/session/import.rs:105` — importing a file
+- `crates/app/src/workspace/mod.rs:1087` — re-transcribing
+
+Nothing provisions at launch. So the first recording anyone makes stalls behind a 488 MB download
+at the exact moment they least want to wait — a meeting has started, they pressed record, and the
+capture bar says "Preparing" for thirty seconds with no indication that half a gigabyte is moving.
+Observed on 2026-08-15: `ggml-small.en.bin` landed at 19:29 during what looked like a hang.
+
+The download is not the problem. Doing it at the worst possible moment, silently, and without ever
+asking is the problem.
+
+## What to build
+
+**On launch, if no usable model is present, the home surface says so and offers the choice.** Not a
+modal that blocks the app, and not a silent background fetch — a visible, dismissible state on the
+surface the user already lands on, because a person who opens Sotto to read an old transcript should
+not be forced through a download first.
+
+**Present every option with what it costs.** `ModelSize::spec()` already carries the exact figures;
+do not restate them as literals:
+
+| Size | File | Download |
+|---|---|---|
+| `BaseEn` | `ggml-base.en.bin` | 147,964,211 bytes (~148 MB) |
+| `SmallEn` | `ggml-small.en.bin` | 487,614,201 bytes (~488 MB) |
+| `MediumEn` | `ggml-medium.en.bin` | 1,533,774,781 bytes (~1.53 GB) |
+
+Download size is a fact and comes from `spec()`. **Runtime cost — memory and relative speed — is
+not currently recorded anywhere**, and the task's own honesty bar applies: state what is measured,
+not what sounds plausible. Either measure the resident cost of each model on this hardware and
+record the figures with their method, or describe the tradeoff qualitatively without inventing
+numbers. Do not ship a table of confident-looking megabytes nobody measured.
+
+Say which one is chosen by default and why. `ModelSize::default()` resolves to `SmallEn` today.
+
+**The choice is the user's and it persists.** Picking a model downloads that one. A user who wants
+`MediumEn` should not have to take `SmallEn` first.
+
+## Two defects to fix while here
+
+1. **The capture bar discards progress it already has.** `crates/app/src/workspace/layout.rs:545`
+   matches `SessionLifecycle::ProvisioningModel { target, .. }` and drops the `progress` field,
+   rendering a bare "Preparing". `progress_label` (`crates/app/src/session/mod.rs:1825`) already
+   computes `"Downloading base.en… 40% (195 of 488 MB). Stop keeps a resumable partial."` A download
+   that must still happen mid-session has to show that, not hide it.
+
+2. **Those labels name the wrong model.** `progress_label` hardcodes `base.en` in all three phases
+   while `ModelSize::default()` resolves to `SmallEn`. The message states a fact that is not true.
+   It must name the model actually being fetched.
+
+Also note `crates/app/src/session/import.rs:108` passes `|_| {}` as its progress callback, so an
+import discards progress entirely.
+
+## Acceptance
+
+- Launching with no model present shows the choice on the home surface, and the app remains usable
+  for everything that does not need transcription — reading an existing transcript, browsing the
+  library, deleting a recording.
+- Every offered model shows its real download size, sourced from `ModelSize::spec()` rather than
+  restated.
+- Any runtime-cost figure shown is measured, with its method recorded in this task. No invented
+  numbers.
+- The chosen model persists across a relaunch, and choosing one downloads that one.
+- Launching with a model already present shows none of this.
+- A download still triggered mid-session reports its phase and percentage, and names the model it is
+  actually fetching.
+- Cancelling a download leaves a resumable partial, as `progress_label` already promises.
+- Full tests, strict Clippy over all targets, formatting, and diff checks pass.
+
+## Out of scope
+
+Changing which models are offered or their pinned checksums (`crates/asr/**` owns that), the
+transcription pipeline itself, and model eviction or disk reclamation.
+
+## Notes
+
+Raised on 2026-08-15 after a maintainer observed a thirty-second "Preparing" on first record and
+asked why the app had not settled this at launch. No recorded design intent was found for the
+current behaviour: T023 is cited elsewhere as the provisioning precedent — "first-run download,
+integrity check, progress, lazy load and idle unload" — but that task file is no longer on the
+board, and "first run" was implemented as first *recording* rather than first *launch*. This is an
+open design question, not a regression against a recorded decision.
