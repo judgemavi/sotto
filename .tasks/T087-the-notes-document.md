@@ -1,6 +1,6 @@
 # T087 — The notes document: a summary you can edit without losing either author
 
-**Status:** blocked
+**Status:** todo
 
 **Wave:** D1 — living notes
 

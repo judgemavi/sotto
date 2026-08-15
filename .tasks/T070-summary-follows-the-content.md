@@ -1,6 +1,6 @@
 # T070 — Summarize what was recorded, not what a meeting would have been
 
-**Status:** in-progress
+**Status:** done
 
 **Wave:** R3 — reasoning product
 

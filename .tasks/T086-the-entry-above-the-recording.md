@@ -1,6 +1,6 @@
 # T086 — The entry above the recording
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N8 — entry workspace
 
