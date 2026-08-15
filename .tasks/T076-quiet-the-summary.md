@@ -72,6 +72,13 @@ The notes taxonomy (T070), the transcript column (T077), the shell and library (
 
 All three defects are closed inside `crates/app/src/workspace/notes.rs`. No other file was edited.
 
+The final review found and corrected one regression in the current tree: the compact per-claim
+evidence control had been removed in favour of the whole-summary toggle alone, despite the
+acceptance contract requiring both paths. `EvidenceDisclosure` once again tracks individual claim
+reveals as well as the whole-summary reveal. Mounted coverage opens the first claim, observes both
+of its citations, and proves the neighbouring claims remain quiet before exercising the global
+toggle.
+
 **1. Citations are quiet by default.** `EvidenceDisclosure` decides, per rendered summary, which
 claims spend vertical space on chips. It is *display* state and holds nothing else: it lives in
 window element state (`Window::use_keyed_state`), not on `MeetingWorkspace` and not in the record,
@@ -135,7 +142,7 @@ escape never reaches the clipboard.
 | Empty sources = one quiet line; configured = policy where it applies | PASS — `the_sources_block_is_one_quiet_line_until_a_source_exists`, `a_configured_source_states_its_policy_where_the_controls_are` |
 | Summary and note text can be selected and copied | PASS — `a_summary_claim_can_be_selected_and_copied` drags across a rendered claim, presses the copy binding and reads the real clipboard |
 | No control clips at 680 px | PASS — bounds asserted for every control in both the quiet and revealed states |
-| Focused and full app tests, strict Clippy, formatting, diff checks | PASS — 188 app tests; `cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0; `cargo fmt --all -- --check` exit 0 |
+| Focused and full app tests, strict Clippy, formatting, diff checks | PASS — 26 focused notes tests; full app suite 237 passed and 4 explicitly ignored real-media cases; `cargo clippy -p app --all-targets --all-features --locked -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` all exit 0 |
 
 **NOT RUN**
 

@@ -64,6 +64,26 @@ and Ask (T069).
 
 All work landed in `crates/app/src/workspace/transcript.rs`. No sibling-owned file was touched.
 
+### Closure review (2026-08-15)
+
+**Not closable yet:** the legend gets narrower, but does not actually collapse before content.
+Production builds the head with `ControlRow::new()`, whose contract never drops expendable
+children; only `ControlRow::for_width(...)` applies the shared collapse threshold. The mounted test
+also requires the narrow legend to remain present and proves only that its measured width shrinks.
+This misses the task's explicit acceptance and the normative mock's `.collapses` behaviour.
+
+The correct repair must wait for the current owners of `transcript.rs` (T077) and `layout.rs`
+(T078): pass the available width from `MeetingWorkspace::render` through the transcript renderer,
+construct the head with `ControlRow::for_width(available)`, and assert that the legend has positive
+bounds when wide but is absent at or below `ControlRow::COLLAPSE_WIDTH`, while the label remains.
+Do not substitute a transcript-local breakpoint.
+
+Current automated evidence is otherwise sound. The focused transcript suite passes 33 tests and
+strict app Clippy is clean. Later T077/T078 work now covers row anchoring and routes summary chips
+through `open_citation` to `reveal_citation`, so the older NOT RUN statements below about having no
+caller and no automated anchor assertion are historical. The mounted citation test establishes the
+tab/focus landing, but it still does not assert the visible flash state or its 1.4-second decay.
+
 ### Attribution and the collapsing legend
 
 `source_label` now returns ADR-0019's vocabulary — `captured audio` for `Source::System`,
