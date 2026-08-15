@@ -23,7 +23,7 @@ use std::{
 use chrono::Datelike as _;
 use gpui::{
     AnyElement, Context, Entity, FontWeight, Global, MouseButton, Pixels, Rgba, Subscription,
-    Window, div, prelude::*, px,
+    Timer, Window, div, prelude::*, px,
 };
 use gpui_component::{
     Sizable as _,
@@ -34,7 +34,10 @@ use gpui_component::{
 };
 use insight::{RecordingNotes, RecordingNotesBlock, load_latest_grounded_notes};
 use rag::{SessionSummary, Store};
-use sotto_core::{EventPayload, SessionId, types::RecordingTitle};
+use sotto_core::{
+    EventPayload, SessionId,
+    types::{RecordingTitle, is_imported_capture_target},
+};
 
 use super::{
     MeetingWorkspace,
@@ -43,7 +46,7 @@ use super::{
     layout::format_bytes,
     tokens::{Space, TypeScale, WorkspaceTokens},
 };
-use crate::session::SessionController;
+use crate::session::{RecordingLibrary, SessionController};
 
 /// The rail's nominal width, matching the shell's default left panel. It is well below
 /// [`ControlRow::COLLAPSE_WIDTH`], which is the honest answer for every row in here: the rail is
@@ -77,7 +80,30 @@ impl LibraryFootprint {
     ///
     /// A recording the store has marked deleted or pruned contributes zero, so the size never
     /// counts bytes that are no longer on the disk.
+    ///
+    /// This is also where a crash-interrupted delete gets repaired. `rebuild_library_index` calls
+    /// this on every catalogue-changing event, and the first of those is the one built into
+    /// `MeetingWorkspace::new` at launch — so a `.{session_id}.deleting` tombstone left by a crash
+    /// mid-delete (`Store::recover_quarantined_media`'s only other callers are "after a recording
+    /// settles" and "when the retention budget changes", neither of which is app launch) gets
+    /// resolved before the rail can list the row it belongs to as available. A recovery failure is
+    /// logged and otherwise ignored: it must never block the footprint the home surface shows, the
+    /// way a failed capture must never block review of what was already recorded.
     pub(crate) fn measure(database: &Path, meetings: &[SessionSummary]) -> Self {
+        // Derived from `database` itself, exactly the way `application_recording_directory`
+        // derives it from `application_database_path`, rather than calling that global function
+        // directly: production always passes the same path both would resolve, but a test's own
+        // isolated `database` must recover against its own temp `recordings` directory, never
+        // against whatever `application_recording_directory()` resolves to on the machine running
+        // the test.
+        let recording_directory = database
+            .parent()
+            .map_or_else(std::env::temp_dir, Path::to_path_buf)
+            .join("recordings");
+        if let Err(error) = RecordingLibrary::new(database, recording_directory).recover_at_launch()
+        {
+            eprintln!("Recording crash-recovery check failed: {error}");
+        }
         let retained_bytes = Store::open(database)
             .and_then(|store| store.list_recordings())
             .map(|recordings| {
@@ -271,7 +297,9 @@ pub(crate) fn group_rail(
         let row = RailRow {
             id: meeting.id,
             title,
-            icon: if meeting.capture_target.is_microphone_only() {
+            icon: if is_imported_capture_target(&meeting.capture_target) {
+                icons::IMPORT
+            } else if meeting.capture_target.is_microphone_only() {
                 icons::MICROPHONE
             } else {
                 icons::CAPTURED
@@ -765,7 +793,8 @@ pub(crate) enum StartChoice {
     CaptureApp,
     /// Microphone only: no picker, no screen, no application audio. Wired by T050.
     Microphone,
-    /// A file the user already has becomes a session. T071; not built.
+    /// A file the user already has becomes a session. Wired through
+    /// `SessionController::start_import`.
     Import,
 }
 
@@ -804,14 +833,12 @@ impl StartChoice {
     }
 
     /// The plain sentence an entry point says about itself when it cannot do its job. `None` means
-    /// the capability exists and the card acts.
+    /// the capability exists and the card acts. All three beginnings are wired today; kept as a
+    /// method on the choice so a future unavailable beginning states its own reason exactly where
+    /// this one used to, rather than the card growing a second ad-hoc mechanism.
     pub(crate) const fn unavailability(self) -> Option<&'static str> {
-        match self {
-            Self::CaptureApp | Self::Microphone => None,
-            Self::Import => Some(
-                "Not built yet — Sotto cannot turn a file into a session, so this does nothing.",
-            ),
-        }
+        let _ = self;
+        None
     }
 
     const fn element_id(self) -> &'static str {
@@ -828,11 +855,52 @@ impl StartChoice {
             Self::Microphone => workspace
                 .session
                 .update(cx, SessionController::start_microphone_only),
-            // Unreachable: `render_start_choices` attaches no click handler to an unavailable
-            // choice. Kept total rather than panicking so a future wiring mistake is inert.
-            Self::Import => {}
+            Self::Import => begin_import(workspace, cx),
         }
     }
+}
+
+/// Starts `SessionController::start_import` and, once it finishes, surfaces a failure the way
+/// every other library action here does.
+///
+/// A success needs no handling here: `SessionController::start_import` sets `completed_session_id`
+/// the same way a finished capture does, and the workspace's existing `refresh_after_session`
+/// (subscribed to the session controller already, for capture) opens it, rebuilds the rail and
+/// selects it in notes without this entry point duplicating any of that. Only a stated failure has
+/// nowhere else to land, so this polls for exactly that.
+fn begin_import(workspace: &mut MeetingWorkspace, cx: &mut Context<MeetingWorkspace>) {
+    if workspace.session.read(cx).is_importing() {
+        return;
+    }
+    workspace
+        .session
+        .update(cx, SessionController::start_import);
+    let workspace_handle = cx.entity();
+    cx.spawn(async move |_, cx| {
+        loop {
+            Timer::after(Duration::from_millis(100)).await;
+            let still_importing = workspace_handle.update(cx, |workspace, cx| {
+                workspace.session.read(cx).is_importing()
+            });
+            match still_importing {
+                Ok(true) => continue,
+                Ok(false) => {
+                    let _ = workspace_handle.update(cx, |workspace, cx| {
+                        let error = workspace
+                            .session
+                            .update(cx, |session, _| session.take_import_error());
+                        if let Some(error) = error {
+                            workspace.message = Some(error);
+                            cx.notify();
+                        }
+                    });
+                    return;
+                }
+                Err(_) => return,
+            }
+        }
+    })
+    .detach();
 }
 
 /// The home surface: the product thesis, three equal beginnings, and one true storage claim.
@@ -1052,7 +1120,9 @@ fn row_meta(meeting: &SessionSummary, live: bool) -> String {
     if live {
         return "recording".to_owned();
     }
-    let source = if meeting.capture_target.is_microphone_only() {
+    let source = if is_imported_capture_target(&meeting.capture_target) {
+        "imported"
+    } else if meeting.capture_target.is_microphone_only() {
         "microphone"
     } else {
         "captured"
@@ -1550,7 +1620,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unbuilt_beginning_states_its_own_unavailability() {
+    fn all_three_beginnings_are_wired_and_state_no_unavailability() {
         assert_eq!(
             StartChoice::CaptureApp.unavailability(),
             None,
@@ -1561,16 +1631,10 @@ mod tests {
             None,
             "microphone-only capture is wired through SessionController::start_microphone_only"
         );
-        let import = StartChoice::Import
-            .unavailability()
-            .unwrap_or("MISSING SENTENCE");
-        assert!(
-            import.contains("Not built yet"),
-            "import must say plainly that it does not exist, got {import}"
-        );
-        assert!(
-            import.contains("does nothing"),
-            "import must say plainly that clicking it achieves nothing, got {import}"
+        assert_eq!(
+            StartChoice::Import.unavailability(),
+            None,
+            "import is wired through SessionController::start_import"
         );
     }
 
@@ -1894,8 +1958,7 @@ mod tests {
         );
 
         // The rail offers exactly one way to begin: Home. `New recording` and `Import…` were a
-        // second and third, duplicating the three start cards Home already shows — and Home is
-        // where the unbuilt Import control states its own unavailability.
+        // second and third, duplicating the three start cards Home already shows.
         for absent in [
             "library-new-recording",
             "library-import",

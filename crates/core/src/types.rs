@@ -10,7 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{EventId, SessionId};
+use crate::{
+    EventId, SessionId,
+    timeline::{CaptureTarget, TargetKind},
+};
 
 /// Stable identity of one library entry.
 ///
@@ -267,6 +270,38 @@ impl<'de> serde::Deserialize<'de> for RecordingTitle {
         Self::new(&value)
             .ok_or_else(|| serde::de::Error::custom("recording title must not be blank"))
     }
+}
+
+/// Builds the honest [`CaptureTarget`] for a session whose media arrived by import (T071,
+/// ADR-0019) rather than a verified OS capture.
+///
+/// Every field states only what is actually known: `kind` is [`TargetKind::Imported`], the variant
+/// that exists precisely because none of the capture-shaped variants may honestly stand in for it;
+/// `display_name` is the imported file's own name (the one fact about its origin that is simply
+/// true); `bundle_id` and `window_title` are `None` because nothing was scoped; and `audio_scoped`
+/// is `false` because no scoped-audio claim can be supported. [`CaptureTarget::has_valid_scope`]
+/// enforces exactly this shape for [`TargetKind::Imported`].
+#[must_use]
+pub fn imported_capture_target(display_name: String) -> CaptureTarget {
+    CaptureTarget {
+        bundle_id: None,
+        display_name,
+        window_title: None,
+        kind: TargetKind::Imported,
+        audio_scoped: false,
+    }
+}
+
+/// True when `target` names a session produced by import rather than capture.
+///
+/// A thin, discoverable wrapper over [`CaptureTarget::is_imported`] kept alongside
+/// [`imported_capture_target`] so every surface that would otherwise present a capture target or
+/// an audio-scope claim — the library rail's marker and source label today, any future settings or
+/// evidence surface — has one obvious name to call before treating `CaptureTarget`'s other fields
+/// as a verified fact about how the session was recorded.
+#[must_use]
+pub fn is_imported_capture_target(target: &CaptureTarget) -> bool {
+    target.is_imported()
 }
 
 /// The independently captured audio stream that produced an event.
@@ -857,9 +892,67 @@ pub enum PermissionStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::{Annotation, Entry, EntryId, MediaTimeMapping, RecordingTitle, Source, Utterance};
-    use crate::SessionId;
+    use super::{
+        Annotation, Entry, EntryId, MediaTimeMapping, RecordingTitle, Source, Utterance,
+        imported_capture_target, is_imported_capture_target,
+    };
+    use crate::{SessionId, timeline::TargetKind};
     use std::time::Duration;
+
+    #[test]
+    fn an_imported_target_has_valid_scope_and_is_detected_as_imported() {
+        let target = imported_capture_target("lecture.mp4".to_owned());
+
+        assert!(
+            target.has_valid_scope(),
+            "an imported target must pass the same structural validation the store applies to a \
+             captured one, or saving the session would fail"
+        );
+        assert!(
+            is_imported_capture_target(&target),
+            "the imported variant must round-trip through the predicate that detects it"
+        );
+        assert_eq!(target.kind, TargetKind::Imported);
+        assert_eq!(target.display_name, "lecture.mp4");
+        assert!(
+            !target.audio_scoped,
+            "an import must never claim a scoped-audio guarantee it cannot support"
+        );
+        assert_eq!(
+            target.window_title, None,
+            "an import has no scoped window to name"
+        );
+        assert_eq!(
+            target.bundle_id, None,
+            "an import has no OS-scoped application identity to name"
+        );
+    }
+
+    #[test]
+    fn a_genuine_capture_is_never_mistaken_for_an_import() {
+        let captured = crate::CaptureTarget {
+            bundle_id: Some("us.zoom.xos".to_owned()),
+            display_name: "Zoom".to_owned(),
+            window_title: Some("Standup".to_owned()),
+            kind: TargetKind::Window,
+            audio_scoped: true,
+        };
+
+        assert!(
+            !is_imported_capture_target(&captured),
+            "a captured target must never be mistaken for an import"
+        );
+
+        let no_bundle_id = crate::CaptureTarget {
+            bundle_id: None,
+            ..captured
+        };
+        assert!(
+            !is_imported_capture_target(&no_bundle_id),
+            "a captured target with no bundle id (e.g. a display) must not be mistaken for an \
+             import either — the check is the variant, not the presence of a bundle id"
+        );
+    }
 
     #[test]
     fn entry_identity_and_session_attachments_stay_distinct() {

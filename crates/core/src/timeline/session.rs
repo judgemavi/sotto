@@ -10,6 +10,11 @@ pub enum TargetKind {
     Display,
     /// A deliberately started session that captures only the local microphone.
     Microphone,
+    /// A session whose media arrived by importing a file rather than by any OS-scoped capture
+    /// (T071, ADR-0019). There is no content filter, no scoped-audio guarantee, and no screen
+    /// frames to claim, so this is the honest "no capture target" state rather than a stretched
+    /// reuse of one of the variants above.
+    Imported,
 }
 
 /// The application, window, or display explicitly selected through the system picker.
@@ -43,6 +48,12 @@ impl CaptureTarget {
         matches!(self.kind, TargetKind::Microphone)
     }
 
+    /// Whether this scope names a session that arrived by import rather than capture.
+    #[must_use]
+    pub const fn is_imported(&self) -> bool {
+        matches!(self.kind, TargetKind::Imported)
+    }
+
     /// Rejects impossible combinations before they become durable session provenance.
     #[must_use]
     pub fn has_valid_scope(&self) -> bool {
@@ -52,6 +63,16 @@ impl CaptureTarget {
                     && self.window_title.is_none()
                     && self.display_name == "Microphone only"
                     && self.audio_scoped
+            }
+            // No OS content filter exists for an import, so nothing it could scope is present:
+            // no bundle id, no window title, and no audio-scope claim. `display_name` is the one
+            // fact that is true — the imported file's own name — so it is the only field this
+            // still requires to be non-empty, on the same terms as a captured target.
+            TargetKind::Imported => {
+                self.bundle_id.is_none()
+                    && self.window_title.is_none()
+                    && !self.audio_scoped
+                    && !self.display_name.trim().is_empty()
             }
             TargetKind::Application | TargetKind::Window | TargetKind::Display => {
                 !self.display_name.trim().is_empty()
@@ -161,6 +182,58 @@ mod tests {
     }
 
     #[test]
+    fn an_imported_target_is_a_distinct_valid_scope_with_no_captured_claims() {
+        let target = CaptureTarget {
+            bundle_id: None,
+            display_name: "lecture.mp4".to_owned(),
+            window_title: None,
+            kind: TargetKind::Imported,
+            audio_scoped: false,
+        };
+
+        assert!(target.is_imported());
+        assert!(!target.is_microphone_only());
+        assert!(
+            target.has_valid_scope(),
+            "an honestly represented import must pass the same structural validation a \
+             captured target does"
+        );
+    }
+
+    #[test]
+    fn an_imported_target_cannot_smuggle_in_a_capture_claim() {
+        for dishonest in [
+            CaptureTarget {
+                bundle_id: Some("us.zoom.xos".to_owned()),
+                display_name: "lecture.mp4".to_owned(),
+                window_title: None,
+                kind: TargetKind::Imported,
+                audio_scoped: false,
+            },
+            CaptureTarget {
+                bundle_id: None,
+                display_name: "lecture.mp4".to_owned(),
+                window_title: Some("Q3 Planning".to_owned()),
+                kind: TargetKind::Imported,
+                audio_scoped: false,
+            },
+            CaptureTarget {
+                bundle_id: None,
+                display_name: "lecture.mp4".to_owned(),
+                window_title: None,
+                kind: TargetKind::Imported,
+                audio_scoped: true,
+            },
+        ] {
+            assert!(
+                !dishonest.has_valid_scope(),
+                "an import must never carry a bundle id, window title, or scoped-audio claim it \
+                 cannot support: {dishonest:?}"
+            );
+        }
+    }
+
+    #[test]
     fn session_lifecycle_uses_caller_supplied_wall_clock() {
         let mut session = Session::new(SessionId::new(2), target(), 1_753_776_000_000);
 
@@ -211,6 +284,24 @@ mod tests {
 
         assert_eq!(decoded, target);
         assert!(json.contains("\"kind\":\"microphone\""));
+        Ok(())
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn imported_scope_round_trips_through_json() -> Result<(), Box<dyn std::error::Error>> {
+        let target = CaptureTarget {
+            bundle_id: None,
+            display_name: "lecture.mp4".to_owned(),
+            window_title: None,
+            kind: TargetKind::Imported,
+            audio_scoped: false,
+        };
+        let json = serde_json::to_string(&target)?;
+        let decoded = serde_json::from_str::<CaptureTarget>(&json)?;
+
+        assert_eq!(decoded, target);
+        assert!(json.contains("\"kind\":\"imported\""));
         Ok(())
     }
 }

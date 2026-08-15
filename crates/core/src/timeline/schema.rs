@@ -14,7 +14,7 @@ CREATE TABLE sessions (
     capture_target_display_name TEXT NOT NULL,
     capture_target_window_title TEXT,
     capture_target_kind TEXT NOT NULL CHECK (
-        capture_target_kind IN ('application', 'window', 'display', 'microphone')
+        capture_target_kind IN ('application', 'window', 'display', 'microphone', 'imported')
     ),
     capture_target_audio_scoped INTEGER NOT NULL CHECK (
         capture_target_audio_scoped IN (0, 1)

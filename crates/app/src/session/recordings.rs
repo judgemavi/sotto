@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use asr::{Config as AsrConfig, LaggedRecordingTranscriber, RecordingConfig};
-use rag::{RecordingReference, RecordingUsage, Store};
+use rag::{QuarantineRecovery, RecordingReference, RecordingUsage, Store};
 use sotto_core::types::{RecordingMissingReason, SessionRecording};
 use sotto_core::{RagError, RecordingStatus, RecordingTranscriber, SessionId, TranscriptUpdate};
 
@@ -153,6 +153,21 @@ impl RecordingLibrary {
     pub fn recording_directory(&self) -> &Path {
         &self.directory
     }
+
+    /// Resolves any `.{session_id}.deleting` tombstone a crash left behind mid-delete.
+    ///
+    /// `Store::enforce_recording_budget` already calls `Store::recover_quarantined_media` first,
+    /// but its only callers today are "after a recording settles" and "when the retention budget
+    /// changes" — neither runs at application launch. Without this, a crash mid-delete leaves a
+    /// recording's row claiming available media that is actually sitting under a tombstone name
+    /// until the user happens to start another recording: the library lists it, and opening it to
+    /// play fails, for however long that takes.
+    ///
+    /// The caller decides how to treat a failure; this only wraps the store call with the directory
+    /// the way every other method here does, and never touches a row itself.
+    pub fn recover_at_launch(&self) -> Result<Vec<QuarantineRecovery>, RagError> {
+        Store::open(&self.database)?.recover_quarantined_media(&self.directory)
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +238,129 @@ mod tests {
             library.snapshot()?.usage.used_bytes,
             0,
             "delete must immediately free accounted media bytes"
+        );
+        Ok(())
+    }
+
+    /// Reproduces the crash this method exists to repair: `remove_recording_media` renamed the file
+    /// to its `.{id}.deleting` tombstone but the row-update commit never reached disk, so the row
+    /// still claims the original path is available media.
+    #[test]
+    fn recover_at_launch_restores_a_tombstone_left_by_an_interrupted_delete()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("sotto.sqlite3");
+        let recordings = directory.path().join("recordings");
+        std::fs::create_dir_all(&recordings)?;
+        let store = Store::open(&database)?;
+        let session_id = SessionId::new(41);
+        let session = Session::new(
+            session_id,
+            CaptureTarget {
+                bundle_id: Some("us.zoom.xos".to_owned()),
+                display_name: "Zoom".to_owned(),
+                window_title: Some("Crash recovery".to_owned()),
+                kind: TargetKind::Window,
+                audio_scoped: true,
+            },
+            1_000,
+        );
+        store.save_session(&session)?;
+        let original = recordings.join("41.mp4");
+        std::fs::write(&original, vec![2_u8; 8])?;
+        store.save_recording(&SessionRecording::Available {
+            session_id,
+            path: original.to_string_lossy().into_owned(),
+            container: RecordingContainer::Mp4,
+            duration: Duration::from_secs(1),
+            byte_size: 8,
+            time_mapping: MediaTimeMapping::IDENTITY,
+        })?;
+        // Simulates the crash: the file is already renamed away, but the row was never updated to
+        // reflect that, exactly as an interrupted `remove_recording_media` would leave it.
+        let tombstone = recordings.join(format!(".{}.deleting", session_id.get()));
+        std::fs::rename(&original, &tombstone)?;
+
+        let library = RecordingLibrary::new(&database, &recordings);
+        let resolved = library.recover_at_launch()?;
+
+        assert_eq!(
+            resolved.len(),
+            1,
+            "exactly the one tombstone left behind must be resolved"
+        );
+        assert!(
+            resolved[0].restored,
+            "the row still claimed the path was available, so the file must be restored rather \
+             than discarded"
+        );
+        assert!(
+            original.exists(),
+            "the recording must be playable again under its original name"
+        );
+        assert!(!tombstone.exists(), "the tombstone itself must be gone");
+        Ok(())
+    }
+
+    /// ADR-0018's promise — the retention budget, pruning, and deletion apply on identical terms
+    /// regardless of how a recording arrived — must hold for an imported session exactly as it
+    /// does for a captured one, not merely by construction but asserted here: an import that the
+    /// user could not delete from Settings, or that pruning silently skipped, would break that
+    /// promise even though every other part of the feature worked.
+    #[test]
+    fn an_imported_recording_counts_against_budget_and_deletes_like_a_captured_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("sotto.sqlite3");
+        let recordings = directory.path().join("recordings");
+        std::fs::create_dir_all(&recordings)?;
+        let store = Store::open(&database)?;
+        let session_id = SessionId::new(53);
+        let mut session = Session::new(
+            session_id,
+            sotto_core::types::imported_capture_target("lecture.mp4".to_owned()),
+            1_000,
+        );
+        session.end(2_000);
+        store.save_session(&session)?;
+        let path = recordings.join("53.mp4");
+        std::fs::write(&path, vec![3_u8; 20])?;
+        store.save_recording(&SessionRecording::Available {
+            session_id,
+            path: path.to_string_lossy().into_owned(),
+            container: RecordingContainer::Mp4,
+            duration: Duration::from_secs(4),
+            byte_size: 20,
+            time_mapping: MediaTimeMapping::IDENTITY,
+        })?;
+        let library = RecordingLibrary::new(&database, &recordings);
+
+        let before = library.snapshot()?;
+        assert_eq!(
+            before.usage.used_bytes, 20,
+            "an imported recording's bytes must count against the retention budget exactly like \
+             a captured one's"
+        );
+        assert_eq!(
+            before.items.len(),
+            1,
+            "an imported recording must appear in the library like any other"
+        );
+        assert!(
+            library.delete(session_id)?,
+            "an imported recording must be deletable exactly like a captured one"
+        );
+        assert_eq!(
+            Store::open(&database)?
+                .load_session_record(session_id)?
+                .id(),
+            session_id,
+            "deleting the media must not delete the meeting record, imported or not"
+        );
+        assert_eq!(
+            library.snapshot()?.usage.used_bytes,
+            0,
+            "deleting an imported recording must immediately free its accounted bytes"
         );
         Ok(())
     }

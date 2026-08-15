@@ -744,14 +744,26 @@ fn capture_target_name(target: &sotto_core::CaptureTarget) -> String {
 }
 
 /// The scope claims shown while recording, in the mock's vocabulary and never overstated.
+///
+/// This renders only inside `render_capture_bar`, which only ever draws for a live
+/// `SessionLifecycle::Running`/`Stopping`/`ProvisioningModel` state — an import never reaches it,
+/// since it has no live capture to show a bar for. The `Imported` arm below exists anyway, and is
+/// handled rather than matched away with `_`, because the alternative — falling through to the
+/// scoped-audio match below — would put a live capture-scope claim on a target that never had one.
 fn scope_chips(target: &sotto_core::CaptureTarget) -> Vec<String> {
     if target.is_microphone_only() {
         return vec!["your mic only".to_owned(), "stays on this Mac".to_owned()];
     }
+    if target.is_imported() {
+        return vec!["imported".to_owned(), "stays on this Mac".to_owned()];
+    }
     let audio = if target.audio_scoped {
         match target.kind {
             TargetKind::Application | TargetKind::Window => "app audio",
-            TargetKind::Display | TargetKind::Microphone => "target audio",
+            TargetKind::Display => "target audio",
+            TargetKind::Microphone | TargetKind::Imported => {
+                unreachable!("handled above")
+            }
         }
     } else {
         "system audio"

@@ -1,7 +1,9 @@
 //! Explicit, picker-scoped map-session lifecycle.
 
+mod import;
 mod recordings;
 
+pub use import::ImportOutcome;
 pub use recordings::{RecordingLibrary, RecordingLibraryItem, RecordingLibrarySnapshot};
 
 use std::{
@@ -16,7 +18,7 @@ use asr::{
 };
 use capture::macos::{CaptureStatus, MacCapture, PickedMacCapture, PickedTarget, probe_recording};
 use futures_util::FutureExt;
-use gpui::{Context, Timer};
+use gpui::{Context, PathPromptOptions, Timer};
 use rag::{Store, TimelinePersistence};
 use sotto_core::types::{MediaTimeMapping, RecordingContainer, SessionRecording};
 use sotto_core::{
@@ -188,6 +190,13 @@ impl RecordingIndicator {
                 }
                 TargetKind::Display => format!("{} display", self.target.display_name),
                 TargetKind::Microphone => unreachable!("handled above"),
+                // A `RecordingIndicator` exists only for `SessionLifecycle::Running`/`Stopping`,
+                // and an import never enters either — it has no live capture to indicate. If a
+                // future wiring mistake ever constructed one anyway, panicking here is preferable
+                // to silently rendering an audio-scope claim an import cannot support.
+                TargetKind::Imported => {
+                    unreachable!("an import never becomes a live capture indicator")
+                }
             }
         } else {
             "system-wide".to_owned()
@@ -491,6 +500,13 @@ pub struct SessionController {
     active_session_id: Option<SessionId>,
     completed_session_id: Option<SessionId>,
     annotation_sender: Option<tokio::sync::mpsc::UnboundedSender<AnnotationRequest>>,
+    /// Whether a file is currently being imported. Deliberately not part of [`SessionLifecycle`]:
+    /// an import captures nothing live, holds no [`StartGate`], and reusing `Running`'s scope-bound
+    /// vocabulary for it would put a capture-target claim on the indicator where none exists.
+    importing: bool,
+    /// The stated reason the most recent import did not become a session, if it did not. Cleared by
+    /// [`Self::take_import_error`] so the same failure cannot be shown twice.
+    import_error: Option<String>,
 }
 
 struct AnnotationRequest {
@@ -591,6 +607,8 @@ impl SessionController {
             active_session_id: None,
             completed_session_id: None,
             annotation_sender: None,
+            importing: false,
+            import_error: None,
         }
     }
 
@@ -652,6 +670,118 @@ impl SessionController {
             return;
         };
         self.begin_worker(generation, CaptureSelection::MicrophoneOnly, cx);
+    }
+
+    /// Whether a file is currently being turned into a session. Guards against a second import
+    /// starting while one is already running; unlike capture, an import never blocks on
+    /// [`SessionLifecycle`], so this is the only guard against overlap.
+    #[must_use]
+    pub const fn is_importing(&self) -> bool {
+        self.importing
+    }
+
+    /// Takes the stated reason the most recent import did not become a session, if any.
+    ///
+    /// `take` rather than `read`: the caller shows it once and the state is consumed, the same
+    /// shape [`Self::completed_session_id`]'s sibling `active_session_id`/`completed_session_id`
+    /// pair already uses to avoid re-showing a stale outcome.
+    pub fn take_import_error(&mut self) -> Option<String> {
+        self.import_error.take()
+    }
+
+    /// Presents the OS file picker and, on a selection, imports the chosen file as a new session on
+    /// a background thread.
+    ///
+    /// This deliberately does not go through [`Self::begin_worker`]/[`SessionLifecycle`]: an import
+    /// captures nothing live, so it never legitimately claims `Running`, holds no [`StartGate`], and
+    /// does not contend with a live capture's worker slot. It reaches the same destination a
+    /// finished capture does — [`Self::completed_session_id`] set, then `cx.notify()` — so the
+    /// workspace's existing `refresh_after_session` opens the imported session exactly the way it
+    /// opens a freshly captured one, with no separate wiring for import to duplicate.
+    pub fn start_import(&mut self, cx: &mut Context<Self>) {
+        if self.importing {
+            return;
+        }
+        let path_receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        self.importing = true;
+        self.import_error = None;
+        let controller = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let picked = match path_receiver.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => Some(paths.remove(0)),
+                _ => None,
+            };
+            let Some(source) = picked else {
+                let _ = controller.update(cx, |controller, cx| {
+                    controller.importing = false;
+                    cx.notify();
+                });
+                return;
+            };
+            let database = application_database_path();
+            let recording_directory = application_recording_directory();
+            let (result_sender, result_receiver) = mpsc::sync_channel(1);
+            let spawn = std::thread::Builder::new()
+                .name("sotto-import".to_owned())
+                .spawn(move || {
+                    let outcome = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| format!("Could not start the import runtime: {error}"))
+                        .map(|runtime| {
+                            runtime.block_on(import::import_recording(
+                                &source,
+                                &database,
+                                &recording_directory,
+                            ))
+                        })
+                        .and_then(|result| result);
+                    let _ = result_sender.send(outcome);
+                });
+            if let Err(error) = spawn {
+                let _ = controller.update(cx, |controller, cx| {
+                    controller.importing = false;
+                    controller.import_error = Some(format!("Could not start the import: {error}"));
+                    cx.notify();
+                });
+                return;
+            }
+            loop {
+                Timer::after(LIFECYCLE_POLL_INTERVAL).await;
+                match result_receiver.try_recv() {
+                    Ok(outcome) => {
+                        let _ = controller.update(cx, |controller, cx| {
+                            controller.importing = false;
+                            match outcome {
+                                Ok(outcome) => {
+                                    controller.completed_session_id = Some(outcome.session_id);
+                                }
+                                Err(error) => controller.import_error = Some(error),
+                            }
+                            cx.notify();
+                        });
+                        return;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        let _ = controller.update(cx, |controller, cx| {
+                            controller.importing = false;
+                            controller.import_error =
+                                Some("The import ended unexpectedly.".to_owned());
+                            cx.notify();
+                        });
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Cancels provisioning or requests bounded capture shutdown. It never starts another run.

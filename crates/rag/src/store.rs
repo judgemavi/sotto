@@ -2001,6 +2001,7 @@ fn target_kind(kind: TargetKind) -> &'static str {
         TargetKind::Window => "window",
         TargetKind::Display => "display",
         TargetKind::Microphone => "microphone",
+        TargetKind::Imported => "imported",
     }
 }
 
@@ -2010,6 +2011,7 @@ fn parse_target_kind(kind: &str) -> rusqlite::Result<TargetKind> {
         "window" => Ok(TargetKind::Window),
         "display" => Ok(TargetKind::Display),
         "microphone" => Ok(TargetKind::Microphone),
+        "imported" => Ok(TargetKind::Imported),
         unknown => Err(rusqlite::Error::FromSqlConversionFailure(
             5,
             Type::Text,

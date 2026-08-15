@@ -53,7 +53,7 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            13,
+            14,
             "recording retention and retranscription migration must reach the current schema"
         );
         Ok(())
@@ -527,7 +527,7 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            13,
+            14,
             "the title migration must land on the current schema version"
         );
         Ok(())
@@ -574,7 +574,7 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            13
+            14
         );
         Ok(())
     }
@@ -644,7 +644,7 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            13
+            14
         );
         Ok(())
     }
@@ -682,7 +682,7 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            13
+            14
         );
         Ok(())
     }
@@ -716,7 +716,7 @@ mod tests {
         let connection = Connection::open(path)?;
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            13
+            14
         );
         Ok(())
     }
@@ -770,7 +770,7 @@ mod tests {
         let connection = Connection::open(path)?;
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            13
+            14
         );
         Ok(())
     }
@@ -923,7 +923,7 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            13
+            14
         );
         Ok(())
     }
@@ -989,7 +989,7 @@ mod tests {
         let connection = Connection::open(&path)?;
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            13
+            14
         );
         assert_eq!(
             connection.query_row(
@@ -1154,7 +1154,7 @@ mod tests {
         let connection = Connection::open(path)?;
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            13
+            14
         );
         assert_eq!(
             connection.query_row("SELECT kind FROM documents WHERE id='current'", [], |row| {
@@ -1612,11 +1612,11 @@ mod tests {
     /// stub `entries` table the backfill's column list does not match, which simulates a crash
     /// landing between the v11 -> v12 commit (drop `session_search_policy`) and the v12 -> v13
     /// commit: the earlier step succeeds and commits, the later one never does. The earlier
-    /// commit must be found parked at its own v12 checkpoint, not at 13 — and clearing the
-    /// conflict must let the very next open finish the walk to a complete, correct v13 schema,
-    /// including a working `entries` table (the concrete failure this hazard produces is
-    /// `Store::save_session`'s `ensure_session_entry` failing with "no such table: entries" on
-    /// the very next recording).
+    /// commit must be found parked at its own v12 checkpoint, not stranded past it — and clearing
+    /// the conflict must let the very next open finish the walk to the current schema (v14 as of
+    /// T071's `imported` capture-target-kind widening), including a working `entries` table (the
+    /// concrete failure this hazard produces is `Store::save_session`'s `ensure_session_entry`
+    /// failing with "no such table: entries" on the very next recording).
     #[test]
     fn a_migration_step_that_fails_does_not_strand_the_earlier_commit_at_the_final_version()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1654,7 +1654,7 @@ mod tests {
         assert_eq!(
             Connection::open(&path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            13,
+            14,
             "resuming from the correctly-parked intermediate version must converge to the \
              current schema"
         );

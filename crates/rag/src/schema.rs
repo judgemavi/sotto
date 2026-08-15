@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension};
 use sotto_core::{RagError, SQLITE_SCHEMA};
 
-pub(crate) const SCHEMA_VERSION: u32 = 13;
+pub(crate) const SCHEMA_VERSION: u32 = 14;
 
 /// Entries are the document-bearing library objects above captured sessions.
 ///
@@ -477,10 +477,9 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
     // for a session whose only artifact was one of these, which is worse than having no cached
     // summary at all. Deleting them is honest about the state and simply asks for a regenerate.
     //
-    // This is the last step, so its own target genuinely is `SCHEMA_VERSION` — but it is written
-    // as a literal fact about this step (mirroring every step above), not as "whatever the crate
-    // constant currently says", so the very next step added after this one does not silently
-    // reopen the same hazard this migration exists to close.
+    // Its own target is written as a literal fact about this step (mirroring every step above),
+    // not as "whatever the crate constant currently says", so a step added after this one does
+    // not silently reopen the same hazard this discipline exists to close.
     if (1..=12).contains(&version) {
         let transaction = connection.transaction().map_err(storage)?;
         transaction.execute_batch(ENTRY_SCHEMA).map_err(storage)?;
@@ -497,6 +496,61 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
             .pragma_update(None, "user_version", 13)
             .map_err(storage)?;
         transaction.commit().map_err(storage)?;
+    }
+    // v14 widens the `capture_target_kind` CHECK to accept `'imported'` (T071/ADR-0019): an
+    // imported session has no OS-scoped capture target, and the CHECK is embedded in the table
+    // definition itself, so accepting a fifth value needs the same rebuild-and-swap `sessions_v10`
+    // used above to add `'microphone'`. No column semantics change and no row's existing data is
+    // touched; this only widens what the `capture_target_kind` column is allowed to say.
+    //
+    // This is the last step, so its own target genuinely is `SCHEMA_VERSION` — see the same note
+    // on the v13 step above for why it is still written as the literal `14`.
+    if (1..=13).contains(&version) {
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .map_err(storage)?;
+        let migration = (|| {
+            let transaction = connection.transaction().map_err(storage)?;
+            transaction
+                .execute_batch(
+                    "CREATE TABLE sessions_v14 (\
+                      id TEXT PRIMARY KEY NOT NULL,\
+                      started_at_unix_ms INTEGER NOT NULL,\
+                      ended_at_unix_ms INTEGER,\
+                      capture_target_bundle_id TEXT,\
+                      capture_target_display_name TEXT NOT NULL,\
+                      capture_target_window_title TEXT,\
+                      capture_target_kind TEXT NOT NULL CHECK (\
+                        capture_target_kind IN\
+                          ('application','window','display','microphone','imported')\
+                      ),\
+                      capture_target_audio_scoped INTEGER NOT NULL CHECK (\
+                        capture_target_audio_scoped IN (0,1)\
+                      )\
+                    );\
+                    INSERT INTO sessions_v14 SELECT * FROM sessions;\
+                    DROP TABLE sessions;\
+                    ALTER TABLE sessions_v14 RENAME TO sessions;",
+                )
+                .map_err(storage)?;
+            let foreign_key_violation = transaction
+                .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+                .optional()
+                .map_err(storage)?;
+            if foreign_key_violation.is_some() {
+                return Err(RagError::Storage(
+                    "imported capture-scope migration violated a foreign key".to_owned(),
+                ));
+            }
+            transaction
+                .pragma_update(None, "user_version", 14)
+                .map_err(storage)?;
+            transaction.commit().map_err(storage)
+        })();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(storage)?;
+        migration?;
     }
     Ok(())
 }
