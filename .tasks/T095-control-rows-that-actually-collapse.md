@@ -1,6 +1,6 @@
 # T095 — A control marked expendable must be able to collapse
 
-**Status:** todo
+**Status:** in-review
 
 **Wave:** N7 — v2 workspace
 
@@ -80,3 +80,55 @@ restyling any control; the summary taxonomy.
 Found while reviewing T076's handoff on 2026-08-15, and corrected the same day after T072's design
 note showed the original framing was wrong. T074 remains open on its own acceptance and should close
 on this task's completion rather than duplicating the fix.
+
+## Implementation notes — 2026-08-15
+
+The transcript head now receives the width it actually occupies. `layout.rs` deducts the visible
+rail (210 px or 248 px) and the open Ask panel (344 px) from the viewport, then gives a live
+transcript its real 57.5% share of that stage; a review transcript receives the full stage. The head
+then deducts its own two 12 px horizontal insets before calling `ControlRow::for_width`. A 900 px
+viewport with the narrow rail therefore supplies 396.75 px to a live transcript column, not the
+misleading 900 px, and the shared threshold makes the decision from the inner row width.
+
+At or below `ControlRow::COLLAPSE_WIDTH`, the legend is not constructed. The label and row count
+remain in the first row. A mounted 680 px live-shell regression exposed a second, pre-existing
+truth: after the legend disappeared, the essential `Copy` and `Following live` controls still could
+not fit beside the metadata in the ~270 px transcript column (`Following live` reached x=644 while
+the column ended at x=480.5). Nothing essential was reclassified. At the same shared threshold,
+those actions now receive a second `ControlRow`; the wide head remains one row. This is a responsive
+placement of the same controls, not a new breakpoint or a restyle.
+
+### Step 2 guard judgment
+
+Taken in the cheap form. `ControlRow` records explicitly whether its width is known, and a debug
+assertion rejects `ControlRow::new().child(ControlRole::Expendable, ...)`. A regression pins the
+failure. A type-state split would make the invalid state unrepresentable in release builds, but it
+would duplicate the builder surface or add generic state to every current call site for one misuse;
+that cost is disproportionate here. The explicit flag avoids the brittle alternative of inferring
+width knowledge from `Pixels::MAX`, and `ask.rs` / `notes.rs` remain unchanged because their
+width-blind rows contain only essential and ellipsizing children.
+
+### Acceptance evidence
+
+- `the_legend_collapses_at_the_shared_threshold_while_the_label_remains` uses a fresh mounted
+  harness at each width (debug bounds persist between frames), proves positive legend bounds at
+  threshold + 1 px, proves the legend absent at and below the threshold, and proves the label
+  remains.
+- `transcript_width_uses_its_real_stage_share_not_the_viewport` pins narrow/wide rail, collapsed
+  rail, Ask-open, live split, and full-width review calculations.
+- `the_live_head_keeps_every_essential_inside_its_narrow_column` mounts the live Recording layout at
+  the stated 680 px minimum with a row present. Label, Copy, and Follow all have positive bounds
+  wholly inside `stage-transcript`; the legend is absent.
+- Focused app gate: 38 passed, 0 failed across `workspace::control_row::tests`,
+  `workspace::transcript`, and the width-plumbing test.
+- `rustfmt --edition 2024 --check` and `git diff --check` over this task's three code paths are clean.
+- Final combined gate: `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test --workspace --locked --quiet`
+  passed outside the sandbox; the app result was 242 passed and 4 explicitly ignored real-media
+  cases. The sandboxed rerun failed only eight unchanged ASR model-cache fixture tests with macOS
+  `Operation not permitted`, and the same full command passed unsandboxed.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo clippy --workspace --all-targets --all-features --locked
+  -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` all pass on the final tree.
+
+No signed-app visual run was performed. T074's citation-flash lifecycle remains its own acceptance
+residual; its current mounted test asserts navigation/focus but does not inspect the 1.4-second
+visual decay.

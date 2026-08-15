@@ -34,6 +34,7 @@ pub(crate) enum ControlRole {
 pub(crate) struct ControlRow {
     row: Div,
     available: Pixels,
+    width_known: bool,
     essential_count: usize,
     rendered_children: usize,
 }
@@ -57,14 +58,18 @@ impl ControlRow {
     pub(crate) const COLLAPSE_WIDTH: Pixels = px(760.0);
 
     /// Builds a row inside a container whose width the caller cannot see — a rail or a column
-    /// header. Expendable children still yield their width first, but nothing is dropped, because
-    /// the row has no honest basis for deciding that it must be.
+    /// header. Such a row may classify essential and ellipsizing children, but an expendable child
+    /// would promise a collapse this constructor has no honest basis for deciding.
     pub(crate) fn new() -> Self {
-        Self::for_width(Pixels::MAX)
+        Self::build(Pixels::MAX, false)
     }
 
     /// Builds a row that knows how much width it has, so it can drop rather than clip.
     pub(crate) fn for_width(available: Pixels) -> Self {
+        Self::build(available, true)
+    }
+
+    fn build(available: Pixels, width_known: bool) -> Self {
         Self {
             row: div()
                 .w_full()
@@ -73,12 +78,17 @@ impl ControlRow {
                 .flex()
                 .items_center(),
             available,
+            width_known,
             essential_count: 0,
             rendered_children: 0,
         }
     }
 
     pub(crate) fn child(mut self, role: ControlRole, child: impl IntoElement) -> Self {
+        debug_assert!(
+            role != ControlRole::Expendable || self.width_known,
+            "a width-blind ControlRow cannot promise that an Expendable child will collapse"
+        );
         if role == ControlRole::Expendable && self.available <= Self::COLLAPSE_WIDTH {
             return self;
         }
@@ -266,5 +276,15 @@ mod tests {
             1,
             "at the collapse width the expendable control is dropped, not clipped"
         );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "a width-blind ControlRow cannot promise that an Expendable child will collapse"
+    )]
+    fn a_width_blind_row_cannot_claim_an_expendable_child() {
+        let _ = ControlRow::new()
+            .child(ControlRole::Essential, div().child("title"))
+            .child(ControlRole::Expendable, div().child("legend"));
     }
 }

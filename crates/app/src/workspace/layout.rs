@@ -64,6 +64,16 @@ const LIBRARY_NARROW_BELOW: Pixels = px(980.0);
 /// the column is not rendered, and the stage gets the width.
 const ASK_PANEL_WIDTH: Pixels = px(344.0);
 
+/// The transcript's share of the stage while a recording runs; the summary takes the remainder.
+///
+/// Named because two places must agree on it and they are not adjacent: `render_stage` lays the
+/// panes out with it, and `available_transcript_width` re-derives the width the transcript will
+/// occupy so its head can decide whether the legend collapses. A literal in both would let someone
+/// rebalance the panes and leave the derivation computing a width the column does not have — the
+/// head would then collapse at the wrong moment, and nothing would fail, because a threshold
+/// comparison against a wrong number is still a comparison.
+const TRANSCRIPT_STAGE_SHARE: f32 = 0.575;
+
 /// The width at the left of the toolbar that belongs to macOS, not to Sotto.
 ///
 /// `main.rs` moves the traffic lights to [`super::TRAFFIC_LIGHT_INSET`] from the left edge. macOS
@@ -145,6 +155,8 @@ impl Render for MeetingWorkspace {
         } else {
             div().into_any_element()
         };
+        let transcript_width =
+            available_transcript_width(width, stage, self.library_collapsed, self.ask_open);
         let transcript_column = transcript::render(
             self.transcript_pacer.rows().to_vec(),
             frame.transcript.unstable,
@@ -154,6 +166,7 @@ impl Render for MeetingWorkspace {
             self.follow_transcript,
             self.focused_event,
             &self.transcript_list,
+            transcript_width,
             cx,
         );
         let notes_column = notes::render_with_citation_times(
@@ -313,6 +326,40 @@ impl Render for MeetingWorkspace {
     }
 }
 
+/// The stage receives the viewport remainder after its two optional siblings take their fixed
+/// widths. During a recording the transcript then receives the same 57.5% share used by
+/// [`render_stage`], so width-sensitive controls decide from the space they really occupy.
+fn available_stage_width(width: Pixels, library_collapsed: bool, ask_open: bool) -> Pixels {
+    let library_width = if library_collapsed {
+        px(0.0)
+    } else if width < LIBRARY_NARROW_BELOW {
+        LIBRARY_WIDTH_NARROW
+    } else {
+        LIBRARY_WIDTH
+    };
+    let ask_width = if ask_open { ASK_PANEL_WIDTH } else { px(0.0) };
+    let available = width - library_width - ask_width;
+    if available > px(0.0) {
+        available
+    } else {
+        px(0.0)
+    }
+}
+
+fn available_transcript_width(
+    width: Pixels,
+    stage: Stage,
+    library_collapsed: bool,
+    ask_open: bool,
+) -> Pixels {
+    let stage_width = available_stage_width(width, library_collapsed, ask_open);
+    if stage == Stage::Recording {
+        stage_width * TRANSCRIPT_STAGE_SHARE
+    } else {
+        stage_width
+    }
+}
+
 /// The toolbar: the band macOS reserves for the traffic lights, doing a job.
 ///
 /// Three controls, in the order a person reads them: what the window shows on the left (the rail),
@@ -436,7 +483,7 @@ fn render_stage(
                     .h_full()
                     .flex_grow()
                     .flex_shrink()
-                    .flex_basis(relative(0.575))
+                    .flex_basis(relative(TRANSCRIPT_STAGE_SHARE))
                     .min_w_0()
                     .bg(tokens.surface)
                     .debug_selector(|| "stage-transcript".into())
@@ -447,7 +494,7 @@ fn render_stage(
                     .h_full()
                     .flex_grow()
                     .flex_shrink()
-                    .flex_basis(relative(0.425))
+                    .flex_basis(relative(1.0 - TRANSCRIPT_STAGE_SHARE))
                     .min_w_0()
                     .bg(tokens.surface)
                     .border_l_1()
@@ -886,7 +933,8 @@ mod tests {
     };
 
     use super::{
-        ASK_PANEL_WIDTH, LIBRARY_WIDTH, MIN_WORKSPACE_WIDTH, TOOLBAR_LEADING_INSET, format_bytes,
+        ASK_PANEL_WIDTH, LIBRARY_WIDTH, MIN_WORKSPACE_WIDTH, Stage, TOOLBAR_LEADING_INSET,
+        TRANSCRIPT_STAGE_SHARE, available_stage_width, available_transcript_width, format_bytes,
         format_clock, format_wall_clock, load_workspace_state, save_workspace_state, view_meta,
     };
     use crate::workspace::{
@@ -900,6 +948,35 @@ mod tests {
     const WIDE_WORKSPACE_WIDTH: gpui::Pixels = px(1400.0);
 
     struct NoOpenAiCredentials;
+
+    #[test]
+    fn transcript_width_uses_its_real_stage_share_not_the_viewport() {
+        assert_eq!(
+            available_stage_width(px(900.0), false, false),
+            px(690.0),
+            "the narrow rail is deducted before the stage receives width"
+        );
+        assert_eq!(
+            available_transcript_width(px(900.0), Stage::Recording, false, false),
+            px(690.0) * TRANSCRIPT_STAGE_SHARE,
+            "the live transcript receives only its 57.5% share, so a 900 px viewport cannot keep the legend"
+        );
+        assert_eq!(
+            available_transcript_width(px(900.0), Stage::Review, false, false),
+            px(690.0),
+            "the review transcript receives the full stage"
+        );
+        assert_eq!(
+            available_stage_width(px(1_400.0), false, true),
+            px(1_400.0) - LIBRARY_WIDTH - ASK_PANEL_WIDTH,
+            "the wide rail and open Ask panel are both deducted"
+        );
+        assert_eq!(
+            available_stage_width(px(900.0), true, false),
+            px(900.0),
+            "a collapsed rail takes no width"
+        );
+    }
 
     impl reasoning::OpenAiCredentialStore for NoOpenAiCredentials {
         fn store(&self, _: &SecretString) -> Result<(), sotto_core::ProviderError> {

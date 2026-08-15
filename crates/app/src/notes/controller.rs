@@ -10,6 +10,7 @@ use insight::{
     GroundedMeetingNotesReport, GroundingInput, MeetingNotesGenerator, RecordingNotes,
     SourceStatus, load_latest_grounded_notes_status,
 };
+use providers::backend::ObservedRequestNormalization;
 use providers::{BackendFingerprint, ReasoningProvider, ResolvedBackend};
 use rag::{SessionSummary, Store};
 use screen::ScreenInspectionSource;
@@ -32,12 +33,19 @@ pub enum NotesState {
         source_status: SourceStatus,
         cached: bool,
         model: String,
+        /// Controls the selected backend could not honor on this fresh run.
+        ///
+        /// Cached reports leave this empty because the observations are diagnostic runtime data
+        /// and are deliberately excluded from the durable artifact.
+        normalizations: Vec<ObservedRequestNormalization>,
     },
     Stale {
         notes: Box<RecordingNotes>,
         bundle: mcp::ContextBundle,
         source_status: SourceStatus,
         model: String,
+        /// Empty for stale cached reports; request normalizations are not persisted.
+        normalizations: Vec<ObservedRequestNormalization>,
     },
     Failed(String),
 }
@@ -269,6 +277,7 @@ impl NotesController {
                 source_status: report.source_status,
                 cached: report.cached,
                 model: report.model,
+                normalizations: report.normalizations,
             },
             Err(error) => NotesState::Failed(error),
         };
@@ -322,6 +331,7 @@ impl NotesController {
                 bundle: cached.report.bundle,
                 source_status: cached.report.source_status,
                 model: cached.report.model,
+                normalizations: cached.report.normalizations,
             },
             Ok(Some(cached)) => NotesState::Ready {
                 notes: Box::new(cached.report.artifact),
@@ -329,6 +339,7 @@ impl NotesController {
                 source_status: cached.report.source_status,
                 cached: true,
                 model: cached.report.model,
+                normalizations: cached.report.normalizations,
             },
             Ok(None) => NotesState::Disabled,
             Err(_) => NotesState::Failed(
@@ -388,6 +399,7 @@ mod tests {
     };
 
     use futures_util::stream;
+    use providers::backend::{ObservedRequestNormalization, RequestNormalization, SamplingControl};
     use providers::{AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendId};
     use rag::Store;
     use sotto_core::{
@@ -436,6 +448,61 @@ mod tests {
         let mut controller = NotesController::new(database);
         controller.refresh_catalogue()?;
         Ok((directory, controller))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fresh_result_keeps_backend_downgrades_for_the_summary_view()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, mut controller) = controller_with_meetings().await?;
+        let normalization = ObservedRequestNormalization {
+            dispatch_id: 17,
+            normalization: RequestNormalization {
+                backend_id: BackendId::new("test.notes")?,
+                control: SamplingControl::Temperature,
+            },
+        };
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn({
+            let normalization = normalization.clone();
+            move || {
+                let _ = sender.send(GenerationResult {
+                    generation: 1,
+                    session_id: SessionId::new(2),
+                    result: Ok(insight::GroundedMeetingNotesReport {
+                        artifact: insight::RecordingNotes::default(),
+                        bundle: mcp::ContextBundle::empty(),
+                        source_status: insight::SourceStatus::NotSelected,
+                        usage: Usage::default(),
+                        model: "test-model".to_owned(),
+                        backend_fingerprint: "test-fingerprint".to_owned(),
+                        grant_fingerprint: None,
+                        cached: false,
+                        calls: 1,
+                        normalizations: vec![normalization],
+                    }),
+                    consultations: Vec::new(),
+                });
+            }
+        });
+        controller.generation = 1;
+        controller.state = NotesState::Generating;
+        controller.pending = Some(PendingGeneration {
+            generation: 1,
+            session_id: SessionId::new(2),
+            receiver,
+            cancellation: sotto_core::CancellationToken::new(),
+            worker,
+        });
+
+        while !controller.poll() {
+            std::thread::yield_now();
+        }
+
+        let NotesState::Ready { normalizations, .. } = controller.snapshot().state else {
+            return Err("fresh notes result did not become ready".into());
+        };
+        assert_eq!(normalizations, vec![normalization]);
+        Ok(())
     }
 
     #[test]

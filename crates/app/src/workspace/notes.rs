@@ -36,6 +36,7 @@ use insight::{
     RecordingNotes, RecordingNotesBlock, RecordingNotesSection, RecordingNotesSectionKind,
     SourceStatus,
 };
+use providers::backend::ObservedRequestNormalization;
 use sotto_core::{EventId, EventPayload, MarkKind, TimelineEvent, replay_lenient};
 
 use crate::{
@@ -971,12 +972,21 @@ impl SummaryView {
                 source_status,
                 cached,
                 model,
-            } => Self::ready(*notes, bundle, source_status, ready_origin(cached), model, None),
+                normalizations,
+            } => Self::ready(
+                *notes,
+                bundle,
+                source_status,
+                ready_origin(cached),
+                model,
+                normalization_line(&normalizations),
+            ),
             NotesState::Stale {
                 notes,
                 bundle,
                 source_status,
                 model,
+                normalizations,
             } => Self::ready(
                 *notes,
                 bundle,
@@ -984,8 +994,13 @@ impl SummaryView {
                 "Saved summary",
                 model,
                 Some(
-                    "This summary predates your latest typed note. Re-summarize when you want it to account for that note."
-                        .to_owned(),
+                    std::iter::once(
+                        "This summary predates your latest typed note. Re-summarize when you want it to account for that note."
+                            .to_owned(),
+                    )
+                    .chain(normalization_line(&normalizations))
+                    .collect::<Vec<_>>()
+                    .join(" "),
                 ),
             ),
         }
@@ -1049,6 +1064,19 @@ const fn ready_origin(cached: bool) -> &'static str {
     } else {
         "Summarized just now"
     }
+}
+
+/// Names each unsupported control once even when a multi-dispatch notes run observed the same
+/// normalization during more than one map/reduce request.
+fn normalization_line(normalizations: &[ObservedRequestNormalization]) -> Option<String> {
+    let controls = normalizations
+        .iter()
+        .map(|item| item.normalization.control.to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    (!controls.is_empty()).then(|| format!("This backend could not apply: {controls}."))
 }
 
 /// Sources are worth a line only when they changed the answer, or when they were meant to and
@@ -1514,6 +1542,10 @@ mod tests {
     use std::time::Duration;
 
     use insight::RecordingNotes;
+    use providers::{
+        BackendId,
+        backend::{ObservedRequestNormalization, RequestNormalization, SamplingControl},
+    };
     use sotto_core::{
         CaptureTarget, EventId, EventPayload, MarkKind, Session, SessionId, Source, SpeechState,
         TargetKind, TimelineBuilder, Utterance, VadSegment,
@@ -1921,6 +1953,7 @@ mod tests {
                 bundle: mcp::ContextBundle::empty(),
                 source_status: insight::SourceStatus::NotSelected,
                 model: "gpt-5.4-codex".to_owned(),
+                normalizations: Vec::new(),
             },
             false,
         );
@@ -1951,6 +1984,7 @@ mod tests {
                 source_status: insight::SourceStatus::Unavailable,
                 cached: false,
                 model: "gpt-5.4-codex".to_owned(),
+                normalizations: Vec::new(),
             },
             false,
         );
@@ -1966,6 +2000,44 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_summary_names_each_lost_control_once() -> Result<(), Box<dyn std::error::Error>> {
+        let backend_id = BackendId::new("codex-cli")?;
+        let observation = |dispatch_id, control| ObservedRequestNormalization {
+            dispatch_id,
+            normalization: RequestNormalization {
+                backend_id: backend_id.clone(),
+                control,
+            },
+        };
+
+        let view = SummaryView::resolve(
+            NotesState::Ready {
+                notes: Box::new(recording_notes(vec![section(
+                    "overview",
+                    vec![note("Planning.", 1)],
+                )])),
+                bundle: mcp::ContextBundle::empty(),
+                source_status: insight::SourceStatus::NotSelected,
+                cached: false,
+                model: "gpt-5.4-codex".to_owned(),
+                normalizations: vec![
+                    observation(1, SamplingControl::Temperature),
+                    observation(2, SamplingControl::MaxTokens),
+                    observation(3, SamplingControl::Temperature),
+                ],
+            },
+            false,
+        );
+
+        assert_eq!(
+            view.caution,
+            Some("This backend could not apply: max_tokens, temperature.".to_owned()),
+            "map/reduce dispatches must not repeat the same lost control in the warning"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_summary_with_no_supported_section_says_so_instead_of_counting_zero() {
         let view = SummaryView::resolve(
             NotesState::Ready {
@@ -1974,6 +2046,7 @@ mod tests {
                 source_status: insight::SourceStatus::NotSelected,
                 cached: false,
                 model: "gpt-5.4-codex".to_owned(),
+                normalizations: Vec::new(),
             },
             false,
         );

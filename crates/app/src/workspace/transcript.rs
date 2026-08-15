@@ -32,8 +32,9 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Div, ElementId, Global, IntoElement, ListState, Rgba,
-    SharedString, Stateful, Timer, WeakEntity, Window, div, list, prelude::*, px, rems,
+    AnyElement, App, ClipboardItem, Context, Div, ElementId, Global, IntoElement, ListState,
+    Pixels, Rgba, SharedString, Stateful, Timer, WeakEntity, Window, div, list, prelude::*, px,
+    rems,
 };
 use gpui_component::{
     button::Button,
@@ -651,6 +652,7 @@ pub(crate) fn render(
     following: bool,
     focused_event: Option<EventId>,
     list_state: &ListState,
+    available_width: Pixels,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
     let tokens = WorkspaceTokens::resolve(cx);
@@ -708,7 +710,14 @@ pub(crate) fn render(
         .size_full()
         .flex()
         .flex_col()
-        .child(render_column_head(live, presented, following, tokens, cx))
+        .child(render_column_head(
+            live,
+            presented,
+            following,
+            available_width,
+            tokens,
+            cx,
+        ))
         .child(
             div()
                 .id("virtual-transcript")
@@ -736,8 +745,13 @@ pub(crate) fn render(
 }
 
 /// The column head: label and row count survive, the legend gives up its width first.
-fn column_head(live: bool, rows: usize, tokens: WorkspaceTokens) -> ControlRow {
-    ControlRow::new()
+fn column_head(
+    live: bool,
+    rows: usize,
+    available_width: Pixels,
+    tokens: WorkspaceTokens,
+) -> ControlRow {
+    ControlRow::for_width(available_width)
         .child(
             ControlRole::Essential,
             div()
@@ -765,44 +779,68 @@ fn render_column_head(
     live: bool,
     rows: usize,
     following: bool,
+    available_width: Pixels,
     tokens: WorkspaceTokens,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
+    let head_width = column_head_available_width(available_width);
+    let compact = head_width <= ControlRow::COLLAPSE_WIDTH;
     // Selection stops at a row boundary, so the whole-transcript unit needs a visible control
     // rather than a gesture the reader has to be told about.
-    let head = column_head(live, rows, tokens).child_when(rows > 0, ControlRole::Essential, || {
-        div()
-            .pl(Space::SM)
-            .debug_selector(|| "transcript-copy-control".into())
-            .child(
-                Button::new("copy-transcript")
-                    .label("Copy")
-                    .on_click(cx.listener(|this, _, _, cx| this.copy_transcript(cx))),
-            )
-            .into_any_element()
-    });
-    let head = if live {
-        head.child(
-            ControlRole::Essential,
-            div().pl(Space::SM).child(
-                Button::new("follow-transcript")
-                    .label(if following {
-                        "Following live"
-                    } else {
-                        "Follow live"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.follow_live(cx))),
-            ),
-        )
-    } else {
-        head
-    };
+    let head = column_head(live, rows, head_width, tokens)
+        .child_when(rows > 0 && !compact, ControlRole::Essential, || {
+            copy_control(cx)
+        })
+        .child_when(live && !compact, ControlRole::Essential, || {
+            follow_control(following, cx)
+        });
     div()
+        .flex()
+        .flex_col()
         .px(Space::MD)
         .py(Space::SM)
         .border_b_1()
         .border_color(tokens.line_soft)
         .child(head.finish())
+        .when(compact && (rows > 0 || live), |header| {
+            // At the same width where the legend leaves, keep the actions rather than clipping
+            // them: metadata remains on the first row and essential actions receive a second.
+            let actions = ControlRow::for_width(head_width)
+                .child(ControlRole::Ellipsizing, div())
+                .child_when(rows > 0, ControlRole::Essential, || copy_control(cx))
+                .child_when(live, ControlRole::Essential, || {
+                    follow_control(following, cx)
+                });
+            header.child(div().pt(Space::XS).child(actions.finish()))
+        })
+        .into_any_element()
+}
+
+fn copy_control(cx: &mut Context<MeetingWorkspace>) -> AnyElement {
+    div()
+        .pl(Space::SM)
+        .debug_selector(|| "transcript-copy-control".into())
+        .child(
+            Button::new("copy-transcript")
+                .label("Copy")
+                .on_click(cx.listener(|this, _, _, cx| this.copy_transcript(cx))),
+        )
+        .into_any_element()
+}
+
+fn follow_control(following: bool, cx: &mut Context<MeetingWorkspace>) -> AnyElement {
+    div()
+        .pl(Space::SM)
+        .debug_selector(|| "transcript-follow-control".into())
+        .child(
+            Button::new("follow-transcript")
+                .label(if following {
+                    "Following live"
+                } else {
+                    "Follow live"
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.follow_live(cx))),
+        )
         .into_any_element()
 }
 
@@ -842,6 +880,18 @@ const fn source_color(source: Source, tokens: WorkspaceTokens) -> Rgba {
     match source {
         Source::Mic => tokens.warn,
         Source::System => tokens.accent,
+    }
+}
+
+/// The control row sits inside the head's horizontal padding, so its honest width is the column
+/// width less both insets. Clamp pathological layout transients rather than passing a negative
+/// width into the shared collapse decision.
+fn column_head_available_width(column_width: Pixels) -> Pixels {
+    let available = column_width - Space::MD * 2;
+    if available > px(0.0) {
+        available
+    } else {
+        px(0.0)
     }
 }
 
@@ -2073,7 +2123,7 @@ mod mounted_tests {
         TimelineBuilder, Utterance,
     };
 
-    use super::{PROVISIONAL_MARKER, provisional_line};
+    use super::{PROVISIONAL_MARKER, TranscriptRow, provisional_line};
     use crate::workspace::{MeetingWorkspace, StageTab};
     use crate::{mcp, reasoning, session};
 
@@ -2424,6 +2474,63 @@ mod mounted_tests {
         Ok(())
     }
 
+    /// Recording is the tightest composition: the visible rail leaves 470 px at the minimum
+    /// viewport, and the transcript receives only 57.5% of that stage. Every essential head
+    /// control must still live wholly inside its actual column while only the legend disappears.
+    #[test]
+    fn the_live_head_keeps_every_essential_inside_its_narrow_column()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const MIN_WORKSPACE_WIDTH: gpui::Pixels = px(680.0);
+
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir()?;
+        let shell = mount_at(&mut cx, dir.path(), MIN_WORKSPACE_WIDTH)?;
+        let workspace = shell.workspace;
+        let visual = shell.visual;
+        let live = SessionId::new(1_786_625_999_000_000_001);
+        visual.update(|_, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_live_transcript(live);
+                workspace.transcript_pacer.replace(vec![TranscriptRow {
+                    event_id: EventId::new(91),
+                    source: Source::Mic,
+                    start: Duration::ZERO,
+                    text: "one settled row".to_owned(),
+                    prosody: vec![],
+                    unfinalized: false,
+                }]);
+                cx.notify();
+            });
+        });
+        visual.refresh()?;
+        visual.run_until_parked();
+
+        let stage = visual
+            .debug_bounds("stage-transcript")
+            .ok_or_else(|| std::io::Error::other("the live transcript stage must render"))?;
+        for selector in [
+            "transcript-head-label",
+            "transcript-copy-control",
+            "transcript-follow-control",
+        ] {
+            let control = visual.debug_bounds(selector).ok_or_else(|| {
+                std::io::Error::other(format!("{selector} must survive the live narrow head"))
+            })?;
+            assert!(
+                control.size.width > px(0.0)
+                    && control.left() >= stage.left()
+                    && control.right() <= stage.right(),
+                "{selector} must stay wholly inside the transcript column: {control:?} in {stage:?}"
+            );
+        }
+        assert!(
+            visual.debug_bounds("transcript-legend").is_none(),
+            "the legend, and only the legend, must collapse in the narrow live head"
+        );
+        Ok(())
+    }
+
     /// The stated limit, held to by a test rather than left for a reader to discover.
     ///
     /// A drag that leaves the row it started in copies only that row. That is why `Copy` and the
@@ -2694,61 +2801,72 @@ mod mounted_tests {
 mod layout_tests {
     use gpui::{Context, IntoElement, Render, TestAppContext, Window, div, prelude::*, px, size};
 
-    use super::{Space, WorkspaceTokens, column_head};
+    use super::{ControlRow, Space, WorkspaceTokens, column_head, column_head_available_width};
 
-    struct HeadHarness;
+    type MeasuredHead = (
+        gpui::Bounds<gpui::Pixels>,
+        Option<gpui::Bounds<gpui::Pixels>>,
+    );
+
+    struct HeadHarness {
+        column_width: gpui::Pixels,
+    }
 
     impl Render for HeadHarness {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let tokens = WorkspaceTokens::resolve(cx);
+            let available_width = column_head_available_width(self.column_width);
             div().size_full().child(
                 div()
                     .px(Space::MD)
                     .py(Space::SM)
-                    .child(column_head(false, 128, tokens).finish()),
+                    .child(column_head(false, 128, available_width, tokens).finish()),
             )
         }
     }
 
     #[test]
-    fn the_legend_gives_up_its_width_before_the_column_label_does()
+    fn the_legend_collapses_at_the_shared_threshold_while_the_label_remains()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
-        let (_view, visual) = cx.add_window_view(|_, _| HeadHarness);
-
-        let mut measure = |width| -> Result<
-            (gpui::Bounds<gpui::Pixels>, gpui::Bounds<gpui::Pixels>),
-            Box<dyn std::error::Error>,
-        > {
-            visual.simulate_resize(size(width, px(400.0)));
+        let measure = |width| -> Result<MeasuredHead, Box<dyn std::error::Error>> {
+            // Debug bounds are retained by a visual context between frames. A fresh harness for
+            // each width proves absence rather than mistaking the previous wide frame for the
+            // current narrow one.
+            let mut cx = TestAppContext::single();
+            cx.update(gpui_component::init);
+            let (_view, visual) = cx.add_window_view(move |_, _| HeadHarness {
+                column_width: width,
+            });
+            visual.simulate_resize(size(px(900.0), px(400.0)));
             visual.refresh()?;
             visual.run_until_parked();
             let label = visual
                 .debug_bounds("transcript-head-label")
                 .ok_or_else(|| std::io::Error::other("the column label must stay rendered"))?;
-            let legend = visual
-                .debug_bounds("transcript-legend")
-                .ok_or_else(|| std::io::Error::other("the legend must stay rendered"))?;
+            let legend = visual.debug_bounds("transcript-legend");
             Ok((label, legend))
         };
 
-        let (wide_label, wide_legend) = measure(px(900.0))?;
-        let (narrow_label, narrow_legend) = measure(px(200.0))?;
+        let head_insets = Space::MD * 2;
+        let (wide_label, wide_legend) =
+            measure(ControlRow::COLLAPSE_WIDTH + px(1.0) + head_insets)?;
+        let (threshold_label, threshold_legend) =
+            measure(ControlRow::COLLAPSE_WIDTH + head_insets)?;
+        let (narrow_label, narrow_legend) =
+            measure(ControlRow::COLLAPSE_WIDTH - px(1.0) + head_insets)?;
 
         assert!(
-            wide_legend.size.width > px(0.0),
+            wide_legend.is_some_and(|bounds| bounds.size.width > px(0.0)),
             "the legend explains the dots when there is room"
         );
         assert!(
-            narrow_legend.size.width < wide_legend.size.width,
-            "the legend must give up width first: {} then {}",
-            wide_legend.size.width,
-            narrow_legend.size.width
+            threshold_legend.is_none() && narrow_legend.is_none(),
+            "at or below the shared threshold the legend must be absent, not merely narrower"
         );
         assert_eq!(
-            narrow_label.size.width, wide_label.size.width,
-            "the column label never shrinks"
+            (threshold_label.size.width, narrow_label.size.width),
+            (wide_label.size.width, wide_label.size.width),
+            "the column label remains at every width"
         );
         Ok(())
     }

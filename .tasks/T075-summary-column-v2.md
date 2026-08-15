@@ -79,6 +79,9 @@ pinned composer.
 - **Provenance is stated, not implied**: the model that produced the summary and whether it was
   written now or loaded from disk, plus the source footing (none selected / retrieved / unavailable).
 - **Citation chips** are short moment labels that call `MeetingWorkspace::open_citation`.
+- **Downgraded controls are visible on fresh results.** The column consumes the observations carried
+  by `NotesState`, names the controls with the same wording as Ask, and deduplicates a loss observed
+  during more than one map/reduce dispatch.
 - **Your notes** lead the column, headed "appended to the record — never rewritten", and when empty
   say what typing will do rather than reporting emptiness. Each typed note keeps Edit and a jump to
   its anchor. A visible `Add` button now sits beside the composer input; Return still works.
@@ -103,18 +106,15 @@ third chip to prove it lands on the row it cites.
 
 ### Deviations and open handoffs
 
-- **Citation chips carry `#<event id>`, not a timecode.** `render`'s signature is frozen (its call
-  site is in T072's `layout.rs`), and nothing in the arguments it receives carries transcript media
-  time. `render_with_citation_times` takes a `CitationTimes` map and is the real body; `render`
-  calls it with an empty map. T072 passing a `BTreeMap<EventId, Duration>` built from
-  `frame.transcript` rows switches every chip and the composer's anchor label to `mm:ss` with no
-  other change.
-- **Downgraded controls are NOT surfaced.** `GroundedMeetingNotesReport.normalizations` (T067) is
-  dropped when `NotesController` builds `NotesState`, and `NotesState::Ready`/`Stale` carry no field
-  for it; both live in `crates/app/src/notes/controller.rs`, which T070 owns. The column cannot say
-  what a run lost until that state carries it. `Ask` already renders the same information from
-  `AskResult.normalizations`, so the shape is settled — `NotesState::Ready`/`Stale` need
-  `normalizations: Vec<ObservedRequestNormalization>`.
+- **Citation-time handoff resolved.** T072 now builds `CitationTimes` from the committed and unstable
+  transcript projections and calls `render_with_citation_times`. Citation chips and composer anchor
+  labels therefore use `mm:ss` whenever the cited transcript row is present; the event id remains
+  only the honest fallback for a missing projection.
+- **Downgrade observations are runtime-only today.** The root lane now threads
+  `GroundedMeetingNotesReport.normalizations` through `NotesState`; the column renders them without
+  changing T076's quiet evidence state. The report field remains `serde(skip)`, so a fresh result
+  can truthfully name lost controls while a cached/stale result has no durable downgrade history to
+  claim.
 - **`.collapses` has no direct GPUI equivalent under this column.** `ControlRole::Expendable` drops
   a child below `ControlRow::COLLAPSE_WIDTH`, but a column child cannot see its own width, so
   `ControlRow::new()` is used throughout and nothing in this column is expendable — every control
@@ -122,15 +122,20 @@ third chip to prove it lands on the row it cites.
 
 ### Verification
 
-Run against a copy of the working tree with two in-flight sibling compile errors patched out
-(`control_row.rs` dead `rendered_children`, `layout.rs` `let mut visual`), because the workspace does
-not currently build in files owned by T072.
+Final combined T075/T095 gate after T070 and T072 landed:
 
-- `cargo test -p app` — 156 passed, 5 failed, all five in `workspace::layout::tests` (T072's file).
-  All 18 `workspace::notes` tests pass, including the render-tree test.
-- `cargo clippy -p app --all-targets --all-features -- -D warnings` — clean.
-- `cargo fmt` — `notes.rs` reports no diff.
-- Whitespace scan over `notes.rs` — clean (the file is untracked at HEAD, so `git diff --check`
-  inspects nothing).
+- `cargo test -p app workspace::notes::tests --all-features --locked` — 26 passed, including the
+  mounted render-tree, evidence navigation, selectable-copy, unsupported-claim, adaptive-section,
+  pending/failure, source-context, and timecode regressions.
+- `a_fresh_result_keeps_backend_downgrades_for_the_summary_view` proves the controller preserves
+  fresh runtime observations; `a_fresh_summary_names_each_lost_control_once` proves the column's
+  wording and map/reduce deduplication.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test --workspace --locked --quiet` — passed on the final
+  tree outside the sandbox. The sandboxed rerun failed only eight unchanged ASR model-cache fixture
+  tests with macOS `Operation not permitted`; the same complete command then passed unsandboxed.
+  The app result was 242 passed and 4 explicitly ignored real-media cases.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo clippy --workspace --all-targets --all-features --locked
+  -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` — passed.
 
-NOT RUN: the full-workspace build and test suite, and any launch of the signed app.
+NOT RUN: a signed-app visual pass over a real summary. Cached/stale reports still cannot disclose a
+past downgrade because that runtime diagnostic is deliberately not persisted today.
