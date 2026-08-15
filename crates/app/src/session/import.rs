@@ -445,10 +445,11 @@ mod tests {
             let _ = &model;
             let database = directory.path().join("sotto.sqlite3");
             let recordings = directory.path().join("recordings");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            let outcome = runtime.block_on(import_recording(&source, &database, &recordings))?;
+            // Awaited on this test's own runtime rather than nested inside a second one. The two
+            // sibling rejection tests below are synchronous and legitimately build their own
+            // runtime; this one is `async` because it awaits the store afterwards, and
+            // `Runtime::block_on` panics outright when a runtime is already driving the thread.
+            let outcome = import_recording(&source, &database, &recordings).await?;
 
             let store = rag::Store::open(&database).await?;
             let transcript = transcript_of(&store, outcome.session_id).await;

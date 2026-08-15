@@ -1,6 +1,6 @@
 # T072 — The workspace shell, its two title bars, and recording vocabulary
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N7 — v2 workspace
 
