@@ -418,7 +418,7 @@ impl MeetingWorkspace {
                 return;
             }
         };
-        let store = match rag::Store::open(&self.database) {
+        let store = match crate::persistence_runtime::block_on(rag::Store::open(&self.database)) {
             Ok(value) => value,
             Err(error) => {
                 self.message = Some(error.to_string());
@@ -431,20 +431,21 @@ impl MeetingWorkspace {
         let single = match scope {
             None => None,
             Some(id) => {
-                let record = match store.load_session_record(id) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        self.message = Some(error.to_string());
-                        return;
-                    }
-                };
+                let record =
+                    match crate::persistence_runtime::block_on(store.load_session_record(id)) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            self.message = Some(error.to_string());
+                            return;
+                        }
+                    };
                 // A running recording's log lives in `TimelineState`, not the store: the actor is
                 // still checkpointing into it, so the persisted copy trails what is on screen.
                 let events = if self.transcript_live {
                     transcript::scope_to_session(self.timeline.read(cx).events(), Some(id))
                         .into_owned()
                 } else {
-                    match store.load_session(id) {
+                    match crate::persistence_runtime::block_on(store.load_session(id)) {
                         Ok(value) => value,
                         Err(error) => {
                             self.message = Some(error.to_string());
@@ -474,39 +475,36 @@ impl MeetingWorkspace {
         let spawn = std::thread::Builder::new()
             .name("sotto-ask".into())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
-                let result = runtime
-                    .map_err(|error| error.to_string())
-                    .and_then(|runtime| {
-                        let engine = AskEngine::new(provider);
-                        match single {
-                            Some((id, target, events)) => runtime
-                                .block_on(engine.ask(
-                                    id,
-                                    &target,
-                                    &events,
+                let result = crate::persistence_runtime::block_on(async {
+                    let engine = AskEngine::new(provider);
+                    match single {
+                        Some((id, target, events)) => engine
+                            .ask(
+                                id,
+                                &target,
+                                &events,
+                                &history,
+                                &worker_question,
+                                worker_cancel,
+                                Some(progress_sender),
+                            )
+                            .await
+                            .map_err(|error| error.to_string()),
+                        None => {
+                            let evidence = retained_evidence(&database, &worker_question).await?;
+                            engine
+                                .ask_across(
+                                    &evidence,
                                     &history,
                                     &worker_question,
                                     worker_cancel,
                                     Some(progress_sender),
-                                ))
-                                .map_err(|error| error.to_string()),
-                            None => {
-                                let evidence = retained_evidence(&database, &worker_question)?;
-                                runtime
-                                    .block_on(engine.ask_across(
-                                        &evidence,
-                                        &history,
-                                        &worker_question,
-                                        worker_cancel,
-                                        Some(progress_sender),
-                                    ))
-                                    .map_err(|error| error.to_string())
-                            }
+                                )
+                                .await
+                                .map_err(|error| error.to_string())
                         }
-                    });
+                    }
+                });
                 let _ = result_sender.send(result);
             });
         if let Err(error) = spawn {
@@ -591,13 +589,16 @@ const LIBRARY_ASK: SessionId = SessionId::new(0);
 /// startup for a person who never opens Ask is the wrong trade. This already runs on the Ask
 /// worker thread with progress on screen, it is idempotent, and it is the exact moment "all
 /// recordings" has to actually be true.
-fn retained_evidence(
+async fn retained_evidence(
     database: &std::path::Path,
     question: &str,
 ) -> Result<Vec<AskEvidence>, String> {
-    let store = rag::Store::open(database).map_err(|error| error.to_string())?;
+    let store = rag::Store::open(database)
+        .await
+        .map_err(|error| error.to_string())?;
     let report = store
         .index_missing_prior_meetings()
+        .await
         .map_err(|error| error.to_string())?;
     for (session_id, error) in &report.failed {
         eprintln!(
@@ -615,6 +616,7 @@ fn retained_evidence(
                 source_session_id: None,
             },
         )
+        .await
         .map_err(|error| error.to_string())?;
     chunks
         .into_iter()

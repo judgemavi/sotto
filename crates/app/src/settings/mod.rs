@@ -1874,14 +1874,14 @@ mod tests {
     }
 
     /// Writes a settled recording with real bytes on disk so a delete has something to remove.
-    fn seed_settled_recording(
+    async fn seed_settled_recording(
         database: &std::path::Path,
         recordings: &std::path::Path,
         session_id: sotto_core::SessionId,
     ) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         let path = recordings.join(format!("{}.mp4", session_id.get()));
         std::fs::write(&path, vec![0_u8; 4_096])?;
-        let store = rag::Store::open(database)?;
+        let store = rag::Store::open(database).await?;
         // The recording row references a session; without one the insert trips the foreign key.
         let mut record = sotto_core::Session::new(
             session_id,
@@ -1889,15 +1889,17 @@ mod tests {
             1_786_625_633_040,
         );
         record.end(1_786_625_700_000);
-        store.save_session(&record)?;
-        store.save_recording(&sotto_core::types::SessionRecording::Available {
-            session_id,
-            path: path.to_string_lossy().into_owned(),
-            container: sotto_core::types::RecordingContainer::Mp4,
-            duration: Duration::from_secs(120),
-            byte_size: 4_096,
-            time_mapping: sotto_core::types::MediaTimeMapping::IDENTITY,
-        })?;
+        store.save_session(&record).await?;
+        store
+            .save_recording(&sotto_core::types::SessionRecording::Available {
+                session_id,
+                path: path.to_string_lossy().into_owned(),
+                container: sotto_core::types::RecordingContainer::Mp4,
+                duration: Duration::from_secs(120),
+                byte_size: 4_096,
+                time_mapping: sotto_core::types::MediaTimeMapping::IDENTITY,
+            })
+            .await?;
         Ok(path)
     }
 
@@ -2193,13 +2195,14 @@ mod tests {
     }
 
     /// The trash icon on a storage row opens a confirm dialog; Cancel keeps the media.
-    #[test]
-    fn deleting_a_recording_asks_in_a_dialog() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_recording_asks_in_a_dialog() -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         let sheet = mount(&mut cx, px(900.0))?;
         let settings = sheet.settings.clone();
         let session_id = sotto_core::SessionId::new(42);
-        let media = seed_settled_recording(&sheet.database(), &sheet.recordings(), session_id)?;
+        let media =
+            seed_settled_recording(&sheet.database(), &sheet.recordings(), session_id).await?;
         let visual = sheet.visual;
         visual.update(|_, cx| settings.update(cx, |this, _| this.refresh_recordings()));
         visual.refresh()?;
@@ -2255,14 +2258,15 @@ mod tests {
     }
 
     /// Confirming removes the media the dialog named, and says so.
-    #[test]
-    fn confirming_the_recording_dialog_removes_the_media() -> Result<(), Box<dyn std::error::Error>>
-    {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn confirming_the_recording_dialog_removes_the_media()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         let sheet = mount(&mut cx, px(900.0))?;
         let settings = sheet.settings.clone();
         let session_id = sotto_core::SessionId::new(42);
-        let media = seed_settled_recording(&sheet.database(), &sheet.recordings(), session_id)?;
+        let media =
+            seed_settled_recording(&sheet.database(), &sheet.recordings(), session_id).await?;
         let visual = sheet.visual;
         visual.update(|_, cx| settings.update(cx, |this, _| this.refresh_recordings()));
         visual.refresh()?;

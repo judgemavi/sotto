@@ -6,6 +6,7 @@ pub mod board;
 pub mod devwindow;
 pub mod mcp;
 pub mod notes;
+mod persistence_runtime;
 pub mod reasoning;
 pub mod session;
 pub mod settings;

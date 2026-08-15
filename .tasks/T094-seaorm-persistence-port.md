@@ -1,6 +1,6 @@
 # T094 — Persistence on SeaORM, end to end
 
-**Status:** todo
+**Status:** done
 
 **Wave:** M4 — recording
 
@@ -122,3 +122,35 @@ sqlx, or entities — the boundary is `Store`'s public API and the `core` domain
 
 Changing any schema shape, table, or constraint beyond what the port requires; redesigning `Store`'s
 public API beyond making it async; the notes taxonomy; anything in `crates/capture`.
+
+---
+
+## Result — 2026-08-15
+
+`crates/rag` now opens SQLite through SeaORM/sqlx, registers `sqlite-vec` before either pool is
+created, and exposes only the async, cloneable `Store`. The writer pool remains serialized at one
+connection while reads use a separate four-connection pool. All base tables have crate-private
+entities; recording state remains a typed `DeriveActiveEnum` narrowed into the existing checked
+domain variants. SQLite-specific virtual tables, triggers, and the expression index remain raw DDL
+inside one irreversible `m0001_current_schema_baseline` migration, as the spike required.
+
+The fifteen-step upgrade chain and its historical migration tests are gone. A database carrying a
+pre-baseline `user_version` is refused with explicit delete-and-reopen guidance; a focused test
+asserts both the refusal and the stated remedy. The async conversion reaches app, insight, and CLI.
+Long-lived app persistence work uses the process runtime, already-async workers await directly,
+shared consumers own cloned `Store` handles, and embedding and filesystem work that can block is
+kept behind `spawn_blocking`. No synchronous `Store` compatibility wrapper remains.
+
+The existing retrieval and persistence assertions remain: vec0/FTS hybrid ordering, append-only
+timeline replay, grounded artifact atomicity, recording retention, entry deletion, quarantine
+rollback, and crash recovery all pass. The feasibility spike directory was removed after the gates
+closed.
+
+Verification:
+
+- `cargo test -p rag` — 33 passed, 1 performance/model-cache check ignored.
+- `cargo test -p app --lib` — 236 passed, 4 explicit real-media/model checks ignored.
+- `cargo test --workspace --quiet` — passed across the full workspace; only the repository's
+  explicit live, real-media, model-cache, and manual checks remained ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings` — passed.
+- `cargo fmt --all -- --check` and `git diff --check` — passed.

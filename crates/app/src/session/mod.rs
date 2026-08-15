@@ -337,6 +337,7 @@ impl StartGate {
     }
 
     /// Holds the Stop boundary across the synchronous OS-capture start side effect.
+    #[cfg(test)]
     fn start_if_not_cancelled<T, E>(
         &self,
         start: impl FnOnce() -> Result<T, E>,
@@ -353,6 +354,31 @@ impl StartGate {
             }
             StartGateState::Started => Ok(None),
             StartGateState::Cancelled => Ok(None),
+        }
+    }
+
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the gate mutex deliberately makes cancellation and the async capture-start boundary atomic"
+    )]
+    async fn start_if_not_cancelled_async<T, E, F>(
+        &self,
+        start: impl FnOnce() -> F,
+    ) -> Result<Option<T>, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match *state {
+            StartGateState::Preparing => {
+                let started = start().await?;
+                *state = StartGateState::Started;
+                Ok(Some(started))
+            }
+            StartGateState::Started | StartGateState::Cancelled => Ok(None),
         }
     }
 
@@ -1069,14 +1095,14 @@ async fn resolve_and_run(
         .await
         .map_err(SessionFailure::from_model)?;
     ensure_not_cancelled(start_gate.cancellation())?;
-    run(
+    Box::pin(run(
         target,
         &model_path,
         ingress,
         start_gate,
         sender,
         annotation_receiver,
-    )
+    ))
     .await
 }
 
@@ -1118,7 +1144,7 @@ async fn run(
     let _ = sender.send(WorkerEvent::Identified(session_id));
     let started_at_unix_ms = u64::try_from(now.as_millis()).unwrap_or(u64::MAX);
     let session = Session::new(session_id, capture_target.clone(), started_at_unix_ms);
-    let (persistence, store) = persistence()?;
+    let (persistence, store) = persistence().await?;
     let recording_directory = application_recording_directory();
     std::fs::create_dir_all(&recording_directory).map_err(|error| {
         SessionFailure::new(
@@ -1150,56 +1176,69 @@ async fn run(
     // This epoch brackets capture startup and is therefore never later than the capture-owned
     // monotonic epoch. It is also the upper bound used to reject impossible persisted coordinates.
     let session_started = std::time::Instant::now();
-    let start_result = start_gate.start_if_not_cancelled(|| {
-        store.save_session(&session).map_err(persistence_failure)?;
-        if let Err(error) = store.save_growing_recording(session_id, &recording_path) {
-            finish_session_record(
-                &store,
-                session_id,
-                capture_target.clone(),
-                started_at_unix_ms,
-            )?;
-            return Err(persistence_failure(error));
-        }
-        if let Err(error) = capture.record_to(&recording_path) {
-            let failure = capture_failure(error);
+    let start_result = start_gate
+        .start_if_not_cancelled_async(|| async {
             store
-                .mark_recording_finalization_failed(session_id, &failure.message)
+                .save_session(&session)
+                .await
                 .map_err(persistence_failure)?;
-            finish_session_record(
-                &store,
-                session_id,
-                capture_target.clone(),
-                started_at_unix_ms,
-            )?;
-            return Err(failure);
-        }
-        match Pipeline::builder(session)
-            .capture(capture)
-            .vad(mic_vad, system_vad)
-            .transcriber(transcriber)
-            .annotator(prosody::Annotator::default())
-            .persistence(persistence)
-            .start()
-        {
-            Ok(pipeline) => Ok(pipeline),
-            Err(error) => {
+            if let Err(error) = store
+                .save_growing_recording(session_id, &recording_path)
+                .await
+            {
+                finish_session_record(
+                    &store,
+                    session_id,
+                    capture_target.clone(),
+                    started_at_unix_ms,
+                )
+                .await?;
+                return Err(persistence_failure(error));
+            }
+            if let Err(error) = capture.record_to(&recording_path) {
+                let failure = capture_failure(error);
                 store
-                    .mark_recording_finalization_failed(
-                        session_id,
-                        "Capture pipeline failed after recording start.",
-                    )
+                    .mark_recording_finalization_failed(session_id, &failure.message)
+                    .await
                     .map_err(persistence_failure)?;
                 finish_session_record(
                     &store,
                     session_id,
                     capture_target.clone(),
                     started_at_unix_ms,
-                )?;
-                Err(capture_failure(error))
+                )
+                .await?;
+                return Err(failure);
             }
-        }
-    });
+            match Pipeline::builder(session)
+                .capture(capture)
+                .vad(mic_vad, system_vad)
+                .transcriber(transcriber)
+                .annotator(prosody::Annotator::default())
+                .persistence(persistence)
+                .start()
+            {
+                Ok(pipeline) => Ok(pipeline),
+                Err(error) => {
+                    store
+                        .mark_recording_finalization_failed(
+                            session_id,
+                            "Capture pipeline failed after recording start.",
+                        )
+                        .await
+                        .map_err(persistence_failure)?;
+                    finish_session_record(
+                        &store,
+                        session_id,
+                        capture_target.clone(),
+                        started_at_unix_ms,
+                    )
+                    .await?;
+                    Err(capture_failure(error))
+                }
+            }
+        })
+        .await;
     let pipeline = match start_result {
         Ok(Some(started)) => started,
         Ok(None) => {
@@ -1343,7 +1382,7 @@ async fn run(
             })
             .collect::<Vec<_>>();
         let tail_events = store
-            .append_final_utterances(session_id, &tail_utterances)
+            .append_final_utterances(session_id, &tail_utterances).await
             .map_err(persistence_failure)?;
         for event in tail_events {
             ingress.send(event).await.map_err(|_| {
@@ -1354,7 +1393,7 @@ async fn run(
             })?;
         }
         let persisted_events = store
-            .load_session(session_id)
+            .load_session(session_id).await
             .map_err(persistence_failure)?;
         // ASR coordinates are media time. Compare them with the probed media duration rather than
         // the independently sampled wall clock used by the control shell.
@@ -1368,14 +1407,14 @@ async fn run(
             time_mapping: MediaTimeMapping::IDENTITY,
         };
         let duration_discrepancy =
-            settle_recording(&store, &recording, probe.duration, capture_elapsed)?;
+            settle_recording(&store, &recording, probe.duration, capture_elapsed).await?;
         if let Some(discrepancy) = duration_discrepancy.as_deref() {
             eprintln!(
                 "Recording duration discrepancy: {discrepancy} The playable recording remains available."
             );
         }
         let pruned = store
-            .enforce_recording_budget(&recording_directory)
+            .enforce_recording_budget(&recording_directory).await
             .map_err(persistence_failure)?;
         if !pruned.contains(&session_id) {
             eprintln!(
@@ -1407,7 +1446,8 @@ async fn run(
                 capture_target.clone(),
                 started_at_unix_ms,
                 &reason,
-            )?;
+            )
+            .await?;
             return Err(SessionFailure::new(SessionFailureKind::Recording, reason));
         }
     };
@@ -1417,9 +1457,11 @@ async fn run(
         session_id,
         capture_target.clone(),
         started_at_unix_ms,
-    )?;
+    )
+    .await?;
     let persisted_record = store
         .load_session_record(session_id)
+        .await
         .map_err(persistence_failure)?;
     if persisted_record.capture_target() != &capture_target
         || persisted_record.ended_at_unix_ms().is_none()
@@ -1431,13 +1473,14 @@ async fn run(
     }
     let persisted = store
         .load_session(session_id)
+        .await
         .map_err(persistence_failure)?;
     // Every completed recording joins the cross-recording index, so Ask can reach the whole
     // library without anyone opting a recording in first. Deliberately non-fatal and last: the
     // recording, its timeline and its media are already durable by this point, and a search index
     // that could not be built is a degraded search, not a lost call. `index_missing_prior_meetings`
     // repairs whatever this pass missed.
-    if let Err(error) = store.index_prior_meeting(session_id, None) {
+    if let Err(error) = store.index_prior_meeting(session_id, None).await {
         eprintln!(
             "Recording saved, but it could not be added to cross-recording search: {error}. It stays reviewable, and Sotto retries when you ask across recordings."
         );
@@ -1472,7 +1515,7 @@ fn recording_duration_discrepancy(
     })
 }
 
-fn settle_recording(
+async fn settle_recording(
     store: &Store,
     recording: &SessionRecording,
     media_duration: Duration,
@@ -1483,6 +1526,7 @@ fn settle_recording(
     // should be made unreachable. Settle the reference first and report the discrepancy after.
     store
         .save_recording(recording)
+        .await
         .map_err(persistence_failure)?;
     Ok(discrepancy)
 }
@@ -1495,7 +1539,7 @@ fn finalization_failure_reason(message: &str) -> String {
     format!("{PREFIX} {detail}")
 }
 
-fn preserve_failed_finalization(
+async fn preserve_failed_finalization(
     store: &Store,
     session_id: SessionId,
     capture_target: CaptureTarget,
@@ -1504,8 +1548,9 @@ fn preserve_failed_finalization(
 ) -> Result<(), SessionFailure> {
     store
         .mark_recording_finalization_failed(session_id, reason)
+        .await
         .map_err(persistence_failure)?;
-    finish_session_record(store, session_id, capture_target, started_at_unix_ms)
+    finish_session_record(store, session_id, capture_target, started_at_unix_ms).await
 }
 
 /// How far a timeline coordinate may sit past the recording's measured end.
@@ -1673,7 +1718,7 @@ async fn wait_for_recording_finalization(
         })?
 }
 
-fn persistence() -> Result<(Arc<TimelinePersistence>, Arc<Store>), SessionFailure> {
+async fn persistence() -> Result<(Arc<TimelinePersistence>, Arc<Store>), SessionFailure> {
     let path = application_database_path();
     if let Some(directory) = path.parent() {
         std::fs::create_dir_all(directory).map_err(|error| {
@@ -1686,7 +1731,7 @@ fn persistence() -> Result<(Arc<TimelinePersistence>, Arc<Store>), SessionFailur
             )
         })?;
     }
-    let store = Arc::new(Store::open(&path).map_err(|error| {
+    let store = Arc::new(Store::open(&path).await.map_err(|error| {
         SessionFailure::new(
             SessionFailureKind::Persistence,
             format!(
@@ -1701,7 +1746,7 @@ fn persistence() -> Result<(Arc<TimelinePersistence>, Arc<Store>), SessionFailur
     ))
 }
 
-fn finish_session_record(
+async fn finish_session_record(
     store: &Store,
     session_id: SessionId,
     capture_target: CaptureTarget,
@@ -1710,7 +1755,10 @@ fn finish_session_record(
     let ended = wall_clock().map_err(worker_failure)?;
     let mut session = Session::new(session_id, capture_target, started_at_unix_ms);
     session.end(u64::try_from(ended.as_millis()).unwrap_or(u64::MAX));
-    store.save_session(&session).map_err(persistence_failure)
+    store
+        .save_session(&session)
+        .await
+        .map_err(persistence_failure)
 }
 
 fn finish_state(result: Result<SessionCompletion, SessionFailure>) -> SessionLifecycle {
@@ -1929,13 +1977,15 @@ mod tests {
         assert_eq!(clock.elapsed_at(stopped), Some(Duration::from_secs(20)));
     }
 
-    #[test]
-    fn genuine_duration_mismatch_is_reported_after_recording_becomes_available()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn genuine_duration_mismatch_is_reported_after_recording_becomes_available()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
-        let store = Store::open(directory.path().join("sotto.sqlite3"))?;
+        let store = Store::open(directory.path().join("sotto.sqlite3")).await?;
         let session_id = SessionId::new(68);
-        store.save_session(&Session::new(session_id, target(true), 1))?;
+        store
+            .save_session(&Session::new(session_id, target(true), 1))
+            .await?;
         let recording = SessionRecording::Available {
             session_id,
             path: directory
@@ -1955,13 +2005,14 @@ mod tests {
             Duration::from_secs(223_555),
             Some(Duration::from_secs_f64(19.9)),
         )
+        .await
         .map_err(|error| std::io::Error::other(error.message))?
         .ok_or("mixed-clock duration unexpectedly passed")?;
 
         assert!(discrepancy.contains("223555"));
         assert!(discrepancy.contains("19.9"));
         assert_eq!(
-            store.load_recording_reference(session_id)?,
+            store.load_recording_reference(session_id).await?,
             Some(rag::RecordingReference::Settled(recording)),
             "a detected mismatch must keep the recording usable"
         );
@@ -1977,20 +2028,22 @@ mod tests {
         assert_eq!(finalization_failure_reason(expected), expected);
     }
 
-    #[test]
-    fn failure_before_final_recording_write_keeps_counted_deletable_reference()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failure_before_final_recording_write_keeps_counted_deletable_reference()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("sotto.sqlite3");
         let recordings = directory.path().join("recordings");
         std::fs::create_dir_all(&recordings)?;
-        let store = Store::open(&database)?;
+        let store = Store::open(&database).await?;
         let session_id = SessionId::new(62);
         let capture_target = target(true);
-        store.save_session(&Session::new(session_id, capture_target.clone(), 1))?;
+        store
+            .save_session(&Session::new(session_id, capture_target.clone(), 1))
+            .await?;
         let path = recordings.join("62.mp4");
         std::fs::write(&path, vec![1_u8; 23])?;
-        store.save_growing_recording(session_id, &path)?;
+        store.save_growing_recording(session_id, &path).await?;
 
         preserve_failed_finalization(
             &store,
@@ -1999,27 +2052,33 @@ mod tests {
             1,
             "injected tail persistence failure",
         )
+        .await
         .map_err(|error| std::io::Error::other(error.message))?;
 
         assert!(
             store
-                .load_session_record(session_id)?
+                .load_session_record(session_id)
+                .await?
                 .ended_at_unix_ms()
                 .is_some()
         );
-        assert_eq!(store.recording_usage()?.used_bytes, 23);
+        assert_eq!(store.recording_usage().await?.used_bytes, 23);
         assert!(matches!(
-            store.load_recording_reference(session_id)?,
+            store.load_recording_reference(session_id).await?,
             Some(rag::RecordingReference::Growing {
                 finalization_error: Some(reason),
                 ..
             }) if reason == "injected tail persistence failure"
         ));
-        assert!(store.remove_recording_media(
-            session_id,
-            sotto_core::types::RecordingMissingReason::Deleted,
-            &recordings,
-        )?);
+        assert!(
+            store
+                .remove_recording_media(
+                    session_id,
+                    sotto_core::types::RecordingMissingReason::Deleted,
+                    &recordings,
+                )
+                .await?
+        );
         assert!(!path.exists());
         Ok(())
     }
@@ -2624,35 +2683,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ready_sweep_returns_when_an_event_sender_is_leaked() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()?;
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ready_sweep_returns_when_an_event_sender_is_leaked()
+    -> Result<(), Box<dyn std::error::Error>> {
         let bus = EventBus::new(NonZeroUsize::MIN);
         let mut events = bus.subscribe("leaked-sender-regression");
         let (ingress, _receiver) = test_ingress(1);
 
-        runtime.block_on(drain_ready(&mut events, &ingress));
+        drain_ready(&mut events, &ingress).await;
         Ok(())
     }
 
-    #[test]
-    fn leaked_event_sender_can_be_bounded_during_drain() -> Result<(), Box<dyn std::error::Error>> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()?;
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leaked_event_sender_can_be_bounded_during_drain()
+    -> Result<(), Box<dyn std::error::Error>> {
         let bus = EventBus::new(NonZeroUsize::MIN);
         let mut events = bus.subscribe("bounded-drain-regression");
         let (ingress, _receiver) = test_ingress(1);
-        let result = runtime.block_on(async {
-            tokio::time::timeout(
-                Duration::from_millis(10),
-                drain_until_closed(&mut events, &ingress),
-            )
-            .await
-        });
+        let result = tokio::time::timeout(
+            Duration::from_millis(10),
+            drain_until_closed(&mut events, &ingress),
+        )
+        .await;
 
         assert!(
             result.is_err(),

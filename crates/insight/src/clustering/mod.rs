@@ -82,18 +82,18 @@ pub enum ClusterError {
     Context(#[from] ReasoningContextError),
 }
 
-pub struct Clusterer<'a> {
-    store: &'a Store,
+pub struct Clusterer {
+    store: Store,
     provider: Arc<dyn ReasoningProvider>,
     backend_fingerprint: Option<BackendFingerprint>,
     screen_inspector: Option<Arc<dyn ScreenInspectionSource>>,
 }
 
-impl<'a> Clusterer<'a> {
+impl Clusterer {
     #[must_use]
-    pub fn new(store: &'a Store, provider: Arc<dyn CompletionProvider>) -> Self {
+    pub fn new(store: &Store, provider: Arc<dyn CompletionProvider>) -> Self {
         Self {
-            store,
+            store: store.clone(),
             provider: text_reasoning_provider(provider),
             backend_fingerprint: None,
             screen_inspector: None,
@@ -124,19 +124,23 @@ impl<'a> Clusterer<'a> {
             .backend_fingerprint
             .as_ref()
             .ok_or(ClusterError::MissingBackendFingerprint)?;
-        let session = self.store.load_session_record(session_id)?;
-        let events = self.store.load_session(session_id)?;
+        let session = self.store.load_session_record(session_id).await?;
+        let events = self.store.load_session(session_id).await?;
         let input = render_timeline(session.capture_target(), &events)?;
         // Prompt wording is part of the model input. Include it so ordinary in-place
         // prompt iteration cannot silently reuse an artifact produced by older instructions.
         let content_hash = clustering_content_hash(PROMPT, &input);
         let model = self.provider.model_id().to_owned();
-        if let Some((artifact, usage)) = self.store.load_derived_view(
-            session_id,
-            VIEW_KIND,
-            backend_fingerprint.as_str(),
-            &content_hash,
-        )? {
+        if let Some((artifact, usage)) = self
+            .store
+            .load_derived_view(
+                session_id,
+                VIEW_KIND,
+                backend_fingerprint.as_str(),
+                &content_hash,
+            )
+            .await?
+        {
             let view = serde_json::from_str(&artifact)?;
             let usage = serde_json::from_str(&usage)?;
             validate(&view, &events)?;
@@ -159,14 +163,16 @@ impl<'a> Clusterer<'a> {
         let view = result.value;
         let usage = result.usage;
         validate(&view, &events)?;
-        self.store.save_derived_view(
-            session_id,
-            VIEW_KIND,
-            backend_fingerprint.as_str(),
-            &content_hash,
-            &serde_json::to_string(&view)?,
-            &serde_json::to_string(&usage)?,
-        )?;
+        self.store
+            .save_derived_view(
+                session_id,
+                VIEW_KIND,
+                backend_fingerprint.as_str(),
+                &content_hash,
+                &serde_json::to_string(&view)?,
+                &serde_json::to_string(&usage)?,
+            )
+            .await?;
         Ok(ClusterReport {
             view,
             usage,

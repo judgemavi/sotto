@@ -104,14 +104,15 @@ impl LibraryFootprint {
         {
             eprintln!("Recording crash-recovery check failed: {error}");
         }
-        let retained_bytes = Store::open(database)
-            .and_then(|store| store.list_recordings())
-            .map(|recordings| {
-                recordings.iter().fold(0_u64, |total, recording| {
-                    total.saturating_add(recording.byte_size())
-                })
+        let retained_bytes = crate::persistence_runtime::block_on(async {
+            Store::open(database).await?.list_recordings().await
+        })
+        .map(|recordings| {
+            recordings.iter().fold(0_u64, |total, recording| {
+                total.saturating_add(recording.byte_size())
             })
-            .unwrap_or_default();
+        })
+        .unwrap_or_default();
         Self {
             recordings: meetings.len(),
             retained_bytes,
@@ -162,12 +163,12 @@ pub(crate) fn search_index(
     database: &Path,
     meetings: &[SessionSummary],
 ) -> BTreeMap<SessionId, String> {
-    let Ok(store) = Store::open(database) else {
-        return BTreeMap::new();
-    };
-    meetings
-        .iter()
-        .map(|meeting| {
+    crate::persistence_runtime::block_on(async {
+        let Ok(store) = Store::open(database).await else {
+            return BTreeMap::new();
+        };
+        let mut index = BTreeMap::new();
+        for meeting in meetings {
             let mut text = target_title(meeting).to_lowercase();
             text.push(' ');
             text.push_str(&meeting.capture_target.display_name.to_lowercase());
@@ -175,7 +176,7 @@ pub(crate) fn search_index(
                 text.push(' ');
                 text.push_str(&title.as_str().to_lowercase());
             }
-            if let Ok(events) = store.load_session(meeting.id) {
+            if let Ok(events) = store.load_session(meeting.id).await {
                 for event in events {
                     match event.payload() {
                         EventPayload::UtteranceFinal(value)
@@ -191,18 +192,19 @@ pub(crate) fn search_index(
                     }
                 }
             }
-            if let Ok(Some(derived)) = store.load_derived_transcript(meeting.id) {
+            if let Ok(Some(derived)) = store.load_derived_transcript(meeting.id).await {
                 for utterance in derived.utterances {
                     text.push(' ');
                     text.push_str(&utterance.text.to_lowercase());
                 }
             }
-            if let Ok(Some(report)) = load_latest_grounded_notes(&store, meeting.id) {
+            if let Ok(Some(report)) = load_latest_grounded_notes(&store, meeting.id).await {
                 append_notes_search_text(&mut text, &report.artifact);
             }
-            (meeting.id, text)
-        })
-        .collect()
+            index.insert(meeting.id, text);
+        }
+        index
+    })
 }
 
 /// Adds only user-visible summary content to the rail's search corpus.
@@ -719,9 +721,10 @@ fn commit_rename(workspace: &mut MeetingWorkspace, cx: &mut Context<MeetingWorks
         return;
     };
     let chosen = RecordingTitle::new(&value);
-    let written = Store::open(&workspace.database).and_then(|store| {
-        let entry_id = store.entry_for_session(id)?;
-        store.set_entry_title(entry_id, chosen.as_ref())
+    let written = crate::persistence_runtime::block_on(async {
+        let store = Store::open(&workspace.database).await?;
+        let entry_id = store.entry_for_session(id).await?;
+        store.set_entry_title(entry_id, chosen.as_ref()).await
     });
     cx.set_global(RailRename::default());
     match written {
@@ -1521,8 +1524,8 @@ mod tests {
 
     /// The rail's search text is what the toolbar query is matched against for anything the row
     /// itself does not carry, so both names have to be in it.
-    #[test]
-    fn the_search_index_carries_the_chosen_and_the_captured_name()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_search_index_carries_the_chosen_and_the_captured_name()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("sotto.sqlite3");
@@ -1539,14 +1542,14 @@ mod tests {
             1_786_625_633_040,
         );
         record.end(1_786_625_700_000);
-        let store = Store::open(&database)?;
-        store.save_session(&record)?;
+        let store = Store::open(&database).await?;
+        store.save_session(&record).await?;
         let title = RecordingTitle::new("Standup").ok_or("Standup is a title")?;
-        let entry_id = store.entry_for_session(session_id)?;
-        store.set_entry_title(entry_id, Some(&title))?;
+        let entry_id = store.entry_for_session(session_id).await?;
+        store.set_entry_title(entry_id, Some(&title)).await?;
         drop(store);
 
-        let meetings = Store::open(&database)?.list_sessions()?;
+        let meetings = Store::open(&database).await?.list_sessions().await?;
         let index = super::search_index(&database, &meetings);
         let text = index
             .get(&session_id)
@@ -1701,8 +1704,8 @@ mod tests {
 
     /// The whole gesture, through the controls a person uses: select the recording, rename it in
     /// the rail, and prove the new name is durable while the captured scope is not.
-    #[test]
-    fn renaming_from_the_rail_persists_the_name_and_never_the_capture_target()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renaming_from_the_rail_persists_the_name_and_never_the_capture_target()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
@@ -1718,7 +1721,7 @@ mod tests {
         };
         let mut record = Session::new(session_id, target.clone(), 1_786_625_633_040);
         record.end(1_786_625_700_000);
-        Store::open(&database)?.save_session(&record)?;
+        Store::open(&database).await?.save_session(&record).await?;
 
         let visual = mount_shell(&mut cx, dir.path(), database.clone())?;
 
@@ -1753,21 +1756,25 @@ mod tests {
         visual.run_until_parked();
 
         // Reopening the store is the relaunch: nothing in memory answers these.
-        let reopened = Store::open(&database)?;
-        let entry_id = reopened.entry_for_session(session_id)?;
+        let reopened = Store::open(&database).await?;
+        let entry_id = reopened.entry_for_session(session_id).await?;
         assert_eq!(
             reopened
-                .entry_title(entry_id)?
+                .entry_title(entry_id)
+                .await?
                 .map(|title| title.as_str().to_owned()),
             Some("standup".to_owned()),
             "the chosen name must outlive the process that chose it"
         );
         assert_eq!(
-            reopened.load_session_record(session_id)?.capture_target(),
+            reopened
+                .load_session_record(session_id)
+                .await?
+                .capture_target(),
             &target,
             "renaming must leave the recorded capture scope exactly as it was captured"
         );
-        let summaries = reopened.list_sessions()?;
+        let summaries = reopened.list_sessions().await?;
         let summary = summaries
             .first()
             .ok_or_else(|| std::io::Error::other("the catalogue must still list the recording"))?;
@@ -1790,8 +1797,8 @@ mod tests {
     }
 
     /// A blank name is not a name. Clearing the field is the way back to the captured one.
-    #[test]
-    fn clearing_the_name_restores_the_captured_one_rather_than_blanking_the_row()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clearing_the_name_restores_the_captured_one_rather_than_blanking_the_row()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
@@ -1810,11 +1817,11 @@ mod tests {
             1_786_625_633_040,
         );
         record.end(1_786_625_700_000);
-        let store = Store::open(&database)?;
-        store.save_session(&record)?;
+        let store = Store::open(&database).await?;
+        store.save_session(&record).await?;
         let chosen = RecordingTitle::new("Standup").ok_or("Standup is a title")?;
-        let entry_id = store.entry_for_session(session_id)?;
-        store.set_entry_title(entry_id, Some(&chosen))?;
+        let entry_id = store.entry_for_session(session_id).await?;
+        store.set_entry_title(entry_id, Some(&chosen)).await?;
         drop(store);
 
         let visual = mount_shell(&mut cx, dir.path(), database.clone())?;
@@ -1833,14 +1840,14 @@ mod tests {
         visual.simulate_keystrokes("cmd-a space enter");
         visual.run_until_parked();
 
-        let reopened = Store::open(&database)?;
-        let entry_id = reopened.entry_for_session(session_id)?;
+        let reopened = Store::open(&database).await?;
+        let entry_id = reopened.entry_for_session(session_id).await?;
         assert_eq!(
-            reopened.entry_title(entry_id)?,
+            reopened.entry_title(entry_id).await?,
             None,
             "a whitespace-only name must clear the title rather than persist a blank one"
         );
-        let summaries = reopened.list_sessions()?;
+        let summaries = reopened.list_sessions().await?;
         let summary = summaries
             .first()
             .ok_or_else(|| std::io::Error::other("the catalogue must still list the recording"))?;
@@ -1853,8 +1860,8 @@ mod tests {
     }
 
     /// Escape is the way out of an editor a person opened by mistake.
-    #[test]
-    fn escaping_the_editor_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn escaping_the_editor_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
@@ -1872,7 +1879,7 @@ mod tests {
             1_786_625_633_040,
         );
         record.end(1_786_625_700_000);
-        Store::open(&database)?.save_session(&record)?;
+        Store::open(&database).await?.save_session(&record).await?;
 
         let visual = mount_shell(&mut cx, dir.path(), database.clone())?;
         let row = visual
@@ -1890,18 +1897,18 @@ mod tests {
         visual.run_until_parked();
 
         assert_eq!(open_editor(visual), None, "Escape must close the editor");
-        let reopened = Store::open(&database)?;
-        let entry_id = reopened.entry_for_session(session_id)?;
+        let reopened = Store::open(&database).await?;
+        let entry_id = reopened.entry_for_session(session_id).await?;
         assert_eq!(
-            reopened.entry_title(entry_id)?,
+            reopened.entry_title(entry_id).await?,
             None,
             "an abandoned rename must write nothing at all"
         );
         Ok(())
     }
 
-    #[test]
-    fn a_long_rail_title_keeps_its_beginning_inside_the_rail_at_minimum_width()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_long_rail_title_keeps_its_beginning_inside_the_rail_at_minimum_width()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
@@ -1924,7 +1931,7 @@ mod tests {
             1_786_625_633_040,
         );
         record.end(1_786_625_700_000);
-        Store::open(&database)?.save_session(&record)?;
+        Store::open(&database).await?.save_session(&record).await?;
 
         let reasoning_path = dir.path().join("reasoning.json");
         let mcp_path = dir.path().join("mcp.json");

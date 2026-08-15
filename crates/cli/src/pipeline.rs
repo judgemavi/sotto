@@ -63,7 +63,7 @@ pub fn run_files(options: &PipelineOptions) -> Result<PipelineRun> {
         .block_on(run_files_async(options))
 }
 
-async fn run_files_async(options: &PipelineOptions) -> Result<PipelineRun> {
+pub async fn run_files_async(options: &PipelineOptions) -> Result<PipelineRun> {
     let mode = if options.realtime {
         FileCaptureMode::Realtime
     } else {
@@ -512,10 +512,10 @@ fn percentile(values: &[Duration], numerator: usize, denominator: usize) -> f64 
         .div_ceil(denominator);
     values[index].as_secs_f64() * 1_000.0
 }
-pub fn ingest_file(store_path: &Path, input: &Path) -> Result<bool> {
+pub async fn ingest_file(store_path: &Path, input: &Path) -> Result<bool> {
     let text = std::fs::read_to_string(input)
         .with_context(|| format!("read document {}", input.display()))?;
-    let store = rag::Store::open(store_path)?;
+    let store = rag::Store::open(store_path).await?;
     let metadata = rag::IngestMetadata {
         title: input
             .file_name()
@@ -527,5 +527,6 @@ pub fn ingest_file(store_path: &Path, input: &Path) -> Result<bool> {
     };
     store
         .ingest_text(&text, FILE_INGEST_KIND, metadata)
+        .await
         .map_err(Into::into)
 }

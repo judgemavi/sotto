@@ -95,10 +95,10 @@ mod tests {
         .clone())
     }
 
-    fn store_with_utterances(
+    async fn store_with_utterances(
         starts: &[u64],
     ) -> Result<(rag::Store, SessionId), Box<dyn std::error::Error>> {
-        let store = rag::Store::open_in_memory()?;
+        let store = rag::Store::open_in_memory().await?;
         let session_id = SessionId::new(37);
         let session = Session::new(
             session_id,
@@ -111,7 +111,7 @@ mod tests {
             },
             1,
         );
-        store.save_session(&session)?;
+        store.save_session(&session).await?;
         let mut timeline = TimelineBuilder::new(session);
         for (index, start) in starts.iter().copied().enumerate() {
             timeline.append(
@@ -134,14 +134,14 @@ mod tests {
                 }),
             );
         }
-        store.append_events(timeline.events())?;
+        store.append_events(timeline.events()).await?;
         Ok((store, session_id))
     }
 
     #[tokio::test]
     async fn adaptive_reduce_input_never_exposes_sotto_owned_block_ids()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (store, session_id) = store_with_utterances(&[1, 1_201])?;
+        let (store, session_id) = store_with_utterances(&[1, 1_201]).await?;
         let first_window = r#"{"sections":[{"kind":"overview","blocks":[{"type":"claim","text":"Launch planning began","meeting_citations":[1]}]}]}"#;
         let second_window = r#"{"sections":[{"kind":"risks","blocks":[{"type":"claim","text":"Rollout risk was discussed","meeting_citations":[2]}]}]}"#;
         let reduced = r#"{"sections":[{"kind":"overview","blocks":[{"type":"claim","text":"The meeting covered launch planning and rollout risk","meeting_citations":[1,2]}]}]}"#;

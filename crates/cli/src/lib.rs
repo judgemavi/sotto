@@ -7,4 +7,4 @@ pub mod pipeline;
 pub mod reasoning;
 
 pub use file_capture::{FileCapture, FileCaptureMode, FrameFile, TimestampedFrames};
-pub use pipeline::{LatencyReport, PipelineOptions, PipelineRun, run_files};
+pub use pipeline::{LatencyReport, PipelineOptions, PipelineRun, run_files, run_files_async};

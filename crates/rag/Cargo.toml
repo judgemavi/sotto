@@ -9,13 +9,25 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = "0.1.89"
 fastembed = { version = "5.2.0", default-features = false, features = ["ort-download-binaries", "hf-hub-native-tls"] }
-rusqlite = { version = "0.37.0", features = ["bundled", "serde_json"] }
+libsqlite3-sys = { version = "0.35.0", features = ["bundled"] }
+sea-orm = { version = "2.0.2", default-features = false, features = [
+    "macros",
+    "runtime-tokio-rustls",
+    "sqlx-sqlite",
+    "with-json",
+] }
+sea-orm-migration = { version = "2.0.2", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "sqlx-sqlite",
+] }
 serde.workspace = true
 serde_json.workspace = true
 sqlite-vec = "0.1.6"
 sotto_core = { package = "core", path = "../core", features = ["serde"] }
-tokio = { workspace = true, features = ["rt"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["sqlite"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
 
 [dev-dependencies]
 tempfile = "3.20.0"

@@ -269,8 +269,8 @@ mod tests {
         }
     }
 
-    fn fixture() -> Result<(rag::Store, SessionId), Box<dyn std::error::Error>> {
-        let store = rag::Store::open_in_memory()?;
+    async fn fixture() -> Result<(rag::Store, SessionId), Box<dyn std::error::Error>> {
+        let store = rag::Store::open_in_memory().await?;
         let id = SessionId::new(41);
         let session = Session::new(
             id,
@@ -283,7 +283,7 @@ mod tests {
             },
             1,
         );
-        store.save_session(&session)?;
+        store.save_session(&session).await?;
         let mut timeline = TimelineBuilder::new(session);
         timeline.append(
             Duration::from_secs(1),
@@ -296,7 +296,7 @@ mod tests {
                 annotations: Vec::new(),
             }),
         );
-        store.append_events(timeline.events())?;
+        store.append_events(timeline.events()).await?;
         Ok((store, id))
     }
 
@@ -317,7 +317,7 @@ mod tests {
     #[tokio::test]
     async fn transcript_only_recording_summary_cache_and_reopen_need_no_context_source()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (store, id) = fixture()?;
+        let (store, id) = fixture().await?;
         let provider = Arc::new(Provider {
             outputs: Mutex::new(VecDeque::from([RECORDING_SUMMARY.to_owned()])),
             calls: AtomicUsize::new(0),
@@ -330,7 +330,9 @@ mod tests {
         let cached = generator
             .generate_grounded_with_cancellation(id, None, CancellationToken::new())
             .await?;
-        let reopened = load_latest_grounded_notes(&store, id)?.ok_or("replay missing")?;
+        let reopened = load_latest_grounded_notes(&store, id)
+            .await?
+            .ok_or("replay missing")?;
         assert_eq!(first.source_status, SourceStatus::NotSelected);
         assert!(cached.cached && reopened.cached);
         assert_eq!(cached.calls, 0);
@@ -339,18 +341,20 @@ mod tests {
         assert_eq!(first.artifact.sections.len(), 1);
         assert!(
             store
-                .load_latest_grounded_derived_view(id, "recording_notes.v1")?
+                .load_latest_grounded_derived_view(id, "recording_notes.v1")
+                .await?
                 .is_some(),
             "the superseding artifact kind is canonical"
         );
         assert!(
             store
-                .load_latest_grounded_derived_view(id, "meeting_notes.v2")?
+                .load_latest_grounded_derived_view(id, "meeting_notes.v2")
+                .await?
                 .is_none(),
             "new output must not be stored under the legacy kind"
         );
 
-        let session = store.load_session_record(id)?;
+        let session = store.load_session_record(id).await?;
         let mut changed = TimelineBuilder::new(session);
         changed.append(
             Duration::from_secs(1),
@@ -374,12 +378,13 @@ mod tests {
                 annotations: Vec::new(),
             }),
         );
-        store.append_events(&changed.events()[1..])?;
+        store.append_events(&changed.events()[1..]).await?;
         assert!(
-            load_latest_grounded_notes(&store, id)?.is_none(),
+            load_latest_grounded_notes(&store, id).await?.is_none(),
             "changed timeline must not reopen stale notes"
         );
-        let stale = load_latest_grounded_notes_status(&store, id)?
+        let stale = load_latest_grounded_notes_status(&store, id)
+            .await?
             .ok_or("latest stale artifact must remain reviewable")?;
         assert!(stale.stale);
         assert_eq!(stale.report.artifact, first.artifact);
@@ -389,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_or_vacuous_external_basis_fails_closed()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (store, id) = fixture()?;
+        let (store, id) = fixture().await?;
         let invalid = r#"{"sections":[{"kind":"findings","blocks":[{"type":"claim","text":"Claim","external_citations":["mcp-evidence-v1-unknown"]}]}]}"#;
         let provider = Arc::new(Provider {
             outputs: Mutex::new(VecDeque::from([invalid.to_owned()])),
@@ -409,7 +414,7 @@ mod tests {
     #[tokio::test]
     async fn source_unavailable_degrades_but_cancellation_and_cached_cancellation_do_not()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (store, id) = fixture()?;
+        let (store, id) = fixture().await?;
         let server = ServerId::new("docs")?;
         let uri = ResourceUri::new("docs://project/plan")?;
         let mut grant = SessionContextGrant::new();
@@ -460,7 +465,7 @@ mod tests {
     #[tokio::test]
     async fn same_external_content_hits_and_changed_content_misses_with_mixed_evidence()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (store, id) = fixture()?;
+        let (store, id) = fixture().await?;
         let (first_input, first_calls) = grounding("External launch plan")?;
         let bundle = first_input
             .source
@@ -494,7 +499,7 @@ mod tests {
         });
         let generator = MeetingNotesGenerator::new(&store, provider.clone())
             .with_backend_fingerprint(fingerprint()?);
-        let timeline_before = serde_json::to_vec(&store.load_session(id)?)?;
+        let timeline_before = serde_json::to_vec(&store.load_session(id).await?)?;
         let first = generator
             .generate_grounded_with_cancellation(id, Some(first_input), CancellationToken::new())
             .await?;
@@ -521,9 +526,11 @@ mod tests {
         assert!(first_calls.load(Ordering::Relaxed) >= 4);
         assert_eq!(
             timeline_before,
-            serde_json::to_vec(&store.load_session(id)?)?
+            serde_json::to_vec(&store.load_session(id).await?)?
         );
-        let reopened = load_latest_grounded_notes(&store, id)?.ok_or("grounded replay missing")?;
+        let reopened = load_latest_grounded_notes(&store, id)
+            .await?
+            .ok_or("grounded replay missing")?;
         assert_eq!(reopened.source_status, SourceStatus::Available);
         assert_eq!(reopened.bundle.digest(), first.bundle.digest());
         Ok(())
@@ -534,7 +541,7 @@ mod tests {
         // An owner asserted with neither meeting nor external evidence. No label can rescue this:
         // there is nothing to derive a basis from and nothing for a reader to check.
         let uncited = r#"{"sections":[{"kind":"action_items","blocks":[{"type":"action","text":"Act","meeting_citations":[1],"owner":"Morgan","due_date":null}]}]}"#;
-        let (store, id) = fixture()?;
+        let (store, id) = fixture().await?;
         let provider = Arc::new(Provider {
             outputs: Mutex::new(VecDeque::from([uncited.to_owned()])),
             calls: AtomicUsize::new(0),
@@ -555,7 +562,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         // Deriving the basis must not become a way to launder an unresolvable citation.
         let unknown = r#"{"sections":[{"kind":"findings","blocks":[{"type":"claim","text":"Claim","meeting_citations":[1],"external_citations":["mcp-evidence-v1-unknown"]}]}]}"#;
-        let (store, id) = fixture()?;
+        let (store, id) = fixture().await?;
         let provider = Arc::new(Provider {
             outputs: Mutex::new(VecDeque::from([unknown.to_owned()])),
             calls: AtomicUsize::new(0),
@@ -575,7 +582,7 @@ mod tests {
     async fn superseding_wire_rejects_the_retired_basis_field()
     -> Result<(), Box<dyn std::error::Error>> {
         let with_basis = r#"{"sections":[{"kind":"findings","blocks":[{"type":"claim","text":"Fact","basis":"meeting","meeting_citations":[1]}]}]}"#;
-        let (store, id) = fixture()?;
+        let (store, id) = fixture().await?;
         let provider = Arc::new(Provider {
             outputs: Mutex::new(VecDeque::from([with_basis.to_owned()])),
             calls: AtomicUsize::new(0),
@@ -591,7 +598,7 @@ mod tests {
     #[tokio::test]
     async fn malicious_selected_excerpt_is_quoted_and_cannot_change_schema_or_reach_other_context()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (store, id) = fixture()?;
+        let (store, id) = fixture().await?;
         let provider = Arc::new(CapturingProvider {
             request: Mutex::new(None),
             output: r#"{"sections":[],"tools":[{"name":"delete_all"}]}"#.to_owned(),

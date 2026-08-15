@@ -157,9 +157,12 @@ pub(super) async fn import_recording(
     );
     session.end(ended_at_unix_ms);
 
-    let store = Store::open(database).map_err(|error| error.to_string())?;
+    let store = Store::open(database)
+        .await
+        .map_err(|error| error.to_string())?;
     store
         .save_session(&session)
+        .await
         .map_err(|error| error.to_string())?;
     store
         .save_recording(&SessionRecording::Available {
@@ -170,17 +173,19 @@ pub(super) async fn import_recording(
             byte_size,
             time_mapping: MediaTimeMapping::IDENTITY,
         })
+        .await
         .map_err(|error| error.to_string())?;
     let events = store
         .append_final_utterances(session_id, &utterances)
+        .await
         .map_err(|error| error.to_string())?;
     // Non-fatal and last, mirroring the captured-session finalize path: the session, its timeline
     // and its media are already durable by this point, so a budget or index failure degrades
     // retention accounting or cross-recording search rather than losing the import.
-    if let Err(error) = store.enforce_recording_budget(recording_directory) {
+    if let Err(error) = store.enforce_recording_budget(recording_directory).await {
         eprintln!("Imported recording saved, but retention budget enforcement failed: {error}");
     }
-    if let Err(error) = store.index_prior_meeting(session_id, None) {
+    if let Err(error) = store.index_prior_meeting(session_id, None).await {
         eprintln!(
             "Imported recording saved, but it could not be added to cross-recording search: \
              {error}. It stays reviewable, and Sotto retries when you ask across recordings."
@@ -352,9 +357,10 @@ mod tests {
                 .then_some(destination)
         }
 
-        fn transcript_of(store: &rag::Store, session_id: sotto_core::SessionId) -> String {
+        async fn transcript_of(store: &rag::Store, session_id: sotto_core::SessionId) -> String {
             store
                 .load_session(session_id)
+                .await
                 .map(|events| {
                     events
                         .iter()
@@ -370,9 +376,9 @@ mod tests {
                 .unwrap_or_default()
         }
 
-        #[test]
+        #[tokio::test(flavor = "multi_thread")]
         #[ignore = "requires SOTTO_WHISPER_MODEL, real on-device inference, and macOS say/afconvert"]
-        fn imports_a_real_audio_file_and_transcribes_known_words()
+        async fn imports_a_real_audio_file_and_transcribes_known_words()
         -> Result<(), Box<dyn std::error::Error>> {
             let model = std::env::var_os("SOTTO_WHISPER_MODEL")
                 .ok_or("SOTTO_WHISPER_MODEL must point to ggml Whisper weights")?;
@@ -387,23 +393,20 @@ mod tests {
             let _ = &model;
             let database = directory.path().join("sotto.sqlite3");
             let recordings = directory.path().join("recordings");
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            let outcome = runtime.block_on(import_recording(&source, &database, &recordings))?;
+            let outcome = import_recording(&source, &database, &recordings).await?;
 
             assert!(
                 outcome.utterance_count > 0,
                 "a real spoken file must produce at least one transcribed utterance"
             );
-            let store = rag::Store::open(&database)?;
-            let transcript = transcript_of(&store, outcome.session_id);
+            let store = rag::Store::open(&database).await?;
+            let transcript = transcript_of(&store, outcome.session_id).await;
             assert!(
                 transcript.contains("roadmap") || transcript.contains("monday"),
                 "transcript must contain recognizable words from the known spoken text, got \
                  {transcript:?}"
             );
-            let session = store.load_session_record(outcome.session_id)?;
+            let session = store.load_session_record(outcome.session_id).await?;
             assert!(
                 is_imported_capture_target(session.capture_target()),
                 "an imported session must record itself as imported, not as a capture"
@@ -415,10 +418,10 @@ mod tests {
             Ok(())
         }
 
-        #[test]
+        #[tokio::test(flavor = "multi_thread")]
         #[ignore = "requires SOTTO_WHISPER_MODEL, real on-device inference, macOS say/afconvert, \
                     and ffmpeg to assemble the video fixture"]
-        fn imports_a_real_video_file_transcribes_it_and_supports_screen_inspection()
+        async fn imports_a_real_video_file_transcribes_it_and_supports_screen_inspection()
         -> Result<(), Box<dyn std::error::Error>> {
             let model = std::env::var_os("SOTTO_WHISPER_MODEL")
                 .ok_or("SOTTO_WHISPER_MODEL must point to ggml Whisper weights")?;
@@ -447,15 +450,16 @@ mod tests {
                 .build()?;
             let outcome = runtime.block_on(import_recording(&source, &database, &recordings))?;
 
-            let store = rag::Store::open(&database)?;
-            let transcript = transcript_of(&store, outcome.session_id);
+            let store = rag::Store::open(&database).await?;
+            let transcript = transcript_of(&store, outcome.session_id).await;
             assert!(
                 transcript.contains("roadmap") || transcript.contains("screen"),
                 "the video's real speech must transcribe to recognizable words, got {transcript:?}"
             );
 
             let recording = store
-                .load_recording(outcome.session_id)?
+                .load_recording(outcome.session_id)
+                .await?
                 .ok_or("the imported video must have a settled recording row")?;
             let inspector = RecordingBackedScreenInspector::new(
                 recording,

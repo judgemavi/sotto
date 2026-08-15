@@ -87,11 +87,12 @@ pub struct GroundingInput {
     pub source: Arc<dyn ContextSource>,
 }
 
-pub fn load_latest_grounded_notes(
+pub async fn load_latest_grounded_notes(
     store: &Store,
     session_id: SessionId,
 ) -> Result<Option<GroundedMeetingNotesReport>, MeetingNotesError> {
-    Ok(load_latest_grounded_notes_status(store, session_id)?
+    Ok(load_latest_grounded_notes_status(store, session_id)
+        .await?
         .filter(|cached| !cached.stale)
         .map(|cached| cached.report))
 }
@@ -100,18 +101,19 @@ pub fn load_latest_grounded_notes(
 ///
 /// Stale artifacts remain reviewable but callers must label them and must not serve them as a
 /// current cache hit.
-pub fn load_latest_grounded_notes_status(
+pub async fn load_latest_grounded_notes_status(
     store: &Store,
     session_id: SessionId,
 ) -> Result<Option<CachedGroundedMeetingNotes>, MeetingNotesError> {
-    let Some(stored) =
-        store.load_latest_grounded_derived_view(session_id, RECORDING_ARTIFACT_KIND)?
+    let Some(stored) = store
+        .load_latest_grounded_derived_view(session_id, RECORDING_ARTIFACT_KIND)
+        .await?
     else {
         return Ok(None);
     };
     let bundle: ContextBundle = serde_json::from_str(&stored.view.bundle)?;
     bundle.validate_integrity()?;
-    let events = store.load_session(session_id)?;
+    let events = store.load_session(session_id).await?;
     let artifact: RecordingNotes = serde_json::from_str(&stored.view.artifact)?;
     validate_recording_notes(&artifact, session_id, &events, &bundle)?;
     let source_status = parse_source_status(&stored.view.source_status)?;
@@ -123,7 +125,7 @@ pub fn load_latest_grounded_notes_status(
     if !source_status_matches(source_status, grant_fingerprint.as_ref(), &bundle) {
         return Err(MeetingNotesError::InvalidSourceStatus);
     }
-    let session = store.load_session_record(session_id)?;
+    let session = store.load_session_record(session_id).await?;
     let transcript = render_transcript(session.capture_target(), &events);
     let timeline = serde_json::to_string(&events)?;
     let current_hash = recording_content_hash(
@@ -197,18 +199,18 @@ pub enum MeetingNotesError {
 }
 
 /// Generates cached notes without changing the canonical meeting record.
-pub struct MeetingNotesGenerator<'a> {
-    store: &'a Store,
+pub struct MeetingNotesGenerator {
+    store: Store,
     provider: Arc<dyn ReasoningProvider>,
     backend_fingerprint: Option<BackendFingerprint>,
     screen_inspector: Option<Arc<dyn ScreenInspectionSource>>,
 }
 
-impl<'a> MeetingNotesGenerator<'a> {
+impl MeetingNotesGenerator {
     #[must_use]
-    pub fn new(store: &'a Store, provider: Arc<dyn CompletionProvider>) -> Self {
+    pub fn new(store: &Store, provider: Arc<dyn CompletionProvider>) -> Self {
         Self {
-            store,
+            store: store.clone(),
             provider: text_reasoning_provider(provider),
             backend_fingerprint: None,
             screen_inspector: None,
@@ -246,8 +248,8 @@ impl<'a> MeetingNotesGenerator<'a> {
             .backend_fingerprint
             .as_ref()
             .ok_or(MeetingNotesError::MissingBackendFingerprint)?;
-        let session = self.store.load_session_record(session_id)?;
-        let events = self.store.load_session(session_id)?;
+        let session = self.store.load_session_record(session_id).await?;
+        let events = self.store.load_session(session_id).await?;
         if !events
             .iter()
             .any(|event| matches!(event.payload(), EventPayload::UtteranceFinal(_)))
@@ -318,12 +320,16 @@ impl<'a> MeetingNotesGenerator<'a> {
             grant_fingerprint.as_ref(),
         );
         let model = self.provider.model_id().to_owned();
-        if let Some(stored) = self.store.load_grounded_derived_view(
-            session_id,
-            RECORDING_ARTIFACT_KIND,
-            backend_fingerprint.as_str(),
-            &content_hash,
-        )? {
+        if let Some(stored) = self
+            .store
+            .load_grounded_derived_view(
+                session_id,
+                RECORDING_ARTIFACT_KIND,
+                backend_fingerprint.as_str(),
+                &content_hash,
+            )
+            .await?
+        {
             if stored.grant_fingerprint.as_deref()
                 != grant_fingerprint.as_ref().map(GrantRunFingerprint::as_str)
             {
@@ -414,18 +420,20 @@ impl<'a> MeetingNotesGenerator<'a> {
         if cancellation.is_cancelled() {
             return Err(MeetingNotesError::Provider(ProviderError::Cancelled));
         }
-        self.store.save_grounded_derived_view(
-            session_id,
-            RECORDING_ARTIFACT_KIND,
-            backend_fingerprint.as_str(),
-            &content_hash,
-            &serde_json::to_string(&artifact)?,
-            &serde_json::to_string(&usage)?,
-            &model,
-            grant_fingerprint.as_ref().map(GrantRunFingerprint::as_str),
-            source_status.as_str(),
-            &serde_json::to_string(&bundle)?,
-        )?;
+        self.store
+            .save_grounded_derived_view(
+                session_id,
+                RECORDING_ARTIFACT_KIND,
+                backend_fingerprint.as_str(),
+                &content_hash,
+                &serde_json::to_string(&artifact)?,
+                &serde_json::to_string(&usage)?,
+                &model,
+                grant_fingerprint.as_ref().map(GrantRunFingerprint::as_str),
+                source_status.as_str(),
+                &serde_json::to_string(&bundle)?,
+            )
+            .await?;
         Ok(GroundedMeetingNotesReport {
             artifact,
             bundle,

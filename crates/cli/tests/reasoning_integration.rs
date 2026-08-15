@@ -150,10 +150,10 @@ mod tests {
             .ok_or_else(|| "OpenAI backend was not selected".into())
     }
 
-    fn persisted_store(
+    async fn persisted_store(
         frame_path: Option<&std::path::Path>,
     ) -> Result<(rag::Store, SessionId), Box<dyn std::error::Error>> {
-        let store = rag::Store::open_in_memory()?;
+        let store = rag::Store::open_in_memory().await?;
         let id = SessionId::new(71);
         let session = Session::new(
             id,
@@ -166,7 +166,7 @@ mod tests {
             },
             1,
         );
-        store.save_session(&session)?;
+        store.save_session(&session).await?;
         let mut timeline = TimelineBuilder::new(session);
         for (index, text) in [
             "The price is too high.",
@@ -205,7 +205,7 @@ mod tests {
                 }),
             );
         }
-        store.append_events(timeline.events())?;
+        store.append_events(timeline.events()).await?;
         Ok((store, id))
     }
 
@@ -228,8 +228,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let frame = directory.path().join("pricing.png");
         std::fs::write(&frame, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1])?;
-        let (store, id) = persisted_store(Some(&frame))?;
-        let before = serde_json::to_vec(&store.load_session(id)?)?;
+        let (store, id) = persisted_store(Some(&frame)).await?;
+        let before = serde_json::to_vec(&store.load_session(id).await?)?;
         let (api_base, requests) =
             spawn_responses(vec![response(RECAP), response(CLUSTERS)]).await?;
         let backend = resolved_openai(api_base)?;
@@ -253,7 +253,7 @@ mod tests {
         );
         assert_eq!(
             before,
-            serde_json::to_vec(&store.load_session(id)?)?,
+            serde_json::to_vec(&store.load_session(id).await?)?,
             "derived reasoning must not mutate the timeline"
         );
 
@@ -294,7 +294,7 @@ mod tests {
                 &frame,
                 [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3],
             )?;
-            let (store, id) = persisted_store(Some(&frame))?;
+            let (store, id) = persisted_store(Some(&frame)).await?;
             let (api_base, requests) =
                 spawn_responses(vec![response(INSPECT_IMAGE), response(RECAP)]).await?;
             let backend = resolved_openai(api_base)?;
@@ -568,7 +568,7 @@ mod tests {
     #[tokio::test]
     async fn structured_consumers_reject_missing_json_capability_before_transport()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (store, id) = persisted_store(None)?;
+        let (store, id) = persisted_store(None).await?;
         let calls = Arc::new(AtomicUsize::new(0));
         let backend = resolve_queue_backend(
             "test.no-json",
@@ -600,7 +600,7 @@ mod tests {
             &frame,
             [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3],
         )?;
-        let (store, id) = persisted_store(Some(&frame))?;
+        let (store, id) = persisted_store(Some(&frame)).await?;
         let calls = Arc::new(AtomicUsize::new(0));
         let backend = resolve_queue_backend(
             "test.text-only",
@@ -638,7 +638,7 @@ mod tests {
     #[tokio::test]
     async fn fake_third_backend_runs_unchanged_consumer_and_separates_cache()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (store, id) = persisted_store(None)?;
+        let (store, id) = persisted_store(None).await?;
         let first_backend = resolved_fake("test.first", CLUSTERS)?;
         let first = cli::reasoning::cluster(&store, id, &first_backend).await?;
         let third_backend = resolved_fake("test.third", CLUSTERS)?;
@@ -862,9 +862,9 @@ mod tests {
         let database = std::env::var("SOTTO_T035_DATABASE")?;
         let session_id = std::env::var("SOTTO_T035_SESSION_ID")?.parse::<u128>()?;
         let model = std::env::var("SOTTO_T035_OPENAI_MODEL")?;
-        let store = rag::Store::open(database)?;
+        let store = rag::Store::open(database).await?;
         let session_id = SessionId::new(session_id);
-        let before_events = store.load_session(session_id)?;
+        let before_events = store.load_session(session_id).await?;
         let before = serde_json::to_vec(&before_events)?;
         let known: HashSet<_> = before_events.iter().map(TimelineEvent::id).collect();
         if known.is_empty() {
@@ -930,7 +930,7 @@ mod tests {
         }
         let startup_latency = cli::reasoning::duration_report(&mut startup);
         let reasoning_latency = cli::reasoning::latency_report(&mut first_delta, &mut total);
-        let after = serde_json::to_vec(&store.load_session(session_id)?)?;
+        let after = serde_json::to_vec(&store.load_session(session_id).await?)?;
         if before != after {
             return Err("live reasoning mutated the persisted timeline".into());
         }

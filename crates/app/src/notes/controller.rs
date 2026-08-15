@@ -16,6 +16,7 @@ use screen::ScreenInspectionSource;
 use sotto_core::CancellationToken;
 use sotto_core::SessionId;
 
+use crate::persistence_runtime::block_on;
 use crate::reasoning::inspection::{
     ScreenConsultation, ScreenInspectorAssembly, product_screen_inspectors,
 };
@@ -123,9 +124,9 @@ impl NotesController {
                 )
             })?;
         }
-        self.meetings = Store::open(&self.database)
-            .and_then(|store| store.list_sessions())
-            .map_err(|error| error.to_string())?;
+        self.meetings =
+            block_on(async { Store::open(&self.database).await?.list_sessions().await })
+                .map_err(|error| error.to_string())?;
         if self.selected_session.is_none() {
             self.selected_session = self
                 .meetings
@@ -310,8 +311,10 @@ impl NotesController {
             self.state = NotesState::NoMeeting;
             return;
         };
-        self.state = match Store::open(&self.database).and_then(|store| {
+        self.state = match block_on(async {
+            let store = Store::open(&self.database).await?;
             load_latest_grounded_notes_status(&store, session_id)
+                .await
                 .map_err(|error| sotto_core::RagError::Storage(error.to_string()))
         }) {
             Ok(Some(cached)) if cached.stale => NotesState::Stale {
@@ -355,28 +358,26 @@ fn run_generation(
     screen_inspector: Arc<dyn ScreenInspectionSource>,
     cancellation: CancellationToken,
 ) -> Result<GroundedMeetingNotesReport, String> {
-    let store = Store::open(database).map_err(|error| error.to_string())?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("Could not start notes runtime: {error}"))?;
-    runtime
-        .block_on(
-            MeetingNotesGenerator::new(&store, provider.clone())
-                .with_reasoning_provider(provider)
-                .with_backend_fingerprint(fingerprint)
-                .with_screen_inspector(screen_inspector)
-                .generate_grounded_with_cancellation(
-                    session_id,
-                    grounding.map(|grounding| GroundingInput {
-                        grant: grounding.grant,
-                        grant_fingerprint: grounding.fingerprint,
-                        source: grounding.source,
-                    }),
-                    cancellation,
-                ),
-        )
-        .map_err(|error| error.to_string())
+    block_on(async {
+        let store = Store::open(database)
+            .await
+            .map_err(|error| error.to_string())?;
+        MeetingNotesGenerator::new(&store, provider.clone())
+            .with_reasoning_provider(provider)
+            .with_backend_fingerprint(fingerprint)
+            .with_screen_inspector(screen_inspector)
+            .generate_grounded_with_cancellation(
+                session_id,
+                grounding.map(|grounding| GroundingInput {
+                    grant: grounding.grant,
+                    grant_fingerprint: grounding.fingerprint,
+                    source: grounding.source,
+                }),
+                cancellation,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -410,11 +411,11 @@ mod tests {
         flag.load(Ordering::Acquire)
     }
 
-    fn controller_with_meetings()
+    async fn controller_with_meetings()
     -> Result<(tempfile::TempDir, NotesController), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("sotto.sqlite3");
-        let store = Store::open(&database)?;
+        let store = Store::open(&database).await?;
         for (id, started, ended) in [(1, 10, Some(20)), (2, 30, Some(40))] {
             let mut session = Session::new(
                 SessionId::new(id),
@@ -430,7 +431,7 @@ mod tests {
             if let Some(ended) = ended {
                 session.end(ended);
             }
-            store.save_session(&session)?;
+            store.save_session(&session).await?;
         }
         let mut controller = NotesController::new(database);
         controller.refresh_catalogue()?;
@@ -456,10 +457,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn catalogue_selects_newest_completed_meeting_without_starting_reasoning()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catalogue_selects_newest_completed_meeting_without_starting_reasoning()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (_directory, controller) = controller_with_meetings()?;
+        let (_directory, controller) = controller_with_meetings().await?;
         let snapshot = controller.snapshot();
         assert_eq!(snapshot.meetings.len(), 2);
         assert_eq!(snapshot.selected_session, Some(SessionId::new(2)));
@@ -467,9 +468,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn session_switch_fences_stale_worker_result() -> Result<(), Box<dyn std::error::Error>> {
-        let (_directory, mut controller) = controller_with_meetings()?;
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_switch_fences_stale_worker_result() -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, mut controller) = controller_with_meetings().await?;
         let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
         let cancellation = sotto_core::CancellationToken::new();
         let worker_cancellation = cancellation.clone();
@@ -503,10 +504,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn disabling_reasoning_cancels_and_reaps_the_worker() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let (_directory, mut controller) = controller_with_meetings()?;
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabling_reasoning_cancels_and_reaps_the_worker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, mut controller) = controller_with_meetings().await?;
         let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
         let cancellation = sotto_core::CancellationToken::new();
         let worker_cancellation = cancellation.clone();
@@ -536,10 +537,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn dropping_controller_cancels_without_waiting_for_a_non_cooperative_worker()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_controller_cancels_without_waiting_for_a_non_cooperative_worker()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (_directory, mut controller) = controller_with_meetings()?;
+        let (_directory, mut controller) = controller_with_meetings().await?;
         let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
         let cancellation = sotto_core::CancellationToken::new();
         let cancellation_observer = cancellation.clone();
@@ -562,10 +563,10 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn session_switch_does_not_join_a_non_cooperative_worker()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_switch_does_not_join_a_non_cooperative_worker()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (_directory, mut controller) = controller_with_meetings()?;
+        let (_directory, mut controller) = controller_with_meetings().await?;
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let cancellation = sotto_core::CancellationToken::new();
         let cancellation_observer = cancellation.clone();
@@ -598,9 +599,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn disabled_and_retry_states_are_explicit() -> Result<(), Box<dyn std::error::Error>> {
-        let (_directory, mut controller) = controller_with_meetings()?;
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disabled_and_retry_states_are_explicit() -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, mut controller) = controller_with_meetings().await?;
         assert_eq!(controller.snapshot().state, NotesState::Disabled);
         controller.set_reasoning_enabled(true);
         assert!(matches!(controller.snapshot().state, NotesState::Failed(_)));
@@ -634,12 +635,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cold_reopen_stays_ready_when_reasoning_is_disabled_without_new_provider_work()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cold_reopen_stays_ready_when_reasoning_is_disabled_without_new_provider_work()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("sotto.sqlite3");
-        let store = Store::open(&database)?;
+        let store = Store::open(&database).await?;
         let mut session = Session::new(
             SessionId::new(9),
             CaptureTarget {
@@ -652,7 +653,7 @@ mod tests {
             1,
         );
         session.end(2);
-        store.save_session(&session)?;
+        store.save_session(&session).await?;
         let mut timeline = TimelineBuilder::new(session);
         timeline.append(
             std::time::Duration::from_secs(1),
@@ -665,7 +666,7 @@ mod tests {
                 annotations: Vec::new(),
             }),
         );
-        store.append_events(timeline.events())?;
+        store.append_events(timeline.events()).await?;
         let provider = Arc::new(ReplayProvider(AtomicBool::new(false)));
         let fingerprint = BackendDescriptor::new(
             BackendId::new("test.replay")?,
@@ -678,18 +679,14 @@ mod tests {
         )?
         .fingerprint()
         .clone();
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(
-                MeetingNotesGenerator::new(&store, provider.clone())
-                    .with_backend_fingerprint(fingerprint)
-                    .generate_grounded_with_cancellation(
-                        SessionId::new(9),
-                        None,
-                        sotto_core::CancellationToken::new(),
-                    ),
-            )?;
+        MeetingNotesGenerator::new(&store, provider.clone())
+            .with_backend_fingerprint(fingerprint)
+            .generate_grounded_with_cancellation(
+                SessionId::new(9),
+                None,
+                sotto_core::CancellationToken::new(),
+            )
+            .await?;
         assert!(provider.0.load(Ordering::Acquire));
         provider.0.store(false, Ordering::Release);
 
@@ -894,7 +891,7 @@ mod tests {
             recording_path: std::path::PathBuf,
         }
 
-        fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
+        async fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
             let directory = tempfile::tempdir()?;
             let database = directory.path().join("sotto.sqlite3");
             let session_id = SessionId::new(59);
@@ -910,8 +907,8 @@ mod tests {
                 1,
             );
             record.end(2);
-            let store = Store::open(&database)?;
-            store.save_session(&record)?;
+            let store = Store::open(&database).await?;
+            store.save_session(&record).await?;
             let mut timeline = TimelineBuilder::new(record);
             let event = timeline.append(
                 Duration::from_secs(8),
@@ -924,7 +921,7 @@ mod tests {
                     annotations: Vec::new(),
                 }),
             );
-            store.append_events(timeline.events())?;
+            store.append_events(timeline.events()).await?;
             let recording_path = directory.path().join("recording.mp4");
             std::fs::write(&recording_path, b"contract-only; not real media")?;
             Ok(Fixture {
@@ -1041,9 +1038,9 @@ mod tests {
             }
         }
 
-        #[test]
-        fn a_notes_run_pulls_one_frame_through_the_apps_own_runtime_assembly() -> TestResult {
-            let fixture = fixture()?;
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_notes_run_pulls_one_frame_through_the_apps_own_runtime_assembly() -> TestResult {
+            let fixture = fixture().await?;
             let decodes = Arc::new(AtomicUsize::new(0));
             let ocr = Arc::new(AtomicUsize::new(0));
             let assembled = Arc::new(AtomicUsize::new(0));
@@ -1099,8 +1096,9 @@ mod tests {
             Ok(())
         }
 
-        #[test]
-        fn a_pruned_recording_still_completes_the_run_from_the_transcript_alone() -> TestResult {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_pruned_recording_still_completes_the_run_from_the_transcript_alone() -> TestResult
+        {
             for recording in [
                 Some(SessionRecording::Missing {
                     session_id: SessionId::new(59),
@@ -1109,7 +1107,7 @@ mod tests {
                 // No settled row at all: deleted before the row landed, or still growing.
                 None,
             ] {
-                let fixture = fixture()?;
+                let fixture = fixture().await?;
                 let decodes = Arc::new(AtomicUsize::new(0));
                 let ocr = Arc::new(AtomicUsize::new(0));
                 let assembled = Arc::new(AtomicUsize::new(0));
@@ -1148,9 +1146,10 @@ mod tests {
             Ok(())
         }
 
-        #[test]
-        fn an_image_request_is_refused_locally_and_no_image_reaches_the_backend() -> TestResult {
-            let fixture = fixture()?;
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_image_request_is_refused_locally_and_no_image_reaches_the_backend() -> TestResult
+        {
+            let fixture = fixture().await?;
             let decodes = Arc::new(AtomicUsize::new(0));
             let ocr = Arc::new(AtomicUsize::new(0));
             let assembled = Arc::new(AtomicUsize::new(0));
@@ -1195,10 +1194,10 @@ mod tests {
             Ok(())
         }
 
-        #[test]
-        fn a_run_needing_no_visual_context_decodes_nothing_with_the_inspector_present() -> TestResult
-        {
-            let fixture = fixture()?;
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_run_needing_no_visual_context_decodes_nothing_with_the_inspector_present()
+        -> TestResult {
+            let fixture = fixture().await?;
             let decodes = Arc::new(AtomicUsize::new(0));
             let ocr = Arc::new(AtomicUsize::new(0));
             let assembled = Arc::new(AtomicUsize::new(0));

@@ -140,19 +140,19 @@ pub enum SummaryError {
     EmptyTimeline,
 }
 
-pub struct Summarizer<'a> {
-    store: &'a Store,
+pub struct Summarizer {
+    store: Store,
     provider: Arc<dyn ReasoningProvider>,
     pricing: Option<Pricing>,
     context_mode: ContextMode,
     screen_inspector: Option<Arc<dyn ScreenInspectionSource>>,
 }
 
-impl<'a> Summarizer<'a> {
+impl Summarizer {
     #[must_use]
-    pub fn new(store: &'a Store, provider: Arc<dyn CompletionProvider>) -> Self {
+    pub fn new(store: &Store, provider: Arc<dyn CompletionProvider>) -> Self {
         Self {
-            store,
+            store: store.clone(),
             provider: text_reasoning_provider(provider),
             pricing: None,
             context_mode: ContextMode::default(),
@@ -192,8 +192,8 @@ impl<'a> Summarizer<'a> {
         if self.context_mode == ContextMode::MetadataAndOcr {
             return Err(SummaryError::EagerOcrContextRemoved);
         }
-        let session = self.store.load_session_record(session_id)?;
-        let events = self.store.load_session(session_id)?;
+        let session = self.store.load_session_record(session_id).await?;
+        let events = self.store.load_session(session_id).await?;
         if !events
             .iter()
             .any(|event| matches!(event.payload(), EventPayload::UtteranceFinal(_)))

@@ -122,8 +122,8 @@ mod tests {
         }
     }
 
-    fn persisted_store() -> Result<rag::Store, Box<dyn std::error::Error>> {
-        let store = rag::Store::open_in_memory()?;
+    async fn persisted_store() -> Result<rag::Store, Box<dyn std::error::Error>> {
+        let store = rag::Store::open_in_memory().await?;
         let session = Session::new(
             SessionId::new(7),
             CaptureTarget {
@@ -135,7 +135,7 @@ mod tests {
             },
             1,
         );
-        store.save_session(&session)?;
+        store.save_session(&session).await?;
         let mut timeline = TimelineBuilder::new(session);
         timeline.append(
             Duration::from_secs(1),
@@ -159,14 +159,14 @@ mod tests {
                 annotations: Vec::new(),
             }),
         );
-        store.append_events(timeline.events())?;
+        store.append_events(timeline.events()).await?;
         Ok(store)
     }
 
     #[tokio::test]
     async fn summarizes_persisted_timeline_with_valid_citations_usage_and_cost()
     -> Result<(), Box<dyn std::error::Error>> {
-        let store = persisted_store()?;
+        let store = persisted_store().await?;
         let report = Summarizer::new(&store, Arc::new(MockProvider))
             .with_pricing(Pricing {
                 input_per_million_usd: 10.0,
@@ -202,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn image_mode_fails_explicitly_instead_of_sending_frame_paths_as_text()
     -> Result<(), Box<dyn std::error::Error>> {
-        let store = persisted_store()?;
+        let store = persisted_store().await?;
         let result = Summarizer::new(&store, Arc::new(MockProvider))
             .with_context(ContextMode::MetadataAndImages)
             .summarize(SessionId::new(7))
@@ -217,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn screen_evidence_is_absent_initially_and_added_only_after_typed_request()
     -> Result<(), Box<dyn std::error::Error>> {
-        let store = persisted_store()?;
+        let store = persisted_store().await?;
         let inputs = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(QueueProvider {
             outputs: Mutex::new(VecDeque::from([
@@ -296,7 +296,7 @@ mod tests {
     #[tokio::test]
     async fn no_inspection_action_does_not_invoke_screen_work()
     -> Result<(), Box<dyn std::error::Error>> {
-        let store = persisted_store()?;
+        let store = persisted_store().await?;
         let inputs = Arc::new(Mutex::new(Vec::new()));
         let provider = Arc::new(QueueProvider {
             outputs: Mutex::new(VecDeque::from([RECAP.to_owned()])),
@@ -330,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn two_hour_timeline_is_mapped_in_bounded_windows_then_reduced()
     -> Result<(), Box<dyn std::error::Error>> {
-        let store = rag::Store::open_in_memory()?;
+        let store = rag::Store::open_in_memory().await?;
         let session = Session::new(
             SessionId::new(8),
             CaptureTarget {
@@ -342,7 +342,7 @@ mod tests {
             },
             1,
         );
-        store.save_session(&session)?;
+        store.save_session(&session).await?;
         let mut timeline = TimelineBuilder::new(session);
         for index in 0_u64..=6 {
             let start = Duration::from_secs(index * 20 * 60);
@@ -362,7 +362,7 @@ mod tests {
                 }),
             );
         }
-        store.append_events(timeline.events())?;
+        store.append_events(timeline.events()).await?;
         let report = Summarizer::new(&store, Arc::new(MockProvider))
             .summarize(SessionId::new(8))
             .await?;

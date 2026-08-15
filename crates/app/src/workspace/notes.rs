@@ -605,9 +605,10 @@ impl MeetingWorkspace {
                     .map(|()| None)
             }
         } else {
-            rag::Store::open(&self.database)
-                .and_then(|store| {
-                    store.append_completed_annotation(
+            crate::persistence_runtime::block_on(async {
+                let store = rag::Store::open(&self.database).await?;
+                store
+                    .append_completed_annotation(
                         id,
                         anchor,
                         text.trim(),
@@ -617,13 +618,17 @@ impl MeetingWorkspace {
                         self.editing_annotation
                             .as_ref()
                             .map(|editing| editing.event_id),
-                    )?;
-                    Ok(store
+                    )
+                    .await?;
+                Ok::<_, sotto_core::RagError>(
+                    store
                         .refresh_searchable_prior_meeting(id)
+                        .await
                         .err()
-                        .map(|error| error.to_string()))
-                })
-                .map_err(|error| error.to_string())
+                        .map(|error| error.to_string()),
+                )
+            })
+            .map_err(|error| error.to_string())
         };
         match result {
             Ok(reingestion_error) => {
@@ -2217,10 +2222,10 @@ mod tests {
         }
 
         /// Persists a stopped recording with three transcript rows and no summary.
-        fn persist_recording(
+        async fn persist_recording(
             database: &std::path::Path,
         ) -> Result<Vec<EventId>, Box<dyn std::error::Error>> {
-            let store = Store::open(database)?;
+            let store = Store::open(database).await?;
             let session_id = SessionId::new(41);
             let mut record = Session::new(
                 session_id,
@@ -2234,7 +2239,7 @@ mod tests {
                 1,
             );
             record.end(2);
-            store.save_session(&record)?;
+            store.save_session(&record).await?;
             let mut timeline = TimelineBuilder::new(record);
             let mut ids = Vec::new();
             for (index, text) in [
@@ -2263,34 +2268,30 @@ mod tests {
                         .id(),
                 );
             }
-            store.append_events(timeline.events())?;
+            store.append_events(timeline.events()).await?;
             Ok(ids)
         }
 
         /// Persists a stopped recording whose summary has three sections and four citations.
-        fn recording_with_summary(
+        async fn recording_with_summary(
             database: &std::path::Path,
         ) -> Result<EventId, Box<dyn std::error::Error>> {
-            let ids = persist_recording(database)?;
-            let store = Store::open(database)?;
+            let ids = persist_recording(database).await?;
+            let store = Store::open(database).await?;
             let artifact = format!(
                 r#"{{"sections":[{{"kind":"overview","blocks":[{{"type":"claim","text":"Sprint 41 is scoped to payment retries and audit fixes after the staging outage pushed the retry work into the following sprint.","meeting_citations":[{first},{second}],"external_citations":[]}}]}},{{"kind":"decisions","blocks":[{{"type":"claim","text":"The search rewrite is deferred to sprint 42.","meeting_citations":[{second}],"external_citations":[]}}]}},{{"kind":"action_items","blocks":[{{"type":"action","text":"Retry rollout checklist, reviewed by Thursday.","meeting_citations":[{third}],"external_citations":[],"owner":"Dana","owner_meeting_citations":[{third}],"owner_external_citations":[],"due_date":"Thursday","due_date_meeting_citations":[{third}],"due_date_external_citations":[]}}]}}]}}"#,
                 first = ids[0].get(),
                 second = ids[1].get(),
                 third = ids[2].get(),
             );
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?
-                .block_on(
-                    MeetingNotesGenerator::new(&store, Arc::new(ReplayProvider(artifact)))
-                        .with_backend_fingerprint(fingerprint()?)
-                        .generate_grounded_with_cancellation(
-                            SessionId::new(41),
-                            None,
-                            CancellationToken::new(),
-                        ),
-                )?;
+            MeetingNotesGenerator::new(&store, Arc::new(ReplayProvider(artifact)))
+                .with_backend_fingerprint(fingerprint()?)
+                .generate_grounded_with_cancellation(
+                    SessionId::new(41),
+                    None,
+                    CancellationToken::new(),
+                )
+                .await?;
             Ok(ids[1])
         }
 
@@ -2350,12 +2351,12 @@ mod tests {
             Ok(())
         }
 
-        #[test]
-        fn the_summary_reads_as_prose_and_gives_up_its_evidence_only_when_asked()
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_summary_reads_as_prose_and_gives_up_its_evidence_only_when_asked()
         -> Result<(), Box<dyn std::error::Error>> {
             let dir = tempfile::tempdir()?;
             let database = dir.path().join("sotto.sqlite3");
-            let cited = recording_with_summary(&database)?;
+            let cited = recording_with_summary(&database).await?;
 
             let mut cx = TestAppContext::single();
             let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
@@ -2449,12 +2450,12 @@ mod tests {
         }
 
         /// With a source configured, the policy governs live controls and is stated over them.
-        #[test]
-        fn a_configured_source_states_its_policy_where_the_controls_are()
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_configured_source_states_its_policy_where_the_controls_are()
         -> Result<(), Box<dyn std::error::Error>> {
             let dir = tempfile::tempdir()?;
             let database = dir.path().join("sotto.sqlite3");
-            let _ = recording_with_summary(&database)?;
+            let _ = recording_with_summary(&database).await?;
             std::fs::write(
                 dir.path().join("mcp.json"),
                 r#"{"version":1,"servers":[{"id":"project-docs","display_name":"Project docs","endpoint":"https://sources.example/mcp"}],"grants":[]}"#,
@@ -2483,11 +2484,12 @@ mod tests {
         /// drags across a rendered claim and presses the copy binding, then reads the real
         /// clipboard — a selectable flag asserted in isolation would prove nothing about whether
         /// the text is reachable in the tree the column actually builds.
-        #[test]
-        fn a_summary_claim_can_be_selected_and_copied() -> Result<(), Box<dyn std::error::Error>> {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_summary_claim_can_be_selected_and_copied()
+        -> Result<(), Box<dyn std::error::Error>> {
             let dir = tempfile::tempdir()?;
             let database = dir.path().join("sotto.sqlite3");
-            let _ = recording_with_summary(&database)?;
+            let _ = recording_with_summary(&database).await?;
 
             let mut cx = TestAppContext::single();
             let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
@@ -2532,32 +2534,27 @@ mod tests {
         /// claim must carry. This runs the real generator over the real store twice: once with a
         /// claim that cites nothing, and once with a claim citing a transcript row that does not
         /// exist. Neither may become notes the column could draw.
-        #[test]
-        fn an_unsupported_claim_still_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_unsupported_claim_still_fails_closed() -> Result<(), Box<dyn std::error::Error>>
+        {
             let dir = tempfile::tempdir()?;
             let database = dir.path().join("sotto.sqlite3");
-            let ids = persist_recording(&database)?;
-            let store = Store::open(&database)?;
+            let ids = persist_recording(&database).await?;
+            let store = Store::open(&database).await?;
+            let backend_fingerprint = fingerprint()?;
 
-            let generate = |artifact: String| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(Box::<dyn std::error::Error>::from)
-                    .and_then(|runtime| {
-                        Ok(runtime.block_on(
-                            MeetingNotesGenerator::new(&store, Arc::new(ReplayProvider(artifact)))
-                                .with_backend_fingerprint(fingerprint()?)
-                                .generate_grounded_with_cancellation(
-                                    SessionId::new(41),
-                                    None,
-                                    CancellationToken::new(),
-                                ),
-                        ))
-                    })
+            let generate = |artifact: String| async {
+                MeetingNotesGenerator::new(&store, Arc::new(ReplayProvider(artifact)))
+                    .with_backend_fingerprint(backend_fingerprint.clone())
+                    .generate_grounded_with_cancellation(
+                        SessionId::new(41),
+                        None,
+                        CancellationToken::new(),
+                    )
+                    .await
             };
 
-            let uncited = generate(claim_artifact("The team agreed to ship on Friday.", ""))?;
+            let uncited = generate(claim_artifact("The team agreed to ship on Friday.", "")).await;
             let Err(uncited) = uncited else {
                 return Err(std::io::Error::other(
                     "a claim carrying no evidence must never become notes",
@@ -2582,7 +2579,8 @@ mod tests {
             let unknown = generate(claim_artifact(
                 "The team agreed to ship on Friday.",
                 &phantom.to_string(),
-            ))?;
+            ))
+            .await;
             let Err(unknown) = unknown else {
                 return Err(std::io::Error::other(
                     "a claim citing a row that does not exist must never become notes",

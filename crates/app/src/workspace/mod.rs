@@ -746,9 +746,13 @@ impl MeetingWorkspace {
     }
 
     fn load_transcript(&mut self, id: SessionId) {
-        match rag::Store::open(&self.database)
-            .and_then(|store| Ok((store.load_session(id)?, store.load_derived_transcript(id)?)))
-        {
+        match crate::persistence_runtime::block_on(async {
+            let store = rag::Store::open(&self.database).await?;
+            Ok::<_, sotto_core::RagError>((
+                store.load_session(id).await?,
+                store.load_derived_transcript(id).await?,
+            ))
+        }) {
             Ok((mut events, derived)) => {
                 // Event ids are the append-only ordering authority. Persisted timestamps can come
                 // from different capture clocks, so timestamp order may place a replacement before
@@ -785,9 +789,13 @@ impl MeetingWorkspace {
     }
 
     fn read_open_recording(&self, id: SessionId) -> Option<OpenRecording> {
-        let recording = rag::Store::open(&self.database)
-            .and_then(|store| store.load_recording(id))
-            .ok()??;
+        let recording = crate::persistence_runtime::block_on(async {
+            rag::Store::open(&self.database)
+                .await?
+                .load_recording(id)
+                .await
+        })
+        .ok()??;
         match recording {
             sotto_core::types::SessionRecording::Available {
                 path,
@@ -911,7 +919,12 @@ impl MeetingWorkspace {
             crate::session::application_recording_directory(),
         );
         let outcome = recordings.delete(id).and_then(|_| {
-            rag::Store::open(&self.database).and_then(|store| store.delete_session(id))
+            crate::persistence_runtime::block_on(async {
+                rag::Store::open(&self.database)
+                    .await?
+                    .delete_session(id)
+                    .await
+            })
         });
         if let Err(error) = outcome {
             self.message = Some(format!("Could not delete this recording: {error}"));

@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use cli::{PipelineOptions, run_files};
+use cli::{PipelineOptions, run_files_async};
 use sotto_core::SessionId;
 use sotto_core::{EventKind, TimelineEvent, replay};
 use std::{
@@ -100,7 +100,8 @@ enum Command {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     match Args::parse().command {
         Command::Run {
             wav,
@@ -112,24 +113,26 @@ fn main() -> Result<()> {
         } => {
             let asr_configured = model.is_some();
             let frames_configured = frames.is_some();
-            let run = run_files(&PipelineOptions {
+            let run = run_files_async(&PipelineOptions {
                 mic: wav,
                 system,
                 frames,
                 model,
                 realtime,
-            })?;
+            })
+            .await?;
             warn_run_stages(&run.events, asr_configured, frames_configured);
             write_events(&run.events, &parse_kinds(&kinds)?)?;
         }
         Command::Transcribe { wav, model } => {
-            let run = run_files(&PipelineOptions {
+            let run = run_files_async(&PipelineOptions {
                 mic: wav,
                 system: None,
                 frames: None,
                 model: Some(model),
                 realtime: false,
-            })?;
+            })
+            .await?;
             warn_if_missing(&run.events, "ASR", |kind| {
                 matches!(
                     kind,
@@ -142,13 +145,14 @@ fn main() -> Result<()> {
             )?;
         }
         Command::Vad { wav } => {
-            let run = run_files(&PipelineOptions {
+            let run = run_files_async(&PipelineOptions {
                 mic: wav,
                 system: None,
                 frames: None,
                 model: None,
                 realtime: false,
-            })?;
+            })
+            .await?;
             warn_if_missing(&run.events, "VAD", |kind| kind == EventKind::Vad);
             write_events(&run.events, &HashSet::from([EventKind::Vad]))?;
         }
@@ -167,13 +171,14 @@ fn main() -> Result<()> {
             model,
             realtime,
         } => {
-            let report = run_files(&PipelineOptions {
+            let report = run_files_async(&PipelineOptions {
                 mic: wav,
                 system,
                 frames: None,
                 model,
                 realtime,
-            })?
+            })
+            .await?
             .latency;
             print_latency(&report)?;
         }
@@ -185,7 +190,7 @@ fn main() -> Result<()> {
         }
         Command::Ingest { path, database } => println!(
             "{}",
-            if cli::pipeline::ingest_file(&database, &path)? {
+            if cli::pipeline::ingest_file(&database, &path).await? {
                 "ingested"
             } else {
                 "unchanged"
@@ -196,8 +201,11 @@ fn main() -> Result<()> {
             database,
             limit,
         } => {
-            let store = rag::Store::open(database)?;
-            for chunk in store.search_filtered(&query, limit, &rag::SearchFilter::default())? {
+            let store = rag::Store::open(database).await?;
+            for chunk in store
+                .search_filtered(&query, limit, &rag::SearchFilter::default())
+                .await?
+            {
                 println!("{}", serde_json::to_string(&chunk)?);
             }
         }
@@ -217,15 +225,9 @@ fn main() -> Result<()> {
                 println!(r#"{{"status":"reasoning_disabled"}}"#);
                 return Ok(());
             };
-            let store = rag::Store::open(database)?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            let report = runtime.block_on(cli::reasoning::summarize(
-                &store,
-                SessionId::new(session_id),
-                &resolved,
-            ))?;
+            let store = rag::Store::open(database).await?;
+            let report =
+                cli::reasoning::summarize(&store, SessionId::new(session_id), &resolved).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Command::Cluster {
@@ -244,15 +246,9 @@ fn main() -> Result<()> {
                 println!(r#"{{"status":"reasoning_disabled"}}"#);
                 return Ok(());
             };
-            let store = rag::Store::open(database)?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            let report = runtime.block_on(cli::reasoning::cluster(
-                &store,
-                SessionId::new(session_id),
-                &resolved,
-            ))?;
+            let store = rag::Store::open(database).await?;
+            let report =
+                cli::reasoning::cluster(&store, SessionId::new(session_id), &resolved).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }

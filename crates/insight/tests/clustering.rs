@@ -71,8 +71,8 @@ mod tests {
         }
     }
 
-    fn store() -> Result<(rag::Store, SessionId), Box<dyn std::error::Error>> {
-        let store = rag::Store::open_in_memory()?;
+    async fn store() -> Result<(rag::Store, SessionId), Box<dyn std::error::Error>> {
+        let store = rag::Store::open_in_memory().await?;
         let id = SessionId::new(44);
         let session = Session::new(
             id,
@@ -85,7 +85,7 @@ mod tests {
             },
             1,
         );
-        store.save_session(&session)?;
+        store.save_session(&session).await?;
         let mut timeline = TimelineBuilder::new(session);
         for (index, text) in [
             "Friday is the launch date",
@@ -119,15 +119,15 @@ mod tests {
                 kind: SpeechState::SpeechEnd,
             }),
         );
-        store.append_events(timeline.events())?;
+        store.append_events(timeline.events()).await?;
         Ok((store, id))
     }
 
     #[tokio::test]
     async fn unchanged_timeline_is_cached_without_mutating_events()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (store, id) = store()?;
-        let before = serde_json::to_vec(&store.load_session(id)?)?;
+        let (store, id) = store().await?;
+        let before = serde_json::to_vec(&store.load_session(id).await?)?;
         let calls = Arc::new(AtomicUsize::new(0));
         let clusterer = Clusterer::new(
             &store,
@@ -139,7 +139,7 @@ mod tests {
         .with_backend_fingerprint(fingerprint("test.first")?);
         let first = clusterer.cluster(id).await?;
         let second = clusterer.cluster(id).await?;
-        let after = serde_json::to_vec(&store.load_session(id)?)?;
+        let after = serde_json::to_vec(&store.load_session(id).await?)?;
 
         assert!(!first.cached, "first run must invoke the provider");
         assert!(
@@ -243,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn known_non_transcript_event_id_is_not_citable() -> Result<(), Box<dyn std::error::Error>>
     {
-        let (store, id) = store()?;
+        let (store, id) = store().await?;
         let calls = Arc::new(AtomicUsize::new(0));
         let result = Clusterer::new(
             &store,

@@ -30,7 +30,7 @@ hex = "0.4.3"
 serde.workspace = true
 serde_json.workspace = true
 sotto-core = { package = "core", path = "../core" }
-tokio = { version = "=1.53.1", features = ["rt", "sync", "time"] }
+tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "sync", "time"] }
 vad = { path = "../vad" }
 
 [dev-dependencies]

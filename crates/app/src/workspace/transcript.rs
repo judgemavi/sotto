@@ -2138,7 +2138,7 @@ mod mounted_tests {
     }
 
     /// Persists a stopped recording of four spoken rows and returns the row event ids in order.
-    fn persist_stopped_session(
+    async fn persist_stopped_session(
         database: &std::path::Path,
     ) -> Result<Vec<EventId>, Box<dyn std::error::Error>> {
         let session_id = FIXTURE_SESSION;
@@ -2154,8 +2154,8 @@ mod mounted_tests {
             1_786_625_633_040,
         );
         record.end(1_786_625_700_000);
-        let store = Store::open(database)?;
-        store.save_session(&record)?;
+        let store = Store::open(database).await?;
+        store.save_session(&record).await?;
         let mut timeline = TimelineBuilder::new(record);
         let spoken = [
             (Source::System, "so where did the retry land"),
@@ -2186,7 +2186,7 @@ mod mounted_tests {
                     .id()
             })
             .collect::<Vec<_>>();
-        store.append_events(timeline.events())?;
+        store.append_events(timeline.events()).await?;
         Ok(ids)
     }
 
@@ -2242,13 +2242,13 @@ mod mounted_tests {
         })
     }
 
-    #[test]
-    fn a_reader_can_select_a_row_anchor_it_and_copy_a_range_of_it()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reader_can_select_a_row_anchor_it_and_copy_a_range_of_it()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        let ids = persist_stopped_session(&dir.path().join("sotto.sqlite3"))?;
+        let ids = persist_stopped_session(&dir.path().join("sotto.sqlite3")).await?;
         let shell = mount(&mut cx, dir.path())?;
         let workspace = shell.workspace;
         let visual = shell.visual;
@@ -2389,15 +2389,15 @@ mod mounted_tests {
 
     /// The copy control is the only way to take a multi-row unit, so it may not be the thing that
     /// falls off the head when the window is at its documented minimum.
-    #[test]
-    fn the_copy_control_survives_the_narrowest_supported_window()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_copy_control_survives_the_narrowest_supported_window()
     -> Result<(), Box<dyn std::error::Error>> {
         const MIN_WORKSPACE_WIDTH: gpui::Pixels = px(680.0);
 
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        persist_stopped_session(&dir.path().join("sotto.sqlite3"))?;
+        persist_stopped_session(&dir.path().join("sotto.sqlite3")).await?;
         let shell = mount_at(&mut cx, dir.path(), MIN_WORKSPACE_WIDTH)?;
         let workspace = shell.workspace;
         let visual = shell.visual;
@@ -2429,13 +2429,13 @@ mod mounted_tests {
     /// A drag that leaves the row it started in copies only that row. That is why `Copy` and the
     /// shift-click range exist, and why the module documents the boundary instead of implying a
     /// selection that spans the column.
-    #[test]
-    fn a_drag_past_the_row_boundary_copies_only_the_row_it_started_in()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drag_past_the_row_boundary_copies_only_the_row_it_started_in()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        let ids = persist_stopped_session(&dir.path().join("sotto.sqlite3"))?;
+        let ids = persist_stopped_session(&dir.path().join("sotto.sqlite3")).await?;
         let shell = mount(&mut cx, dir.path())?;
         let workspace = shell.workspace;
         let visual = shell.visual;
@@ -2491,13 +2491,13 @@ mod mounted_tests {
     /// Rows shared one element id until T077, and GPUI keys click state by that id, so the first
     /// row's mouse-up listener cleared the pending press before the clicked row saw it. The column
     /// looked interactive and answered exactly one row.
-    #[test]
-    fn a_row_below_the_first_can_still_be_made_the_note_anchor()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_row_below_the_first_can_still_be_made_the_note_anchor()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        let ids = persist_stopped_session(&dir.path().join("sotto.sqlite3"))?;
+        let ids = persist_stopped_session(&dir.path().join("sotto.sqlite3")).await?;
         let shell = mount(&mut cx, dir.path())?;
         let workspace = shell.workspace;
         let visual = shell.visual;
@@ -2526,13 +2526,13 @@ mod mounted_tests {
         Ok(())
     }
 
-    #[test]
-    fn a_citation_still_scrolls_and_flashes_after_the_rows_became_selectable()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_citation_still_scrolls_and_flashes_after_the_rows_became_selectable()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        let ids = persist_stopped_session(&dir.path().join("sotto.sqlite3"))?;
+        let ids = persist_stopped_session(&dir.path().join("sotto.sqlite3")).await?;
         let shell = mount(&mut cx, dir.path())?;
         let workspace = shell.workspace;
         let visual = shell.visual;

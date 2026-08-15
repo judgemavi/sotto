@@ -5,6 +5,8 @@ use rag::{QuarantineRecovery, RecordingReference, RecordingUsage, Store};
 use sotto_core::types::{RecordingMissingReason, SessionRecording};
 use sotto_core::{RagError, RecordingStatus, RecordingTranscriber, SessionId, TranscriptUpdate};
 
+use crate::persistence_runtime::block_on;
+
 /// One settings-library row. Missing media remains visible instead of disappearing ambiguously.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordingLibraryItem {
@@ -45,9 +47,12 @@ impl RecordingLibrary {
     }
 
     pub fn snapshot(&self) -> Result<RecordingLibrarySnapshot, RagError> {
-        let store = Store::open(&self.database)?;
-        let sessions = store.list_sessions()?;
-        let references = store.list_recording_references()?;
+        let (store, sessions, references) = block_on(async {
+            let store = Store::open(&self.database).await?;
+            let sessions = store.list_sessions().await?;
+            let references = store.list_recording_references().await?;
+            Ok::<_, RagError>((store, sessions, references))
+        })?;
         let recordings = references.iter().filter_map(|reference| match reference {
             RecordingReference::Settled(recording) => Some(recording.clone()),
             RecordingReference::Growing { .. } => None,
@@ -82,22 +87,29 @@ impl RecordingLibrary {
                 .into_iter()
                 .filter(|reference| matches!(reference, RecordingReference::Growing { .. }))
                 .collect(),
-            usage: store.recording_usage()?,
+            usage: block_on(store.recording_usage())?,
         })
     }
 
     pub fn delete(&self, session_id: SessionId) -> Result<bool, RagError> {
-        Store::open(&self.database)?.remove_recording_media(
-            session_id,
-            RecordingMissingReason::Deleted,
-            &self.directory,
-        )
+        block_on(async {
+            Store::open(&self.database)
+                .await?
+                .remove_recording_media(
+                    session_id,
+                    RecordingMissingReason::Deleted,
+                    &self.directory,
+                )
+                .await
+        })
     }
 
     pub fn set_budget(&self, budget_bytes: u64) -> Result<Vec<SessionId>, RagError> {
-        let store = Store::open(&self.database)?;
-        store.set_recording_budget(budget_bytes)?;
-        store.enforce_recording_budget(&self.directory)
+        block_on(async {
+            let store = Store::open(&self.database).await?;
+            store.set_recording_budget(budget_bytes).await?;
+            store.enforce_recording_budget(&self.directory).await
+        })
     }
 
     /// Rebuilds the selected meeting's derived transcript from retained media.
@@ -105,9 +117,8 @@ impl RecordingLibrary {
     /// The append-only captured timeline is not modified. A successful rerun atomically replaces
     /// the prior derived projection for this session.
     pub fn retranscribe(&self, session_id: SessionId, model_path: &Path) -> Result<usize, String> {
-        let store = Store::open(&self.database).map_err(|error| error.to_string())?;
-        let recording = store
-            .load_recording_reference(session_id)
+        let store = block_on(Store::open(&self.database)).map_err(|error| error.to_string())?;
+        let recording = block_on(store.load_recording_reference(session_id))
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "This meeting has no recording metadata.".to_owned())?;
         let path = match recording {
@@ -143,8 +154,7 @@ impl RecordingLibrary {
                 TranscriptUpdate::Partial(_) => None,
             })
             .collect::<Vec<_>>();
-        store
-            .replace_derived_transcript(session_id, &model, &utterances)
+        block_on(store.replace_derived_transcript(session_id, &model, &utterances))
             .map_err(|error| error.to_string())?;
         Ok(utterances.len())
     }
@@ -166,7 +176,12 @@ impl RecordingLibrary {
     /// The caller decides how to treat a failure; this only wraps the store call with the directory
     /// the way every other method here does, and never touches a row itself.
     pub fn recover_at_launch(&self) -> Result<Vec<QuarantineRecovery>, RagError> {
-        Store::open(&self.database)?.recover_quarantined_media(&self.directory)
+        block_on(async {
+            Store::open(&self.database)
+                .await?
+                .recover_quarantined_media(&self.directory)
+                .await
+        })
     }
 }
 
@@ -179,14 +194,14 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn library_reports_usage_and_delete_without_deleting_meeting()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn library_reports_usage_and_delete_without_deleting_meeting()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("sotto.sqlite3");
         let recordings = directory.path().join("recordings");
         std::fs::create_dir_all(&recordings)?;
-        let store = Store::open(&database)?;
+        let store = Store::open(&database).await?;
         let session_id = SessionId::new(27);
         let mut session = Session::new(
             session_id,
@@ -200,17 +215,19 @@ mod tests {
             1_000,
         );
         session.end(2_000);
-        store.save_session(&session)?;
+        store.save_session(&session).await?;
         let path = recordings.join("27.mp4");
         std::fs::write(&path, vec![1_u8; 12])?;
-        store.save_recording(&SessionRecording::Available {
-            session_id,
-            path: path.to_string_lossy().into_owned(),
-            container: RecordingContainer::Mp4,
-            duration: Duration::from_secs(1),
-            byte_size: 12,
-            time_mapping: MediaTimeMapping::IDENTITY,
-        })?;
+        store
+            .save_recording(&SessionRecording::Available {
+                session_id,
+                path: path.to_string_lossy().into_owned(),
+                container: RecordingContainer::Mp4,
+                duration: Duration::from_secs(1),
+                byte_size: 12,
+                time_mapping: MediaTimeMapping::IDENTITY,
+            })
+            .await?;
         let library = RecordingLibrary::new(&database, &recordings);
 
         let before = library.snapshot()?;
@@ -228,8 +245,10 @@ mod tests {
             "delete must remove available media"
         );
         assert_eq!(
-            Store::open(&database)?
-                .load_session_record(session_id)?
+            Store::open(&database)
+                .await?
+                .load_session_record(session_id)
+                .await?
                 .id(),
             session_id,
             "recording delete must not delete the meeting"
@@ -245,14 +264,14 @@ mod tests {
     /// Reproduces the crash this method exists to repair: `remove_recording_media` renamed the file
     /// to its `.{id}.deleting` tombstone but the row-update commit never reached disk, so the row
     /// still claims the original path is available media.
-    #[test]
-    fn recover_at_launch_restores_a_tombstone_left_by_an_interrupted_delete()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recover_at_launch_restores_a_tombstone_left_by_an_interrupted_delete()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("sotto.sqlite3");
         let recordings = directory.path().join("recordings");
         std::fs::create_dir_all(&recordings)?;
-        let store = Store::open(&database)?;
+        let store = Store::open(&database).await?;
         let session_id = SessionId::new(41);
         let session = Session::new(
             session_id,
@@ -265,17 +284,19 @@ mod tests {
             },
             1_000,
         );
-        store.save_session(&session)?;
+        store.save_session(&session).await?;
         let original = recordings.join("41.mp4");
         std::fs::write(&original, vec![2_u8; 8])?;
-        store.save_recording(&SessionRecording::Available {
-            session_id,
-            path: original.to_string_lossy().into_owned(),
-            container: RecordingContainer::Mp4,
-            duration: Duration::from_secs(1),
-            byte_size: 8,
-            time_mapping: MediaTimeMapping::IDENTITY,
-        })?;
+        store
+            .save_recording(&SessionRecording::Available {
+                session_id,
+                path: original.to_string_lossy().into_owned(),
+                container: RecordingContainer::Mp4,
+                duration: Duration::from_secs(1),
+                byte_size: 8,
+                time_mapping: MediaTimeMapping::IDENTITY,
+            })
+            .await?;
         // Simulates the crash: the file is already renamed away, but the row was never updated to
         // reflect that, exactly as an interrupted `remove_recording_media` would leave it.
         let tombstone = recordings.join(format!(".{}.deleting", session_id.get()));
@@ -307,14 +328,14 @@ mod tests {
     /// does for a captured one, not merely by construction but asserted here: an import that the
     /// user could not delete from Settings, or that pruning silently skipped, would break that
     /// promise even though every other part of the feature worked.
-    #[test]
-    fn an_imported_recording_counts_against_budget_and_deletes_like_a_captured_one()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_imported_recording_counts_against_budget_and_deletes_like_a_captured_one()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("sotto.sqlite3");
         let recordings = directory.path().join("recordings");
         std::fs::create_dir_all(&recordings)?;
-        let store = Store::open(&database)?;
+        let store = Store::open(&database).await?;
         let session_id = SessionId::new(53);
         let mut session = Session::new(
             session_id,
@@ -322,17 +343,19 @@ mod tests {
             1_000,
         );
         session.end(2_000);
-        store.save_session(&session)?;
+        store.save_session(&session).await?;
         let path = recordings.join("53.mp4");
         std::fs::write(&path, vec![3_u8; 20])?;
-        store.save_recording(&SessionRecording::Available {
-            session_id,
-            path: path.to_string_lossy().into_owned(),
-            container: RecordingContainer::Mp4,
-            duration: Duration::from_secs(4),
-            byte_size: 20,
-            time_mapping: MediaTimeMapping::IDENTITY,
-        })?;
+        store
+            .save_recording(&SessionRecording::Available {
+                session_id,
+                path: path.to_string_lossy().into_owned(),
+                container: RecordingContainer::Mp4,
+                duration: Duration::from_secs(4),
+                byte_size: 20,
+                time_mapping: MediaTimeMapping::IDENTITY,
+            })
+            .await?;
         let library = RecordingLibrary::new(&database, &recordings);
 
         let before = library.snapshot()?;
@@ -351,8 +374,10 @@ mod tests {
             "an imported recording must be deletable exactly like a captured one"
         );
         assert_eq!(
-            Store::open(&database)?
-                .load_session_record(session_id)?
+            Store::open(&database)
+                .await?
+                .load_session_record(session_id)
+                .await?
                 .id(),
             session_id,
             "deleting the media must not delete the meeting record, imported or not"

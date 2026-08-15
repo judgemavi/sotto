@@ -5,10 +5,13 @@
 
 #![deny(warnings)]
 
+#[cfg(test)]
+mod annotation_tests;
+mod entities;
 mod schema;
-mod store;
+mod store_async;
 
-pub use store::{
+pub use store_async::{
     DEFAULT_RECORDING_BUDGET_BYTES, DerivedTranscript, DocumentKind, GroundedDerivedArtifact,
     GroundedDerivedView, IngestMetadata, LocalEvidenceReceipt, LocalProvenance, QuarantineRecovery,
     RecordingReference, RecordingUsage, SearchFilter, SessionSummary, Store, TimelinePersistence,

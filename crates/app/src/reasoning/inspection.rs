@@ -185,9 +185,13 @@ impl RecordingSource for StoredRecordings {
     fn recording(&self, session_id: SessionId) -> Result<Option<SessionRecording>, String> {
         // `load_recording` deliberately excludes a still-growing recording, so a live capture
         // resolves to `None` and becomes an explicit unavailable state below.
-        rag::Store::open(&self.database)
-            .and_then(|store| store.load_recording(session_id))
-            .map_err(|error| error.to_string())
+        crate::persistence_runtime::block_on(async {
+            rag::Store::open(&self.database)
+                .await?
+                .load_recording(session_id)
+                .await
+        })
+        .map_err(|error| error.to_string())
     }
 }
 

@@ -1101,7 +1101,7 @@ mod tests {
     }
 
     /// Persists a stopped session with `finals` transcript rows and returns its id.
-    fn persist_stopped_session(
+    async fn persist_stopped_session(
         database: &std::path::Path,
         finals: u64,
     ) -> Result<SessionId, Box<dyn std::error::Error>> {
@@ -1111,10 +1111,11 @@ mod tests {
             "This is a persisted recording",
             finals,
         )
+        .await
     }
 
     /// The same, for a second recording a test needs to prove was *not* touched.
-    fn persist_stopped_session_titled(
+    async fn persist_stopped_session_titled(
         database: &std::path::Path,
         session_id: SessionId,
         title: &str,
@@ -1132,8 +1133,8 @@ mod tests {
             1_786_625_633_040,
         );
         record.end(1_786_625_700_000);
-        let store = Store::open(database)?;
-        store.save_session(&record)?;
+        let store = Store::open(database).await?;
+        store.save_session(&record).await?;
         let mut timeline = TimelineBuilder::new(record);
         for index in 0..finals {
             let start = Duration::from_secs(index * 3);
@@ -1161,7 +1162,7 @@ mod tests {
                 &partial,
             )?;
         }
-        store.append_events(timeline.events())?;
+        store.append_events(timeline.events()).await?;
         Ok(session_id)
     }
 
@@ -1358,12 +1359,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn launch_opens_home_not_the_newest_recording() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn launch_opens_home_not_the_newest_recording() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        persist_stopped_session(&dir.path().join("sotto.sqlite3"), 4)?;
+        persist_stopped_session(&dir.path().join("sotto.sqlite3"), 4).await?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = shell.workspace;
         let visual = shell.visual;
@@ -1390,12 +1392,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn home_is_reachable_from_an_open_recording() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn home_is_reachable_from_an_open_recording() -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 6)?;
+        let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 6).await?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = shell.workspace;
         let visual = shell.visual;
@@ -1438,13 +1440,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn home_during_a_recording_keeps_stop_and_says_the_capture_is_running()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn home_during_a_recording_keeps_stop_and_says_the_capture_is_running()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 3)?;
+        let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 3).await?;
         let shell = mount(
             &mut cx,
             dir.path(),
@@ -1518,13 +1520,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn the_home_entry_fits_the_rail_and_reports_only_what_is_measured()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_home_entry_fits_the_rail_and_reports_only_what_is_measured()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        persist_stopped_session(&dir.path().join("sotto.sqlite3"), 3)?;
+        persist_stopped_session(&dir.path().join("sotto.sqlite3"), 3).await?;
         let visual = mount(&mut cx, dir.path(), None, MIN_WORKSPACE_WIDTH)?.visual;
         visual.refresh()?;
         visual.run_until_parked();
@@ -1683,12 +1685,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn a_narrow_view_bar_keeps_the_tabs_and_delete() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_narrow_view_bar_keeps_the_tabs_and_delete() -> Result<(), Box<dyn std::error::Error>>
+    {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 7)?;
+        let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 7).await?;
         let shell = mount(&mut cx, dir.path(), None, MIN_WORKSPACE_WIDTH)?;
         let workspace = shell.workspace;
         let visual = shell.visual;
@@ -2058,13 +2061,13 @@ mod tests {
     /// back fixed it, because that path calls `load_transcript` directly. The shell now reads the
     /// flag against the controller's own `completed_session_id`, so a finished recording cannot
     /// render as live however the refresh went.
-    #[test]
-    fn a_finished_recording_stops_rendering_as_live_without_a_refresh()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_recording_stops_rendering_as_live_without_a_refresh()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 3)?;
+        let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 3).await?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = shell.workspace;
         let visual = shell.visual;
@@ -2105,13 +2108,14 @@ mod tests {
     /// The shell is mounted the way `main.rs` mounts it — under `gpui_component::Root` — because
     /// that is the whole precondition for a dialog: `Window::open_dialog` stores the open dialogs
     /// on the `Root`, and the layer that draws them reads them back from there.
-    fn mount_with_a_recording_open(
+    async fn mount_with_a_recording_open(
         cx: &mut TestAppContext,
         directory: &std::path::Path,
     ) -> Result<(SessionId, MountedApp), Box<dyn std::error::Error>> {
         let database = directory.join("sotto.sqlite3");
-        let session_id = persist_stopped_session(&database, 4)?;
-        persist_stopped_session_titled(&database, BYSTANDER_SESSION, "A bystander recording", 2)?;
+        let session_id = persist_stopped_session(&database, 4).await?;
+        persist_stopped_session_titled(&database, BYSTANDER_SESSION, "A bystander recording", 2)
+            .await?;
         let app = mount_as_the_product_does(cx, directory, None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = app.workspace.clone();
         app.visual.update(|_, cx| {
@@ -2131,9 +2135,13 @@ mod tests {
         Ok((session_id, app))
     }
 
-    fn session_survives(database: &std::path::Path, session_id: SessionId) -> bool {
-        rag::Store::open(database)
-            .and_then(|store| store.load_session(session_id))
+    async fn session_survives(database: &std::path::Path, session_id: SessionId) -> bool {
+        let Ok(store) = rag::Store::open(database).await else {
+            return false;
+        };
+        store
+            .load_session(session_id)
+            .await
             .is_ok_and(|events| !events.is_empty())
     }
 
@@ -2158,14 +2166,14 @@ mod tests {
 
     /// Delete is a glyph in the view bar, so the dialog it opens carries the whole target: which
     /// recording, and how much of this Mac goes with it. Cancel is a real answer, not a discovery.
-    #[test]
-    fn the_view_bar_delete_asks_in_a_dialog_and_cancel_keeps_everything()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_view_bar_delete_asks_in_a_dialog_and_cancel_keeps_everything()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
-        let (session_id, app) = mount_with_a_recording_open(&mut cx, dir.path())?;
+        let (session_id, app) = mount_with_a_recording_open(&mut cx, dir.path()).await?;
         let workspace = app.workspace;
         let visual = app.visual;
 
@@ -2196,7 +2204,7 @@ mod tests {
             "Cancel must dismiss the dialog"
         );
         assert!(
-            session_survives(&database, session_id),
+            session_survives(&database, session_id).await,
             "Cancel must leave the recording, its transcript and its notes untouched"
         );
         assert_eq!(
@@ -2208,13 +2216,13 @@ mod tests {
     }
 
     /// Escape is the keyboard's Cancel, and closing must hand focus back rather than strand it.
-    #[test]
-    fn escape_cancels_the_view_bar_delete_dialog() -> Result<(), Box<dyn std::error::Error>> {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn escape_cancels_the_view_bar_delete_dialog() -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
-        let (session_id, app) = mount_with_a_recording_open(&mut cx, dir.path())?;
+        let (session_id, app) = mount_with_a_recording_open(&mut cx, dir.path()).await?;
         let visual = app.visual;
         open_view_bar_delete_dialog(visual)?;
 
@@ -2226,7 +2234,7 @@ mod tests {
             "Escape must cancel the dialog"
         );
         assert!(
-            session_survives(&database, session_id),
+            session_survives(&database, session_id).await,
             "Escape must leave the recording untouched"
         );
         // Focus is not stranded on an element that is no longer rendered: the trash control is
@@ -2240,14 +2248,14 @@ mod tests {
     }
 
     /// Confirming removes the recording the dialog named — and only that one.
-    #[test]
-    fn confirming_the_view_bar_dialog_deletes_only_that_recording()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn confirming_the_view_bar_dialog_deletes_only_that_recording()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
-        let (session_id, app) = mount_with_a_recording_open(&mut cx, dir.path())?;
+        let (session_id, app) = mount_with_a_recording_open(&mut cx, dir.path()).await?;
         let workspace = app.workspace;
         let visual = app.visual;
         let (_, ok) = open_view_bar_delete_dialog(visual)?;
@@ -2260,11 +2268,11 @@ mod tests {
             "confirming must close the dialog"
         );
         assert!(
-            !session_survives(&database, session_id),
+            !session_survives(&database, session_id).await,
             "confirming must delete the recording the dialog named"
         );
         assert!(
-            session_survives(&database, BYSTANDER_SESSION),
+            session_survives(&database, BYSTANDER_SESSION).await,
             "confirming must delete exactly the recording named and nothing else"
         );
         assert_eq!(
@@ -2275,15 +2283,15 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn a_stopped_session_opens_on_notes_with_transcript_one_tab_away()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_session_opens_on_notes_with_transcript_one_tab_away()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
         // Enough rows that the list genuinely scrolls; a transcript that fits the viewport has no
         // scroll position to lose and would prove nothing.
-        let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 80)?;
+        let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 80).await?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = shell.workspace;
         let visual = shell.visual;
@@ -2455,13 +2463,13 @@ mod tests {
     /// The sidebar collapses, gives its width to the stage, and comes back from a control that has
     /// not moved. The last clause is the one that matters: a person who collapses the rail and
     /// forgets must be able to *see* the way back, which rules out a hover-to-reveal edge.
-    #[test]
-    fn the_library_collapses_from_the_toolbar_and_comes_back()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_library_collapses_from_the_toolbar_and_comes_back()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        persist_stopped_session(&dir.path().join("sotto.sqlite3"), 4)?;
+        persist_stopped_session(&dir.path().join("sotto.sqlite3"), 4).await?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = shell.workspace;
         let visual = shell.visual;
@@ -2529,14 +2537,14 @@ mod tests {
     }
 
     /// The choice has to outlive the launch that made it, the way `ask_open` already does.
-    #[test]
-    fn a_collapsed_library_is_still_collapsed_after_a_relaunch()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_collapsed_library_is_still_collapsed_after_a_relaunch()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
-        persist_stopped_session(&database, 3)?;
+        persist_stopped_session(&database, 3).await?;
         let first = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let visual = first.visual;
         visual.refresh()?;
@@ -2583,13 +2591,13 @@ mod tests {
 
     /// Search moved to the toolbar because it used to live in the rail, and a search control that
     /// disappears with the list it filters is not one a person can use to find anything.
-    #[test]
-    fn toolbar_search_reaches_a_collapsed_library_and_still_matches_bodies()
+    #[tokio::test(flavor = "multi_thread")]
+    async fn toolbar_search_reaches_a_collapsed_library_and_still_matches_bodies()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        persist_stopped_session(&dir.path().join("sotto.sqlite3"), 4)?;
+        persist_stopped_session(&dir.path().join("sotto.sqlite3"), 4).await?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = shell.workspace;
         let visual = shell.visual;
