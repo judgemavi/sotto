@@ -146,7 +146,7 @@ pub struct LocalEvidenceReceipt {
 pub struct SessionSummary {
     pub id: SessionId,
     pub capture_target: CaptureTarget,
-    /// The chosen name, absent until someone renames the recording.
+    /// The chosen name of the entry that owns this session, absent until someone renames it.
     pub title: Option<RecordingTitle>,
     pub started_at_unix_ms: u64,
     pub ended_at_unix_ms: Option<u64>,
@@ -434,6 +434,25 @@ impl Store {
         Ok(())
     }
 
+    /// The chosen name for one entry, if anyone has chosen one.
+    ///
+    /// The entry is the only titled object (T086/ADR-0021): there is no per-session title to fall
+    /// back to. An unknown `entry_id` reads back as `None` rather than an error, matching every
+    /// other optional-field lookup in this store.
+    pub fn entry_title(&self, entry_id: EntryId) -> Result<Option<RecordingTitle>, RagError> {
+        self.reader
+            .lock()
+            .map_err(poisoned)?
+            .query_row(
+                "SELECT title FROM entries WHERE id=?1",
+                [entry_id.get().to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(storage)
+            .map(|value| value.flatten().as_deref().and_then(RecordingTitle::new))
+    }
+
     /// Attaches one existing session. Its timeline, recording, and captured scope are untouched.
     pub fn attach_session(&self, entry_id: EntryId, session_id: SessionId) -> Result<(), RagError> {
         let mut connection = self.writer.lock().map_err(poisoned)?;
@@ -714,13 +733,20 @@ impl Store {
 
     /// Lists persisted sessions newest first without loading their timeline payloads.
     ///
-    /// The chosen name is joined in rather than substituted for the capture target, so one query
-    /// answers both "what is this called" and "what was recorded".
+    /// The chosen name is joined in from the owning entry — the only titled object (T086/
+    /// ADR-0021) — rather than substituted for the capture target, so one query answers both
+    /// "what is this called" and "what was recorded". Every persisted session has exactly one
+    /// entry (every save path inserts the relation in the same transaction as the session row),
+    /// so the join is inner rather than left.
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>, RagError> {
         let connection = self.reader.lock().map_err(poisoned)?;
         let mut statement = connection
             .prepare(
-                "SELECT s.id,s.started_at_unix_ms,s.ended_at_unix_ms,s.capture_target_bundle_id,s.capture_target_display_name,s.capture_target_window_title,s.capture_target_kind,s.capture_target_audio_scoped,t.title FROM sessions s LEFT JOIN session_titles t ON t.session_id=s.id ORDER BY s.started_at_unix_ms DESC,s.id DESC",
+                "SELECT s.id,s.started_at_unix_ms,s.ended_at_unix_ms,s.capture_target_bundle_id,s.capture_target_display_name,s.capture_target_window_title,s.capture_target_kind,s.capture_target_audio_scoped,e.title \
+                 FROM sessions s \
+                 JOIN entry_sessions es ON es.session_id=s.id \
+                 JOIN entries e ON e.id=es.entry_id \
+                 ORDER BY s.started_at_unix_ms DESC,s.id DESC",
             )
             .map_err(storage)?;
         let rows = statement
@@ -749,61 +775,6 @@ impl Store {
             })
             .map_err(storage)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(storage)
-    }
-
-    /// Stores, replaces, or clears the person's chosen name for one recording.
-    ///
-    /// `None` clears the name and the recording falls back to being named by what was captured.
-    /// Nothing on the `sessions` row is written either way: a rename is a label, never an edit of
-    /// the capture target, and the foreign key means a title can only exist for a real session.
-    pub fn set_session_title(
-        &self,
-        session_id: SessionId,
-        title: Option<&RecordingTitle>,
-    ) -> Result<(), RagError> {
-        let id = session_id.get().to_string();
-        let connection = self.writer.lock().map_err(poisoned)?;
-        match title {
-            Some(title) => {
-                let updated_at = i64::try_from(
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map_err(message)?
-                        .as_millis(),
-                )
-                .map_err(message)?;
-                connection
-                    .execute(
-                        "INSERT INTO session_titles(session_id,title,updated_at_unix_ms) VALUES(?1,?2,?3) ON CONFLICT(session_id) DO UPDATE SET title=excluded.title,updated_at_unix_ms=excluded.updated_at_unix_ms",
-                        params![id, title.as_str(), updated_at],
-                    )
-                    .map_err(storage)?;
-            }
-            None => {
-                connection
-                    .execute("DELETE FROM session_titles WHERE session_id=?1", [id])
-                    .map_err(storage)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// The chosen name for one recording, if anyone has chosen one.
-    pub fn load_session_title(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<RecordingTitle>, RagError> {
-        self.reader
-            .lock()
-            .map_err(poisoned)?
-            .query_row(
-                "SELECT title FROM session_titles WHERE session_id=?1",
-                [session_id.get().to_string()],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(storage)
-            .map(|value| value.as_deref().and_then(RecordingTitle::new))
     }
 
     pub fn save_recording(&self, recording: &SessionRecording) -> Result<(), RagError> {

@@ -1,6 +1,6 @@
 # T071 — Import an audio or video file as a session
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** M4 — recording
 

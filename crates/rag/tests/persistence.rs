@@ -14,6 +14,14 @@ mod tests {
         types::RecordingTitle,
     };
 
+    /// The schema version every migration path must converge on.
+    ///
+    /// Named rather than repeated as a literal in each migration test: `rag`'s own
+    /// `SCHEMA_VERSION` is `pub(crate)` and so invisible from an integration test, and ten
+    /// hand-written copies of the number meant every schema bump failed ten tests for no reason
+    /// beyond the stale literal, burying any genuine convergence failure among them.
+    const CURRENT_SCHEMA_VERSION: u32 = 15;
+
     fn session() -> Session {
         Session::new(
             SessionId::new(7),
@@ -53,7 +61,7 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            14,
+            CURRENT_SCHEMA_VERSION,
             "recording retention and retranscription migration must reach the current schema"
         );
         Ok(())
@@ -402,20 +410,22 @@ mod tests {
         Ok(())
     }
 
-    /// The correctness point of T085: a chosen name is a label over a recording, never an edit of
-    /// what was recorded. Renaming repeatedly must leave the capture target byte-identical.
+    /// The correctness point of T085/T086: a chosen name is a label over the entry that owns a
+    /// recording, never an edit of what was recorded. Renaming repeatedly must leave the capture
+    /// target byte-identical.
     #[test]
     fn renaming_a_recording_never_rewrites_what_was_captured()
     -> Result<(), Box<dyn std::error::Error>> {
         let store = Store::open_in_memory()?;
         let captured = session();
         store.save_session(&captured)?;
+        let entry_id = store.entry_for_session(captured.id())?;
 
         for name in ["Standup", "BTU standup", "Monday standup"] {
             let title = RecordingTitle::new(name).ok_or("a name is a title")?;
-            store.set_session_title(captured.id(), Some(&title))?;
+            store.set_entry_title(entry_id, Some(&title))?;
             assert_eq!(
-                store.load_session_title(captured.id())?.as_ref(),
+                store.entry_title(entry_id)?.as_ref(),
                 Some(&title),
                 "the latest chosen name must be the one the store returns"
             );
@@ -437,9 +447,9 @@ mod tests {
             );
         }
 
-        store.set_session_title(captured.id(), None)?;
+        store.set_entry_title(entry_id, None)?;
         assert_eq!(
-            store.load_session_title(captured.id())?,
+            store.entry_title(entry_id)?,
             None,
             "clearing a title removes it rather than storing an empty one"
         );
@@ -452,7 +462,7 @@ mod tests {
     }
 
     /// The store is the last line: a blank title must be impossible even for a writer that skipped
-    /// `RecordingTitle`, and a title can only exist for a session that exists.
+    /// `RecordingTitle`, and a title can only exist for an entry that exists.
     #[test]
     fn the_store_refuses_a_blank_title_and_an_orphan_one() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -461,14 +471,15 @@ mod tests {
         let store = Store::open(&path)?;
         let captured = session();
         store.save_session(&captured)?;
+        let entry_id = store.entry_for_session(captured.id())?;
         let title = RecordingTitle::new("Standup").ok_or("a name is a title")?;
-        store.set_session_title(captured.id(), Some(&title))?;
+        store.set_entry_title(entry_id, Some(&title))?;
 
         assert!(
             store
-                .set_session_title(SessionId::new(9_999), Some(&title))
+                .set_entry_title(EntryId::new(9_999), Some(&title))
                 .is_err(),
-            "a title for a session that does not exist must be refused"
+            "a title for an entry that does not exist must be refused"
         );
 
         let connection = Connection::open(&path)?;
@@ -476,8 +487,8 @@ mod tests {
         assert!(
             connection
                 .execute(
-                    "INSERT INTO session_titles(session_id,title,updated_at_unix_ms) VALUES('7','   ',1) ON CONFLICT(session_id) DO UPDATE SET title=excluded.title",
-                    [],
+                    "UPDATE entries SET title='   ' WHERE id=?1",
+                    [entry_id.get().to_string()],
                 )
                 .is_err(),
             "a whitespace-only title must fail the schema's own check"
@@ -485,50 +496,11 @@ mod tests {
 
         store.delete_session(captured.id())?;
         assert_eq!(
-            connection.query_row("SELECT COUNT(*) FROM session_titles", [], |row| row
+            connection.query_row("SELECT COUNT(*) FROM entries", [], |row| row
                 .get::<_, u32>(0))?,
             0,
-            "deleting a recording must take its chosen name with it"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn migrating_version_ten_adds_titles_and_keeps_every_captured_fact()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("rag-v10.sqlite3");
-        {
-            let store = Store::open(&path)?;
-            store.save_session(&session())?;
-        }
-        {
-            let connection = Connection::open(&path)?;
-            connection.execute_batch("DROP TABLE session_titles;")?;
-            connection.pragma_update(None, "user_version", 10)?;
-        }
-
-        let migrated = Store::open(&path)?;
-        assert_eq!(
-            migrated
-                .load_session_record(SessionId::new(7))?
-                .capture_target(),
-            session().capture_target(),
-            "a database that predates titles must keep every captured fact"
-        );
-        assert_eq!(
-            migrated.load_session_title(SessionId::new(7))?,
-            None,
-            "an existing recording is untitled after the migration, not retitled"
-        );
-        let title = RecordingTitle::new("Standup").ok_or("a name is a title")?;
-        migrated.set_session_title(SessionId::new(7), Some(&title))?;
-        assert_eq!(migrated.load_session_title(SessionId::new(7))?, Some(title));
-        assert_eq!(
-            Connection::open(path)?
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            14,
-            "the title migration must land on the current schema version"
+            "deleting a recording's only session must take its owning entry, and the chosen \
+             name on it, with it"
         );
         Ok(())
     }
@@ -538,11 +510,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("rag-v12.sqlite3");
-        let title = RecordingTitle::new("Named before entries").ok_or("title")?;
         {
             let store = Store::open(&path)?;
             store.save_session(&session())?;
-            store.set_session_title(SessionId::new(7), Some(&title))?;
         }
         {
             let connection = Connection::open(&path)?;
@@ -559,9 +529,11 @@ mod tests {
         assert_eq!(entries[0].id(), EntryId::new(7));
         assert_eq!(entries[0].session_ids(), &[SessionId::new(7)]);
         assert_eq!(
-            migrated.load_session_title(SessionId::new(7))?,
-            Some(title),
-            "the in-review title path stays intact until its ownership closes"
+            entries[0].title(),
+            None,
+            "a session that predates entries migrates in untitled: `session_titles` and every \
+             path that wrote it are retired, so there is nothing left to carry a name forward \
+             from"
         );
         drop(migrated);
 
@@ -574,7 +546,7 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            14
+            CURRENT_SCHEMA_VERSION
         );
         Ok(())
     }
@@ -644,7 +616,58 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            14
+            CURRENT_SCHEMA_VERSION
+        );
+        Ok(())
+    }
+
+    /// A v14 library still carries the retired per-session title table. Leaving it would let a
+    /// database claim to be current while holding a table nothing reads, so v15 drops it — and the
+    /// titles inside it are deliberately not carried into `entries.title`, because a clean library
+    /// was chosen over a compatibility path.
+    #[test]
+    fn migrating_version_fourteen_drops_the_retired_session_title_table()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("v14-titles.sqlite3");
+        {
+            let store = Store::open(&path)?;
+            store.save_session(&session())?;
+        }
+        {
+            let connection = Connection::open(&path)?;
+            connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS session_titles (\
+                   session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,\
+                   title TEXT NOT NULL CHECK(length(trim(title))>0),\
+                   updated_at_unix_ms INTEGER NOT NULL\
+                 );\
+                 INSERT INTO session_titles VALUES('7','Named before entries',1);\
+                 PRAGMA user_version=14;",
+            )?;
+        }
+
+        let migrated = Store::open(&path)?;
+        assert_eq!(
+            migrated.list_sessions()?.len(),
+            1,
+            "dropping the retired title table must not disturb the captured session"
+        );
+        drop(migrated);
+
+        let connection = Connection::open(&path)?;
+        assert_eq!(
+            connection.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='session_titles'",
+                [],
+                |row| row.get::<_, u32>(0)
+            )?,
+            0,
+            "the retired per-session title table must not survive the v15 migration"
+        );
+        assert_eq!(
+            connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
+            CURRENT_SCHEMA_VERSION
         );
         Ok(())
     }
@@ -682,7 +705,7 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            14
+            CURRENT_SCHEMA_VERSION
         );
         Ok(())
     }
@@ -716,7 +739,7 @@ mod tests {
         let connection = Connection::open(path)?;
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            14
+            CURRENT_SCHEMA_VERSION
         );
         Ok(())
     }
@@ -770,7 +793,7 @@ mod tests {
         let connection = Connection::open(path)?;
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            14
+            CURRENT_SCHEMA_VERSION
         );
         Ok(())
     }
@@ -923,7 +946,7 @@ mod tests {
         assert_eq!(
             Connection::open(path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            14
+            CURRENT_SCHEMA_VERSION
         );
         Ok(())
     }
@@ -989,7 +1012,7 @@ mod tests {
         let connection = Connection::open(&path)?;
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            14
+            CURRENT_SCHEMA_VERSION
         );
         assert_eq!(
             connection.query_row(
@@ -1154,7 +1177,7 @@ mod tests {
         let connection = Connection::open(path)?;
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            14
+            CURRENT_SCHEMA_VERSION
         );
         assert_eq!(
             connection.query_row("SELECT kind FROM documents WHERE id='current'", [], |row| {
@@ -1654,7 +1677,7 @@ mod tests {
         assert_eq!(
             Connection::open(&path)?
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?,
-            14,
+            CURRENT_SCHEMA_VERSION,
             "resuming from the correctly-parked intermediate version must converge to the \
              current schema"
         );

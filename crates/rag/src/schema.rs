@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OptionalExtension};
 use sotto_core::{RagError, SQLITE_SCHEMA};
 
-pub(crate) const SCHEMA_VERSION: u32 = 14;
+pub(crate) const SCHEMA_VERSION: u32 = 15;
 
 /// Entries are the document-bearing library objects above captured sessions.
 ///
@@ -20,24 +20,6 @@ CREATE TABLE IF NOT EXISTS entry_sessions (
  entry_id TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS entry_sessions_entry_idx ON entry_sessions(entry_id,session_id);
-"#;
-
-/// A person's chosen name for a recording, held in its own table rather than as a column on
-/// `sessions`.
-///
-/// The separation is the point. Every column on `sessions` beginning `capture_target_` is a
-/// captured fact about what the OS content filter was built from, and a rename must never touch
-/// one of them. A row here is a label over the recording: absent until someone chooses a name,
-/// removed again when they clear it, and cascading away with the session it names.
-///
-/// The `CHECK` is the storage-level half of `RecordingTitle`'s guarantee — a blank title cannot be
-/// persisted even by a caller that skipped the constructor.
-const SESSION_TITLE_SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS session_titles (
- session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
- title TEXT NOT NULL CHECK(length(trim(title))>0),
- updated_at_unix_ms INTEGER NOT NULL
-);
 "#;
 
 const RETRANSCRIPTION_SCHEMA: &str = r#"
@@ -249,9 +231,6 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
         transaction
             .execute_batch(RETRANSCRIPTION_SCHEMA)
             .map_err(storage)?;
-        transaction
-            .execute_batch(SESSION_TITLE_SCHEMA)
-            .map_err(storage)?;
         transaction.execute_batch(ENTRY_SCHEMA).map_err(storage)?;
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -439,19 +418,13 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
             .map_err(storage)?;
         migration?;
     }
-    // Adding a place for chosen names touches nothing that was captured: existing sessions keep
-    // every `capture_target_` column exactly as recorded and simply have no title row yet, which
-    // is the same state a freshly captured recording is in.
-    if (1..=10).contains(&version) {
-        let transaction = connection.transaction().map_err(storage)?;
-        transaction
-            .execute_batch(SESSION_TITLE_SCHEMA)
-            .map_err(storage)?;
-        transaction
-            .pragma_update(None, "user_version", 11)
-            .map_err(storage)?;
-        transaction.commit().map_err(storage)?;
-    }
+    // A per-session title table briefly lived here (v10 -> v11, `session_titles`). The entry is
+    // now the only titled object (T086/ADR-0021: "the title becomes the entry's; a session keeps
+    // only its captured facts"), so that table, its schema, and its APIs are retired outright
+    // rather than bridged — there is nothing left for a v10 database to gain at this checkpoint,
+    // and removing the step is safe: every later block below still guards on the same
+    // originally-read `version` snapshot, not on this step having run, so no later range or
+    // exact-match condition depended on ever passing through the old checkpoint 11 to fire.
     // v12 retires the per-recording search opt-in. Every completed recording is indexed, so the
     // presence of its `prior_meeting` document is the only state there is, and a policy row that
     // could disagree with the index is worse than no row at all. Dropping the table is safe in
@@ -470,7 +443,9 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
     }
     // Every existing recording gains one mechanical entry. The ids intentionally match only for
     // this migration; they remain distinct domain types and future prepared entries have their
-    // own identities. Title adoption waits for T085's title-persistence ownership to close.
+    // own identities. Titles are not carried forward from the retired `session_titles` table —
+    // there is nothing to carry, since that table and every path that wrote it are gone by this
+    // schema; a migrated entry starts untitled and the person renames it same as any other entry.
     //
     // The same pass also drops any `meeting_notes.v2` rows. Retiring that read path made them
     // unreadable dead data: `load_latest_grounded_notes_status` would silently return `Ok(None)`
@@ -551,6 +526,24 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<(), RagError> {
             .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(storage)?;
         migration?;
+    }
+    // `session_titles` is retired: the entry is the only titled object (T086, ADR-0021). A database
+    // written before that change still carries the table, and a schema that claims to be current
+    // while holding a table nothing reads is the same dishonesty this chain's per-step versioning
+    // exists to prevent — so dropping it earns its own version rather than riding along silently.
+    //
+    // Titles are deliberately *not* carried across into `entries.title`. That is a decision, not an
+    // oversight: a clean library was judged preferable to a compatibility path, so a recording that
+    // predates entries migrates in untitled and is renamed again if its name still matters.
+    if (1..=14).contains(&version) {
+        let transaction = connection.transaction().map_err(storage)?;
+        transaction
+            .execute_batch("DROP TABLE IF EXISTS session_titles;")
+            .map_err(storage)?;
+        transaction
+            .pragma_update(None, "user_version", 15)
+            .map_err(storage)?;
+        transaction.commit().map_err(storage)?;
     }
     Ok(())
 }

@@ -707,8 +707,9 @@ fn cancel_rename(cx: &mut Context<MeetingWorkspace>) {
 /// recording goes back to being named by what was captured. That is the only way back to the
 /// default, and it is the same rule the store enforces — a blank title is never persisted.
 ///
-/// Nothing about the capture target is written here. `set_session_title` touches one row in one
-/// table, and it is not the row that records what was captured.
+/// Nothing about the capture target is written here. The entry that owns this recording is the
+/// only titled object (T086/ADR-0021); renaming a row resolves that entry and writes its title,
+/// never a row that records what was captured.
 fn commit_rename(workspace: &mut MeetingWorkspace, cx: &mut Context<MeetingWorkspace>) {
     let Some((id, value)) = cx
         .try_global::<RailRename>()
@@ -718,8 +719,10 @@ fn commit_rename(workspace: &mut MeetingWorkspace, cx: &mut Context<MeetingWorks
         return;
     };
     let chosen = RecordingTitle::new(&value);
-    let written = Store::open(&workspace.database)
-        .and_then(|store| store.set_session_title(id, chosen.as_ref()));
+    let written = Store::open(&workspace.database).and_then(|store| {
+        let entry_id = store.entry_for_session(id)?;
+        store.set_entry_title(entry_id, chosen.as_ref())
+    });
     cx.set_global(RailRename::default());
     match written {
         Ok(()) => {
@@ -1539,7 +1542,8 @@ mod tests {
         let store = Store::open(&database)?;
         store.save_session(&record)?;
         let title = RecordingTitle::new("Standup").ok_or("Standup is a title")?;
-        store.set_session_title(session_id, Some(&title))?;
+        let entry_id = store.entry_for_session(session_id)?;
+        store.set_entry_title(entry_id, Some(&title))?;
         drop(store);
 
         let meetings = Store::open(&database)?.list_sessions()?;
@@ -1750,9 +1754,10 @@ mod tests {
 
         // Reopening the store is the relaunch: nothing in memory answers these.
         let reopened = Store::open(&database)?;
+        let entry_id = reopened.entry_for_session(session_id)?;
         assert_eq!(
             reopened
-                .load_session_title(session_id)?
+                .entry_title(entry_id)?
                 .map(|title| title.as_str().to_owned()),
             Some("standup".to_owned()),
             "the chosen name must outlive the process that chose it"
@@ -1808,7 +1813,8 @@ mod tests {
         let store = Store::open(&database)?;
         store.save_session(&record)?;
         let chosen = RecordingTitle::new("Standup").ok_or("Standup is a title")?;
-        store.set_session_title(session_id, Some(&chosen))?;
+        let entry_id = store.entry_for_session(session_id)?;
+        store.set_entry_title(entry_id, Some(&chosen))?;
         drop(store);
 
         let visual = mount_shell(&mut cx, dir.path(), database.clone())?;
@@ -1828,8 +1834,9 @@ mod tests {
         visual.run_until_parked();
 
         let reopened = Store::open(&database)?;
+        let entry_id = reopened.entry_for_session(session_id)?;
         assert_eq!(
-            reopened.load_session_title(session_id)?,
+            reopened.entry_title(entry_id)?,
             None,
             "a whitespace-only name must clear the title rather than persist a blank one"
         );
@@ -1883,8 +1890,10 @@ mod tests {
         visual.run_until_parked();
 
         assert_eq!(open_editor(visual), None, "Escape must close the editor");
+        let reopened = Store::open(&database)?;
+        let entry_id = reopened.entry_for_session(session_id)?;
         assert_eq!(
-            Store::open(&database)?.load_session_title(session_id)?,
+            reopened.entry_title(entry_id)?,
             None,
             "an abandoned rename must write nothing at all"
         );

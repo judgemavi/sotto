@@ -1,6 +1,6 @@
 # T085 — Let a recording be named
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N7 — v2 workspace
 

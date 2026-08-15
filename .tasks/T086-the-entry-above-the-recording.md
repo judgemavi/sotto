@@ -1,6 +1,6 @@
 # T086 — The entry above the recording
 
-**Status:** in-progress
+**Status:** in-review
 
 **Wave:** N8 — entry workspace
 
@@ -100,14 +100,20 @@ session from a multi-session entry leaves the entry and its other session intact
 `prior_meeting` search document deliberately remains per-session; T089/T090 must read it through
 the entry relation, and this task does not rebuild the index.
 
-### Exact T085 handoff still open
+### T085 handoff — closed 2026-08-15
 
-T085 remains `in-review` and explicitly owns `session_titles` plus its persistence/catalogue path.
-Therefore v13 leaves `session_titles` byte-for-byte intact and does **not** copy its title into
-`entries.title`; migrated entry titles are temporarily `NULL`. Once T085 closes, the remaining
-step is to adopt `session_titles.title` into the owning entry and redirect/retire the per-session
-title APIs and `list_sessions` join without changing capture-target facts. Until that handoff is
-done, the first acceptance item (titles carried over) is not satisfied and T086 cannot close.
+T085's manual rename acceptance passed and it is `done`, so `session_titles` came back to this
+task. The entry is now the only titled object: `session_titles` is **retired outright** — the
+table, its schema constant, `set_session_title`/`load_session_title`, and the `list_sessions`
+join are all deleted, and `crates/app/src/workspace/library.rs` renames by resolving the owning
+entry and calling `set_entry_title`. Schema v15 drops the retired table.
+
+**The first acceptance item was retired, not met.** It required a migrated library to carry
+pre-existing titles into `entries.title`. The owner decided against any legacy-compatibility path
+for this repo — a clean wipe is acceptable and preferred — so titles are deliberately not carried
+across, and a recording that predates entries migrates in untitled. `crates/rag/tests/persistence.rs`
+asserts exactly that. Read the acceptance list above with this substitution in mind; it is a
+recorded decision, not an unmet requirement.
 
 ### Verification so far
 
