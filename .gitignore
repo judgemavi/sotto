@@ -5,6 +5,11 @@
 .idea/
 .vscode/
 
+# Agent harness scratch: isolated worktrees and session state. Generated, never authored here.
+# `.tasks/` is deliberately *not* ignored — task files are the unit of assignment, and an agent
+# working in a fresh worktree reads its `Owns` list out of them.
+.claude/
+
 # Swift Package Manager output for the three macOS bridges (asr, capture, screen). Not anchored,
 # because each bridge builds into its own directory; `crates/capture/bridge-macos/.gitignore`
 # covered exactly one of them and is now redundant.
