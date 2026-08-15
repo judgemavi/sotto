@@ -1,6 +1,6 @@
 # T079 — Decide whether a recording can be paused
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** M4 — recording
 
