@@ -11,10 +11,15 @@ mod entities;
 mod notes_overlay;
 mod schema;
 mod store_async;
+mod vault;
 
 pub use notes_overlay::NotesOverlayRow;
 pub use store_async::{
     DEFAULT_RECORDING_BUDGET_BYTES, DerivedTranscript, DocumentKind, GroundedDerivedArtifact,
     GroundedDerivedView, IngestMetadata, LocalEvidenceReceipt, LocalProvenance, QuarantineRecovery,
     RecordingReference, RecordingUsage, SearchFilter, SessionSummary, Store, TimelinePersistence,
+};
+pub use vault::{
+    SottoLink, VaultBlock, VaultCitation, VaultEdit, VaultEntry, VaultError, VaultMirror,
+    VaultStatus, VaultSync,
 };

@@ -50,6 +50,7 @@ entity_without_relations!(entries, "entries", {
     pub id: String,
     pub created_at_unix_ms: i64,
     pub title: Option<String>,
+    pub series: Option<String>,
 });
 
 entity_without_relations!(entry_sessions, "entry_sessions", {

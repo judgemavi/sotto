@@ -10,6 +10,7 @@ mod persistence_runtime;
 pub mod reasoning;
 pub mod session;
 pub mod settings;
+pub mod vault;
 pub mod workspace;
 
 use std::sync::Arc;

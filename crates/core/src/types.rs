@@ -45,6 +45,7 @@ pub struct Entry {
     id: EntryId,
     created_at_unix_ms: u64,
     title: Option<RecordingTitle>,
+    series: Option<String>,
     session_ids: Vec<SessionId>,
 }
 
@@ -55,6 +56,7 @@ impl Entry {
             id,
             created_at_unix_ms,
             title,
+            series: None,
             session_ids: Vec::new(),
         }
     }
@@ -72,6 +74,19 @@ impl Entry {
     #[must_use]
     pub const fn title(&self) -> Option<&RecordingTitle> {
         self.title.as_ref()
+    }
+
+    #[must_use]
+    pub fn series(&self) -> Option<&str> {
+        self.series.as_deref()
+    }
+
+    /// Links this occurrence to a recurring-meeting series. Blank names clear the relation.
+    pub fn set_series(&mut self, series: Option<&str>) {
+        self.series = series
+            .map(str::trim)
+            .filter(|series| !series.is_empty())
+            .map(str::to_owned);
     }
 
     #[must_use]

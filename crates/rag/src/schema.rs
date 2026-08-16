@@ -2,7 +2,7 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use sea_orm_migration::{MigrationName, MigrationTrait, MigratorTrait, SchemaManager};
 use sotto_core::{RagError, SQLITE_SCHEMA};
 
-pub(crate) const SCHEMA_VERSION: u32 = 17;
+pub(crate) const SCHEMA_VERSION: u32 = 18;
 
 const RAG_SCHEMA: &str = r#"
 CREATE TABLE documents (
@@ -136,6 +136,8 @@ struct GroundedNormalizationsMigration;
 
 struct NotesOverlayMigration;
 
+struct EntrySeriesMigration;
+
 impl MigrationName for BaselineMigration {
     fn name(&self) -> &str {
         "m0001_current_schema_baseline"
@@ -179,6 +181,36 @@ impl MigrationName for GroundedNormalizationsMigration {
 impl MigrationName for NotesOverlayMigration {
     fn name(&self) -> &str {
         "m0003_entry_note_overlay"
+    }
+}
+
+impl MigrationName for EntrySeriesMigration {
+    fn name(&self) -> &str {
+        "m0004_entry_series"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for EntrySeriesMigration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), sea_orm::DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE entries ADD COLUMN series TEXT \
+                 CHECK(series IS NULL OR length(trim(series))>0);",
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(&format!("PRAGMA user_version={SCHEMA_VERSION};"))
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), sea_orm::DbErr> {
+        Err(sea_orm::DbErr::Migration(
+            "entry series links are durable library structure".to_owned(),
+        ))
     }
 }
 
@@ -235,6 +267,7 @@ impl MigratorTrait for Migrator {
             Box::new(BaselineMigration),
             Box::new(GroundedNormalizationsMigration),
             Box::new(NotesOverlayMigration),
+            Box::new(EntrySeriesMigration),
         ]
     }
 }

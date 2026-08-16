@@ -1,6 +1,6 @@
 # T100 — The keyboard cannot see where it is
 
-**Status:** todo
+**Status:** in-review
 
 **Wave:** N8 — entry workspace
 
@@ -97,3 +97,33 @@ Recorded so it is not lost: the same review noted the **`Show timecodes` control
 right edge of the notes column** on a wide window — in the screenshot it extends past where the
 claim text above it wraps. Confirm before acting; if real it belongs to a `ControlRow` question in
 that head, in the family T095 and T060 exist to prevent, not to this task.
+
+Diagnosis, 2026-08-16: **focus never moved**. A Root-mounted test established that the window
+started with no focused node and a simulated Tab left it that way. GPUI dispatches keys through the
+focused node's ancestry; with no origin, Root's `"Root"` key context and its `focus_next()` action
+were not in the dispatch path. A non-tab-stop `KeyboardRoot` between Root and the workspace now
+holds initial focus, so the first Tab moves to the first real control and Shift-Tab moves backward.
+The same mounted test uses the production `evidence_control` and proves Enter reaches its ancestor
+listener from the focused child button. Sotto also installs explicit maximum-contrast component
+ring tokens for both stored theme appearances; tests switch dark then light and prove neither
+appearance change discards them.
+
+Ownership deviation: `crates/app/src/workspace/notes.rs` was held by open lanes, but
+`evidence_control` changed from `fn` to `pub(super) fn` so this lane's mounted regression exercises
+the production control instead of a test copy. Testing the real seam justified retaining that
+minimal visibility-only change.
+
+T077's `SelectableText` claim is withdrawn. Source inspection showed `TextView` calls
+`track_focus(focus_handle)` but never marks that handle as a tab stop. Its text remains pointer-
+selectable and copyable, but static prose is not inserted into the control tab order. No production
+claim should say it is keyboard-reachable unless the upstream widget or Sotto's wrapper later adds
+an intentional text-navigation interaction.
+
+Automated gates, 2026-08-16: the Root-mounted focus/activation tests pass; the full workspace test
+suite passes when its loopback MCP tests are allowed to bind local sockets; strict workspace
+Clippy over all targets/features, formatting, plist validation, and diff checks pass. The first
+sandboxed full run failed only at all four MCP HTTP tests with `Operation not permitted`; the same
+binary and then the full suite passed outside that socket restriction. **Real built-app visual
+confirmation remains NOT RUN**: review must confirm the black-at-20%-alpha light ring and
+white-at-20%-alpha dark ring are visibly distinct on the actual controls before changing this task
+to `done` and releasing T076.

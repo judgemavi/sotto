@@ -312,7 +312,7 @@ impl Store {
         }
         execute(
             &self.writer,
-            "INSERT INTO entries(id,created_at_unix_ms,title) VALUES(?,?,?)",
+            "INSERT INTO entries(id,created_at_unix_ms,title,series) VALUES(?,?,?,?)",
             vec![
                 entry.id().get().to_string().into(),
                 to_i64(entry.created_at_unix_ms())?.into(),
@@ -321,6 +321,7 @@ impl Store {
                     .map(RecordingTitle::as_str)
                     .map(str::to_owned)
                     .into(),
+                entry.series().map(str::to_owned).into(),
             ],
         )
         .await?;
@@ -330,7 +331,7 @@ impl Store {
     pub async fn list_entries(&self) -> Result<Vec<Entry>, RagError> {
         let rows = query_all(
             &self.reader,
-            "SELECT e.id,e.created_at_unix_ms,e.title,es.session_id FROM entries e LEFT JOIN entry_sessions es ON es.entry_id=e.id LEFT JOIN sessions s ON s.id=es.session_id ORDER BY e.created_at_unix_ms DESC,e.id DESC,s.started_at_unix_ms,es.session_id",
+            "SELECT e.id,e.created_at_unix_ms,e.title,e.series,es.session_id FROM entries e LEFT JOIN entry_sessions es ON es.entry_id=e.id LEFT JOIN sessions s ON s.id=es.session_id ORDER BY e.created_at_unix_ms DESC,e.id DESC,s.started_at_unix_ms,es.session_id",
             Vec::new(),
         )
         .await?;
@@ -338,13 +339,16 @@ impl Store {
         for row in rows {
             let entry_id = parse_entry_id(&get::<String>(&row, "id")?)?;
             if output.last().map(Entry::id) != Some(entry_id) {
-                output.push(Entry::new(
+                let mut entry = Entry::new(
                     entry_id,
                     from_i64(get(&row, "created_at_unix_ms")?)?,
                     get::<Option<String>>(&row, "title")?
                         .as_deref()
                         .and_then(RecordingTitle::new),
-                ));
+                );
+                let series = get::<Option<String>>(&row, "series")?;
+                entry.set_series(series.as_deref());
+                output.push(entry);
             }
             if let Some(session_id) = get::<Option<String>>(&row, "session_id")?
                 && let Some(entry) = output.last_mut()
@@ -385,6 +389,29 @@ impl Store {
                 .map_err(storage)?
                 .and_then(|row| row.title.as_deref().and_then(RecordingTitle::new)),
         )
+    }
+
+    pub async fn set_entry_series(
+        &self,
+        entry_id: EntryId,
+        series: Option<&str>,
+    ) -> Result<(), RagError> {
+        let series = series.map(str::trim).filter(|series| !series.is_empty());
+        let changed = execute(
+            &self.writer,
+            "UPDATE entries SET series=? WHERE id=?",
+            vec![
+                series.map(str::to_owned).into(),
+                entry_id.get().to_string().into(),
+            ],
+        )
+        .await?;
+        if changed == 0 {
+            return Err(RagError::NotFound {
+                id: entry_id.get().to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub async fn attach_session(
@@ -2446,6 +2473,23 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    #[tokio::test]
+    async fn entry_series_round_trips_and_blank_clears_it() -> Result<(), RagError> {
+        let store = Store::open_in_memory().await?;
+        let entry_id = EntryId::new(18);
+        store.create_entry(&Entry::new(entry_id, 1, None)).await?;
+        store
+            .set_entry_series(entry_id, Some(" Weekly standup "))
+            .await?;
+        assert_eq!(
+            store.list_entries().await?[0].series(),
+            Some("Weekly standup")
+        );
+        store.set_entry_series(entry_id, Some("  ")).await?;
+        assert_eq!(store.list_entries().await?[0].series(), None);
+        Ok(())
+    }
 
     fn recording_session(id: u128, started_at: u64) -> Session {
         let mut session = Session::new(

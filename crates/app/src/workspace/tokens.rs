@@ -13,8 +13,73 @@
 //! teal scheme. Both branches moved together: a palette changed in one theme only is how a
 //! product ends up rendering one theme's text on the other theme's ground.
 
-use gpui::{App, Pixels, Rgba, px, rgb, rgba};
-use gpui_component::ActiveTheme as _;
+use std::rc::Rc;
+
+use gpui::{
+    AnyView, App, Context, FocusHandle, IntoElement, Pixels, Render, Rgba, Window, div, prelude::*,
+    px, rgb, rgba,
+};
+use gpui_component::{ActiveTheme as _, Theme};
+
+// The component library applies 20% alpha to this token. Black-on-light and white-on-dark retain
+// the greatest possible edge contrast after that fixed alpha is applied.
+const LIGHT_FOCUS_RING: &str = "#000000";
+const DARK_FOCUS_RING: &str = "#FFFFFF";
+
+/// Installs Sotto's focus colour into both component-theme appearances.
+///
+/// `gpui-component` owns the geometry of its button focus ring, but its default ring colour is
+/// unrelated to Sotto's surfaces and is drawn at 20% alpha. Keeping the colour in both stored
+/// theme configurations matters: [`Theme::change`] reapplies one of those configurations whenever
+/// the person switches appearance, so changing only the active colour would repair one frame and
+/// lose the indicator at the next switch.
+pub(crate) fn install_component_focus_ring(cx: &mut App) {
+    let theme = Theme::global_mut(cx);
+    Rc::make_mut(&mut theme.light_theme).colors.ring = Some(LIGHT_FOCUS_RING.into());
+    Rc::make_mut(&mut theme.dark_theme).colors.ring = Some(DARK_FOCUS_RING.into());
+    theme.colors.ring = if theme.is_dark() {
+        rgb(0xffffff).into()
+    } else {
+        rgb(0x000000).into()
+    };
+}
+
+/// Non-tab-stop focus origin which lets the first Tab enter `gpui-component::Root`'s key context.
+///
+/// GPUI dispatches a key through the focused node's ancestry. With no focused node, Root's Tab
+/// action is never reached, even though the frame contains tab stops. This wrapper is focused when
+/// the window is built and sits between Root and the workspace, so the first Tab reaches Root and
+/// moves to the first real control without presenting the origin itself as a stop.
+pub struct KeyboardRoot {
+    focus_handle: FocusHandle,
+    view: AnyView,
+}
+
+impl KeyboardRoot {
+    #[must_use]
+    pub fn new(view: impl Into<AnyView>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle);
+        Self {
+            focus_handle,
+            view: view.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn view(&self) -> &AnyView {
+        &self.view
+    }
+}
+
+impl Render for KeyboardRoot {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .track_focus(&self.focus_handle)
+            .child(self.view.clone())
+    }
+}
 
 #[derive(Clone, Copy)]
 #[expect(
@@ -127,4 +192,110 @@ impl Space {
     pub(crate) const SM: Pixels = px(8.0);
     pub(crate) const MD: Pixels = px(12.0);
     pub(crate) const LG: Pixels = px(16.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, ops::Deref as _, rc::Rc};
+
+    use gpui::{
+        Bounds, Context, IntoElement, Render, TestAppContext, VisualTestContext, Window,
+        WindowBounds, WindowOptions, div, point, prelude::*, px, size,
+    };
+    use gpui_component::{Root, Theme, ThemeMode, button::Button};
+
+    use super::{DARK_FOCUS_RING, KeyboardRoot, LIGHT_FOCUS_RING, install_component_focus_ring};
+
+    struct KeyboardProbe {
+        activated: Rc<Cell<bool>>,
+    }
+
+    impl Render for KeyboardProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let activated = Rc::clone(&self.activated);
+            div()
+                .child(crate::workspace::notes::evidence_control(
+                    "keyboard-probe".into(),
+                    "keyboard-probe".to_owned(),
+                    "Show timecodes".to_owned(),
+                    "Show or hide timecodes",
+                    move |_| activated.set(true),
+                ))
+                .child(Button::new("keyboard-probe-second").label("Edit note"))
+        }
+    }
+
+    #[test]
+    fn focus_tokens_survive_both_appearance_changes() -> Result<(), Box<dyn std::error::Error>> {
+        let cx = TestAppContext::single();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            install_component_focus_ring(cx);
+            assert_eq!(
+                Theme::global(cx)
+                    .light_theme
+                    .colors
+                    .ring
+                    .as_ref()
+                    .map(AsRef::as_ref),
+                Some(LIGHT_FOCUS_RING)
+            );
+            assert_eq!(
+                Theme::global(cx)
+                    .dark_theme
+                    .colors
+                    .ring
+                    .as_ref()
+                    .map(AsRef::as_ref),
+                Some(DARK_FOCUS_RING)
+            );
+            Theme::change(ThemeMode::Dark, None, cx);
+            assert_eq!(Theme::global(cx).colors.ring, gpui::rgb(0xffffff).into());
+            Theme::change(ThemeMode::Light, None, cx);
+            assert_eq!(Theme::global(cx).colors.ring, gpui::rgb(0x000000).into());
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn root_tab_focus_reaches_a_real_button_and_enter_bubbles_to_its_handler()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cx = TestAppContext::single();
+        let activated = Rc::new(Cell::new(false));
+        let probe = Rc::clone(&activated);
+        let handle = cx.update(|cx| {
+            gpui_component::init(cx);
+            install_component_focus_ring(cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: point(px(0.0), px(0.0)),
+                        size: size(px(320.0), px(180.0)),
+                    })),
+                    ..WindowOptions::default()
+                },
+                move |window, cx| {
+                    let view = cx.new(|_| KeyboardProbe { activated: probe });
+                    let keyboard_root = cx.new(|cx| KeyboardRoot::new(view, window, cx));
+                    cx.new(|cx| Root::new(keyboard_root, window, cx))
+                },
+            )
+        })?;
+        let visual = VisualTestContext::from_window(*handle.deref(), &cx).into_mut();
+        visual.update(|window, _| window.activate_window());
+        visual.run_until_parked();
+        let origin = visual.update(|window, cx| format!("{:?}", window.focused(cx)));
+        visual.simulate_keystrokes("tab");
+        let first = visual.update(|window, cx| format!("{:?}", window.focused(cx)));
+        assert_ne!(first, origin, "Tab must leave the non-stop focus origin");
+        visual.simulate_keystrokes("enter");
+        assert!(
+            activated.get(),
+            "the focused button's ancestor must receive Enter"
+        );
+        visual.simulate_keystrokes("shift-tab");
+        let previous = visual.update(|window, cx| format!("{:?}", window.focused(cx)));
+        assert_ne!(previous, first, "Shift-Tab must move to the prior control");
+        Ok(())
+    }
 }

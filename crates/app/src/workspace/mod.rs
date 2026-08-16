@@ -60,6 +60,7 @@ actions!(
 );
 
 pub use icons::Assets;
+pub use tokens::KeyboardRoot;
 
 /// Where the traffic lights sit inside the title strip, and how tall that strip is.
 ///
@@ -314,10 +315,25 @@ fn in_workspace(
             root.view()
                 .clone()
                 .downcast::<MeetingWorkspace>()
+                .ok()
+                .or_else(|| {
+                    root.view()
+                        .clone()
+                        .downcast::<KeyboardRoot>()
+                        .ok()
+                        .and_then(|keyboard_root| {
+                            keyboard_root
+                                .read(cx)
+                                .view()
+                                .clone()
+                                .downcast::<MeetingWorkspace>()
+                                .ok()
+                        })
+                })
                 .map(|workspace| {
                     workspace.update(cx, |workspace, cx| body(workspace, window, cx));
                 })
-                .is_ok()
+                .is_some()
         });
         // Never silent. Swallowing this is what let `Sotto ▸ Settings…` look correctly wired while
         // doing nothing: the listener was reached, the window was not, and nothing said so.
@@ -478,6 +494,9 @@ impl MeetingWorkspace {
         });
         let persisted = layout::load_workspace_state(&database);
         let ask_open = persisted.ask_open;
+        // The component library supplies the ring geometry; the workspace owns the two colours
+        // that keep it visible on Sotto's light and dark surfaces.
+        tokens::install_component_focus_ring(cx);
         // A recorded theme choice is applied before the first frame, so the shell never paints one
         // theme and then flips to the other in front of the person who chose it.
         if let Some(theme) = persisted.theme {
@@ -761,6 +780,35 @@ impl MeetingWorkspace {
             self.message = Some("That recording is no longer available.".into());
         }
         cx.notify();
+    }
+
+    /// Opens one vault citation through the same recording-selection and citation-reveal paths as
+    /// an in-app evidence chip.
+    pub fn open_sotto_link(&mut self, link: rag::SottoLink, cx: &mut Context<Self>) {
+        let relation = crate::persistence_runtime::block_on(async {
+            let store = rag::Store::open(&self.database).await?;
+            store.entry_for_session(link.session_id).await
+        });
+        match relation {
+            Ok(entry_id) if entry_id == link.entry_id => {
+                self.select_meeting(link.session_id, cx);
+                // `reveal_citation` supplies the honest missing/pruned-row state itself.
+                let _ = self.reveal_citation(link.event_id, cx);
+            }
+            Ok(_) => {
+                self.message = Some(
+                    "That vault link names a recording which no longer belongs to this entry."
+                        .to_owned(),
+                );
+                cx.notify();
+            }
+            Err(_) => {
+                self.show_home(cx);
+                self.message =
+                    Some("The entry or recording behind that vault link was deleted.".to_owned());
+                cx.notify();
+            }
+        }
     }
 
     fn load_transcript(&mut self, id: SessionId) {

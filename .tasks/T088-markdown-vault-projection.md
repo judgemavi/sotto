@@ -1,6 +1,6 @@
 # T088 — The vault: entries as markdown files
 
-**Status:** todo
+**Status:** in-progress
 
 **Wave:** V1 — vault
 
@@ -84,3 +84,28 @@ one-way** — transcript projections are read-only and external edits to them ar
 Any graph or vault UI inside Sotto, cloud sync, projecting audio or frames, entity link
 extraction (arrives with T093's classifier or later), ingesting arbitrary markdown files not
 produced by Sotto, and Obsidian plugin development.
+
+## Notes
+
+Implementation pass, 2026-08-16: `rag::VaultMirror` now owns deterministic all-entry rebuilds,
+atomic replacement, stable filename collisions and renames, deletion, an internal projection
+manifest, conflict-first external-edit diffs, and an explicit post-overlay acknowledgement so an
+external edit racing an in-app edit cannot be overwritten. Markdown carries YAML metadata,
+wiki-links, task syntax, stable `^blockid` anchors, `sotto://entry/.../session/.../event/...`
+citations, a plainly marked one-way transcript section, and derived read-only series pages. T086
+had no series relation, so schema v18 adds the entry-series field as ADR-0021 required.
+This required editing the frozen-core file `crates/core/src/types.rs`; T088 step 6 explicitly
+authorized that small entry-series addition, and this is the recorded ownership deviation.
+
+`app::vault::sync_vault` is the upward dependency seam: it composes current entry notes, projects
+all attached recording transcripts, translates external add/reword/check/hide/reorder changes to
+T087 overlay operations, acknowledges only after those operations are durable, and rebuilds the
+merged file. The signed bundle registers the `sotto` scheme; the running app queues incoming URLs,
+validates the entry/session relation, selects the recording, then uses the existing citation reveal
+path. Deleted or mismatched links land on an honest message.
+
+The planner-excluded settings row remains absent. Consequently the mirror engine and status model
+are implemented, but there is not yet an authorized user-facing folder chooser/on-off path or a
+live change trigger; do not mark this task done until that sequential handoff is filed and wired.
+Manual Obsidian acceptance is **NOT RUN**; it remains an owner gate and must record the exact
+Obsidian version here.

@@ -1768,7 +1768,7 @@ fn render_evidence(
 /// keystroke panics inside `gpui-component`'s root lookup before reaching any listener, and mouse
 /// events in that harness never move focus onto a button. Both are properties of how the window is
 /// mounted, not of this control. The pointer path below is covered.
-fn evidence_control(
+pub(super) fn evidence_control(
     id: ElementId,
     selector: String,
     label: String,
