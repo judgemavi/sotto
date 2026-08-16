@@ -26,7 +26,7 @@ use gpui::{Context, PathPromptOptions, Timer};
 use rag::{Store, TimelinePersistence};
 use sotto_core::types::{MediaTimeMapping, RecordingContainer, SessionRecording};
 use sotto_core::{
-    AudioFrame, CancellationToken, CaptureBackend, CaptureError, CaptureTarget, EventId,
+    AudioFrame, CancellationToken, CaptureBackend, CaptureError, CaptureTarget, EntryId, EventId,
     EventPayload, EventReceiver, MarkKind, PermissionStatus, Pipeline, Session, SessionId, Source,
     TargetKind, TimelineEvent, TranscriptUpdate,
 };
@@ -540,6 +540,9 @@ pub struct SessionController {
     worker: Option<WorkerThread>,
     active_session_id: Option<SessionId>,
     completed_session_id: Option<SessionId>,
+    next_entry_id: Option<EntryId>,
+    #[cfg(test)]
+    last_requested_entry_id: Option<EntryId>,
     annotation_sender: Option<tokio::sync::mpsc::UnboundedSender<AnnotationRequest>>,
     /// Whether a file is currently being imported. Deliberately not part of [`SessionLifecycle`]:
     /// an import captures nothing live, holds no [`StartGate`], and reusing `Running`'s scope-bound
@@ -661,6 +664,9 @@ impl SessionController {
             worker: None,
             active_session_id: None,
             completed_session_id: None,
+            next_entry_id: None,
+            #[cfg(test)]
+            last_requested_entry_id: None,
             annotation_sender: None,
             importing: false,
             import_error: None,
@@ -869,6 +875,11 @@ impl SessionController {
         self.completed_session_id = completed;
     }
 
+    #[cfg(test)]
+    pub(crate) const fn pending_entry_for_test(&self) -> Option<EntryId> {
+        self.last_requested_entry_id
+    }
+
     /// Exact durable meeting identity, published only after finalization and reload succeed.
     #[must_use]
     pub const fn completed_session_id(&self) -> Option<SessionId> {
@@ -885,10 +896,12 @@ impl SessionController {
     pub fn start(&mut self, cx: &mut Context<Self>) {
         self.reap_finished_worker();
         if self.transcription_model.ready_path().is_none() {
+            self.next_entry_id = None;
             cx.notify();
             return;
         }
         let Some(generation) = self.model.begin() else {
+            self.next_entry_id = None;
             return;
         };
         let controller = cx.entity();
@@ -899,6 +912,7 @@ impl SessionController {
                     controller.begin_worker(generation, CaptureSelection::Scoped(target), cx)
                 }
                 None => {
+                    controller.next_entry_id = None;
                     controller.model.picker_cancelled(generation);
                     cx.notify();
                 }
@@ -908,18 +922,40 @@ impl SessionController {
         cx.notify();
     }
 
+    /// Starts a scoped recording which must land on an existing entry.
+    pub fn start_in_entry(&mut self, entry_id: EntryId, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.last_requested_entry_id = Some(entry_id);
+        }
+        self.next_entry_id = Some(entry_id);
+        self.start(cx);
+    }
+
     /// Starts a local voice-note session without presenting the system picker or querying
     /// Screen & System Audio Recording permission.
     pub fn start_microphone_only(&mut self, cx: &mut Context<Self>) {
         self.reap_finished_worker();
         if self.transcription_model.ready_path().is_none() {
+            self.next_entry_id = None;
             cx.notify();
             return;
         }
         let Some(generation) = self.model.begin() else {
+            self.next_entry_id = None;
             return;
         };
         self.begin_worker(generation, CaptureSelection::MicrophoneOnly, cx);
+    }
+
+    /// Starts a microphone-only recording which must land on an existing entry.
+    pub fn start_microphone_only_in_entry(&mut self, entry_id: EntryId, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        {
+            self.last_requested_entry_id = Some(entry_id);
+        }
+        self.next_entry_id = Some(entry_id);
+        self.start_microphone_only(cx);
     }
 
     /// Whether a file is currently being turned into a session. Guards against a second import
@@ -1102,6 +1138,7 @@ impl SessionController {
         selection: CaptureSelection,
         cx: &mut Context<Self>,
     ) {
+        let entry_id = self.next_entry_id.take();
         let target = selection.description();
         let Some(model_path) = self.transcription_model.ready_path().map(Path::to_path_buf) else {
             return;
@@ -1124,15 +1161,16 @@ impl SessionController {
         let spawn = std::thread::Builder::new()
             .name("sotto-map-session".to_owned())
             .spawn(move || {
-                run_worker(
-                    selection,
+                run_worker(WorkerRun {
+                    target: selection,
+                    entry_id,
                     ingress,
                     start_gate,
                     model_path,
                     sender,
                     annotation_receiver,
-                    &worker_shutdown,
-                );
+                    app_shutdown: worker_shutdown,
+                });
                 let _ = done_sender.send(());
             });
         let handle = match spawn {
@@ -1255,15 +1293,28 @@ impl Drop for SessionController {
     }
 }
 
-fn run_worker(
+struct WorkerRun {
     target: CaptureSelection,
+    entry_id: Option<EntryId>,
     ingress: TimelineIngress,
     start_gate: StartGate,
     model_path: PathBuf,
     sender: mpsc::SyncSender<WorkerEvent>,
     annotation_receiver: tokio::sync::mpsc::UnboundedReceiver<AnnotationRequest>,
-    app_shutdown: &std::sync::atomic::AtomicBool,
-) {
+    app_shutdown: Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn run_worker(run: WorkerRun) {
+    let WorkerRun {
+        target,
+        entry_id,
+        ingress,
+        start_gate,
+        model_path,
+        sender,
+        annotation_receiver,
+        app_shutdown,
+    } = run;
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1276,6 +1327,7 @@ fn run_worker(
         .and_then(|runtime| {
             runtime.block_on(resolve_and_run(
                 target,
+                entry_id,
                 model_path,
                 ingress,
                 &start_gate,
@@ -1283,7 +1335,7 @@ fn run_worker(
                 annotation_receiver,
             ))
         });
-    send_finished(&sender, app_shutdown, WorkerEvent::Finished(result));
+    send_finished(&sender, &app_shutdown, WorkerEvent::Finished(result));
 }
 
 fn send_finished(
@@ -1307,6 +1359,7 @@ fn send_finished(
 
 async fn resolve_and_run(
     target: CaptureSelection,
+    entry_id: Option<EntryId>,
     model_path: PathBuf,
     ingress: TimelineIngress,
     start_gate: &StartGate,
@@ -1316,6 +1369,7 @@ async fn resolve_and_run(
     ensure_not_cancelled(start_gate.cancellation())?;
     Box::pin(run(
         target,
+        entry_id,
         &model_path,
         ingress,
         start_gate,
@@ -1348,6 +1402,7 @@ fn send_phase_progress(
 
 async fn run(
     target: CaptureSelection,
+    entry_id: Option<EntryId>,
     model_path: &Path,
     ingress: TimelineIngress,
     start_gate: &StartGate,
@@ -1398,10 +1453,17 @@ async fn run(
     let session_started = std::time::Instant::now();
     let start_result = start_gate
         .start_if_not_cancelled_async(|| async {
-            store
-                .save_session(&session)
-                .await
-                .map_err(persistence_failure)?;
+            if let Some(entry_id) = entry_id {
+                store
+                    .save_session_in_entry(&session, entry_id)
+                    .await
+                    .map_err(persistence_failure)?;
+            } else {
+                store
+                    .save_session(&session)
+                    .await
+                    .map_err(persistence_failure)?;
+            }
             if let Err(error) = store
                 .save_growing_recording(session_id, &recording_path)
                 .await

@@ -18,6 +18,7 @@ futures-util = "0.3.32"
 insight = { path = "../insight" }
 keyring = "4.0.0"
 mcp = { path = "../mcp" }
+notify = "=7.0.0"
 objc2 = "=0.6.4"
 providers = { path = "../providers" }
 prosody = { path = "../prosody" }

@@ -31,7 +31,7 @@ use gpui_component::{
 };
 use providers::Role;
 use serde::{Deserialize, Serialize};
-use sotto_core::{EventId, SessionId, TimelineEvent};
+use sotto_core::{Entry, EntryId, EventId, SessionId, TimelineEvent};
 
 use crate::{
     devwindow::TimelineState,
@@ -40,6 +40,7 @@ use crate::{
     reasoning::ReasoningController,
     session::{RecordingLibrary, SessionController, SessionLifecycle},
     settings::{SettingsEvent, SettingsView},
+    vault::VaultMirrorController,
 };
 
 // The actions macOS invokes on Sotto's behalf. They are declared here rather than in `main.rs`
@@ -432,6 +433,8 @@ pub struct MeetingWorkspace {
     message: Option<String>,
     observed_live_session: Option<SessionId>,
     observed_completed_session: Option<SessionId>,
+    entries: Vec<Entry>,
+    selected_entry: Option<EntryId>,
     transcript_session: Option<SessionId>,
     transcript_events: Vec<TimelineEvent>,
     transcript_live: bool,
@@ -444,10 +447,13 @@ pub struct MeetingWorkspace {
     /// The contiguous finalized transcript rows explicitly offered as an Ask scope.
     ask_selection: Option<ask::AskSelection>,
     library_filter: Entity<InputState>,
+    entry_title_input: Entity<InputState>,
     annotation_input: Entity<InputState>,
+    prepared_notes: Vec<String>,
     editing_annotation: Option<notes::AnnotationView>,
     editing_notes_block: Option<notes::EditingNotesBlock>,
     library_index: BTreeMap<SessionId, String>,
+    entry_library_index: BTreeMap<EntryId, String>,
     library_footprint: library::LibraryFootprint,
     /// Whether the library rail is hidden. Persisted, the way `ask_open` is.
     library_collapsed: bool,
@@ -455,6 +461,7 @@ pub struct MeetingWorkspace {
     pending_ask: Option<(ask::PendingAsk, String)>,
     ask_dock: Entity<DockArea>,
     ask_open: bool,
+    vault: Entity<VaultMirrorController>,
     /// The settings sheet, built the first time it is asked for and kept afterwards. Building it
     /// probes the Codex CLI and starts the MCP poll, so cold launch must not build it and each
     /// re-open must not build another.
@@ -486,7 +493,9 @@ impl MeetingWorkspace {
         // would understate it, and T083 moved the control into the toolbar precisely so it stays
         // reachable when the rail it filters is collapsed.
         let library_filter =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Search recordings and notes"));
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search entries and notes"));
+        let entry_title_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Name this entry"));
         let annotation_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(1, 4)
@@ -508,6 +517,7 @@ impl MeetingWorkspace {
             persisted.theme,
         )));
         let ask_panel = cx.new(|cx| ask::AskPanel::new(window, cx));
+        let vault = cx.new(|cx| VaultMirrorController::new(database.clone(), cx));
         let ask_dock = cx.new(|cx| {
             let mut area = DockArea::new("sotto-ask-dock", Some(1), window, cx);
             let item = DockItem::tab(ask_panel.clone(), &cx.entity().downgrade(), window, cx);
@@ -567,6 +577,13 @@ impl MeetingWorkspace {
                 &annotation_input,
                 window,
                 |this, _, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. })
+                        && this.transcript_session.is_none()
+                        && this.selected_entry.is_some()
+                    {
+                        this.submit_prepared_note(window, cx);
+                        return;
+                    }
                     if matches!(event, InputEvent::PressEnter { secondary: true })
                         || (matches!(event, InputEvent::PressEnter { secondary: false })
                             && !this.composer_edits_notes_document(cx))
@@ -607,6 +624,8 @@ impl MeetingWorkspace {
             message,
             observed_live_session: None,
             observed_completed_session: None,
+            entries: Vec::new(),
+            selected_entry: None,
             transcript_session: None,
             transcript_events: vec![],
             transcript_live: false,
@@ -618,16 +637,20 @@ impl MeetingWorkspace {
             focused_event: None,
             ask_selection: None,
             library_filter,
+            entry_title_input,
             annotation_input,
+            prepared_notes: Vec::new(),
             editing_annotation: None,
             editing_notes_block: None,
             library_index: BTreeMap::new(),
+            entry_library_index: BTreeMap::new(),
             library_footprint: library::LibraryFootprint::default(),
             library_collapsed: persisted.library_collapsed,
             ask_panel,
             pending_ask: None,
             ask_dock,
             ask_open,
+            vault,
             settings: None,
             settings_open: false,
             theme: persisted.theme,
@@ -769,7 +792,16 @@ impl MeetingWorkspace {
         let enabled = self
             .reasoning_backend(cx)
             .is_ok_and(|backend| backend.is_some());
-        if self.notes.update(cx, |notes, _| notes.select(id, enabled)) {
+        let notes_session = self
+            .entry_id_for_session(id)
+            .and_then(|entry_id| self.entries.iter().find(|entry| entry.id() == entry_id))
+            .and_then(|entry| entry.session_ids().last())
+            .copied()
+            .unwrap_or(id);
+        if self
+            .notes
+            .update(cx, |notes, _| notes.select(notes_session, enabled))
+        {
             self.message = None;
             self.clear_ask_selection(cx);
             self.load_transcript(id);
@@ -780,6 +812,145 @@ impl MeetingWorkspace {
             self.message = Some("That recording is no longer available.".into());
         }
         cx.notify();
+    }
+
+    pub(crate) fn select_entry(&mut self, entry_id: EntryId, cx: &mut Context<Self>) {
+        let Some(entry) = self.entries.iter().find(|entry| entry.id() == entry_id) else {
+            self.message = Some("That entry is no longer available.".to_owned());
+            cx.notify();
+            return;
+        };
+        self.selected_entry = Some(entry_id);
+        if let Some(active) = self.session.read(cx).active_session_id()
+            && entry.session_ids().contains(&active)
+        {
+            self.show_live_transcript(active, cx);
+            cx.notify();
+            return;
+        }
+        if let Some(session_id) = entry.session_ids().last().copied() {
+            self.select_meeting(session_id, cx);
+            return;
+        }
+        self.cancel_pending_ask();
+        self.clear_ask_selection(cx);
+        self.transcript_session = None;
+        self.transcript_events.clear();
+        self.transcript_live = false;
+        self.transcript_pacer.clear();
+        self.transcript_list.reset(0);
+        self.open_recording = None;
+        self.focused_event = None;
+        self.message = None;
+        self.refresh_prepared_notes(entry_id);
+        self.sync_ask_scope(
+            self.reasoning_backend(cx)
+                .is_ok_and(|backend| backend.is_some()),
+            cx,
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn create_prepared_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.entry_title_input.read(cx).value().to_string();
+        let Some(title) = sotto_core::types::RecordingTitle::new(&raw) else {
+            self.message = Some("Name the entry before preparing it.".to_owned());
+            cx.notify();
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let entry_id = EntryId::new(now);
+        let created_at = u64::try_from(now / 1_000_000).unwrap_or(u64::MAX);
+        let result = crate::persistence_runtime::block_on(async {
+            rag::Store::open(&self.database)
+                .await?
+                .create_entry(&Entry::new(entry_id, created_at, Some(title)))
+                .await
+        });
+        match result {
+            Ok(()) => {
+                self.entry_title_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.rebuild_library_index(cx);
+                self.select_entry(entry_id, cx);
+            }
+            Err(error) => {
+                self.message = Some(format!("Could not prepare this entry: {error}"));
+                cx.notify();
+            }
+        }
+    }
+
+    fn submit_prepared_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry_id) = self.selected_entry else {
+            return;
+        };
+        let text = self.annotation_input.read(cx).value().to_string();
+        if text.trim().is_empty() {
+            self.message = Some("Type a prep note before saving it.".to_owned());
+            cx.notify();
+            return;
+        }
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        let operation = insight::NotesOverlayOperation::Add {
+            user_block_id: format!("prep-{created_at}"),
+            section: insight::RecordingNotesSectionKind::Overview,
+            text,
+            action: false,
+            owner: None,
+            due_date: None,
+        };
+        let result = crate::persistence_runtime::block_on(async {
+            let store = rag::Store::open(&self.database).await?;
+            insight::append_notes_overlay_operation(
+                &store,
+                entry_id,
+                &insight::RecordingNotes::default(),
+                &operation,
+                created_at,
+            )
+            .await
+            .map_err(|error| sotto_core::RagError::Storage(error.to_string()))?;
+            Ok::<_, sotto_core::RagError>(())
+        });
+        match result {
+            Ok(()) => {
+                self.annotation_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.refresh_prepared_notes(entry_id);
+                self.rebuild_library_index(cx);
+                self.message = Some("Prep note saved in this entry.".to_owned());
+            }
+            Err(error) => self.message = Some(format!("Could not save the prep note: {error}")),
+        }
+        cx.notify();
+    }
+
+    fn refresh_prepared_notes(&mut self, entry_id: EntryId) {
+        self.prepared_notes = crate::persistence_runtime::block_on(async {
+            let store = rag::Store::open(&self.database).await?;
+            let document = insight::load_presented_notes_document(
+                &store,
+                entry_id,
+                &insight::RecordingNotes::default(),
+            )
+            .await
+            .map_err(|error| sotto_core::RagError::Storage(error.to_string()))?;
+            Ok::<_, sotto_core::RagError>(
+                document
+                    .blocks
+                    .into_iter()
+                    .map(|block| block.text)
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
     }
 
     /// Opens one vault citation through the same recording-selection and citation-reveal paths as
@@ -837,6 +1008,7 @@ impl MeetingWorkspace {
                 self.transcript_list
                     .reset(self.transcript_pacer.rows().len());
                 self.transcript_session = Some(id);
+                self.selected_entry = self.entry_id_for_session(id);
                 self.transcript_events = events;
                 self.transcript_live = false;
                 self.follow_transcript = false;
@@ -881,6 +1053,7 @@ impl MeetingWorkspace {
         self.cancel_pending_ask();
         self.clear_ask_selection(cx);
         self.transcript_session = Some(id);
+        self.selected_entry = self.entry_id_for_session(id);
         self.transcript_events.clear();
         self.transcript_live = true;
         self.transcript_pacer.clear();
@@ -901,6 +1074,7 @@ impl MeetingWorkspace {
         self.cancel_pending_ask();
         self.clear_ask_selection(cx);
         self.transcript_session = None;
+        self.selected_entry = None;
         self.transcript_events.clear();
         self.transcript_live = false;
         self.transcript_pacer.clear();
@@ -982,6 +1156,7 @@ impl MeetingWorkspace {
     /// about, not whatever happens to be open when OK is clicked.
     fn confirm_delete_session(&mut self, id: SessionId, cx: &mut Context<Self>) {
         self.cancel_pending_ask();
+        let owning_entry = self.entry_id_for_session(id);
         let recordings = RecordingLibrary::new(
             self.database.clone(),
             crate::session::application_recording_directory(),
@@ -1016,6 +1191,17 @@ impl MeetingWorkspace {
         if self.message.is_none() {
             self.rebuild_library_index(cx);
         }
+        if let Some(entry_id) = owning_entry
+            && let Some(next) = self
+                .entries
+                .iter()
+                .find(|entry| entry.id() == entry_id)
+                .and_then(|entry| entry.session_ids().last())
+                .copied()
+        {
+            self.select_meeting(next, cx);
+            return;
+        }
         // Deleting what you were reading lands you on Home, not inside an unrelated recording the
         // shell picked for you. Same reasoning as launch: nothing here is the obvious next thing.
         let enabled = self
@@ -1042,20 +1228,84 @@ impl MeetingWorkspace {
                 || "this recording".to_owned(),
                 |meeting| format!("“{}”", library::recording_name(&meeting)),
             );
+        let keeps_entry = self
+            .selected_entry
+            .and_then(|entry_id| self.entries.iter().find(|entry| entry.id() == entry_id))
+            .is_some_and(|entry| entry.session_ids().len() > 1);
+        let consequence = if keeps_entry {
+            "This removes only that recording and transcript; the entry, its other recordings and its notes stay."
+        } else {
+            "This removes the recording and transcript; its automatically created empty entry is removed too."
+        };
         match self
             .open_recording
             .as_ref()
             .and_then(|recording| recording.byte_size)
         {
             Some(bytes) => format!(
-                "Delete {title} and its {}? This removes the recording, its transcript and its \
-                 notes from this Mac.",
-                layout::format_bytes(bytes)
+                "Delete {title} and its {}? {consequence}",
+                layout::format_bytes(bytes),
             ),
-            None => format!(
-                "Delete {title}? It has no retained media, and its transcript and notes are \
-                 removed from this Mac."
-            ),
+            None => format!("Delete {title}? It has no retained media. {consequence}"),
+        }
+    }
+
+    pub(crate) fn delete_open_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry_id) = self.selected_entry else {
+            return;
+        };
+        let Some(entry) = self.entries.iter().find(|entry| entry.id() == entry_id) else {
+            return;
+        };
+        let name = library::entry_name(entry, &self.notes.read(cx).snapshot().meetings);
+        let count = entry.session_ids().len();
+        let prompt = format!(
+            "Delete the entry “{name}”? This removes its {count} recording(s), transcripts, retained media and notes from this Mac."
+        );
+        let workspace = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let workspace = workspace.clone();
+            confirm_delete_dialog(
+                dialog,
+                "Delete entry",
+                &prompt,
+                "Delete entry",
+                move |_, cx| {
+                    let _ = workspace.update(cx, |workspace, cx| {
+                        workspace.confirm_delete_entry(entry_id, cx);
+                    });
+                },
+            )
+        });
+    }
+
+    fn confirm_delete_entry(&mut self, entry_id: EntryId, cx: &mut Context<Self>) {
+        self.cancel_pending_ask();
+        let recording_directory = self
+            .database
+            .parent()
+            .map_or_else(std::env::temp_dir, Path::to_path_buf)
+            .join("recordings");
+        let result = crate::persistence_runtime::block_on(async {
+            rag::Store::open(&self.database)
+                .await?
+                .delete_entry(entry_id, &recording_directory)
+                .await
+        });
+        match result {
+            Ok(()) => {
+                self.observed_completed_session = None;
+                self.message = self
+                    .notes
+                    .update(cx, |notes, _| notes.refresh_catalogue())
+                    .err();
+                self.rebuild_library_index(cx);
+                self.show_home(cx);
+            }
+            Err(error) => {
+                self.message = Some(format!("Could not delete this entry: {error}"));
+                cx.notify();
+            }
         }
     }
 
@@ -1073,24 +1323,22 @@ impl MeetingWorkspace {
     /// in is the most natural question there is — and reporting nothing simply means Ask has no
     /// single-recording scope to offer, never that Ask is unavailable.
     fn sync_ask_scope(&mut self, ready: bool, cx: &mut Context<Self>) {
-        let scope = self.transcript_session.map(|id| {
-            let name = self
-                .notes
-                .read(cx)
-                .snapshot()
-                .meetings
-                .into_iter()
-                .find(|meeting| meeting.id == id)
-                .map_or_else(
-                    || library::UNTITLED_RECORDING.to_owned(),
-                    |meeting| library::recording_name(&meeting),
-                );
-            (id, name)
+        let meetings = self.notes.read(cx).snapshot().meetings;
+        let scope = self.selected_entry.and_then(|entry_id| {
+            self.entries
+                .iter()
+                .find(|entry| entry.id() == entry_id)
+                .map(|entry| {
+                    (
+                        entry.session_ids().to_vec(),
+                        library::entry_name(entry, &meetings),
+                    )
+                })
         });
         let live = self.transcript_live;
         let selection = self.ask_selection.clone();
         self.ask_panel.update(cx, |panel, _| {
-            panel.set_scope(scope, ready, live);
+            panel.set_entry_scope(scope, ready, live);
             panel.set_selection(selection);
         });
     }
@@ -1122,6 +1370,11 @@ impl MeetingWorkspace {
     /// summary's chips, the Ask panel's answers) arrives here so none of them can drift into a
     /// half-gesture. A `false` return means the message already explains why nothing moved.
     pub fn open_citation(&mut self, event_id: EventId, cx: &mut Context<Self>) {
+        if let Some(cited_session) = self.notes.read(cx).snapshot().selected_session
+            && self.transcript_session != Some(cited_session)
+        {
+            self.select_meeting(cited_session, cx);
+        }
         self.reveal_citation(event_id, cx);
     }
 
@@ -1142,7 +1395,23 @@ impl MeetingWorkspace {
         }
     }
     pub(crate) fn start_scoped_session(&mut self, cx: &mut Context<Self>) {
-        self.session.update(cx, SessionController::start);
+        if let Some(entry_id) = self.selected_entry {
+            self.session
+                .update(cx, |session, cx| session.start_in_entry(entry_id, cx));
+        } else {
+            self.session.update(cx, SessionController::start);
+        }
+    }
+
+    pub(crate) fn start_microphone_session(&mut self, cx: &mut Context<Self>) {
+        if let Some(entry_id) = self.selected_entry {
+            self.session.update(cx, |session, cx| {
+                session.start_microphone_only_in_entry(entry_id, cx);
+            });
+        } else {
+            self.session
+                .update(cx, SessionController::start_microphone_only);
+        }
     }
 
     pub(crate) fn stop_session(&mut self, cx: &mut Context<Self>) {
@@ -1362,7 +1631,9 @@ impl MeetingWorkspace {
                 let reasoning = self.reasoning.clone();
                 let mcp = self.mcp.clone();
                 let database = self.database.clone();
-                let view = cx.new(|cx| SettingsView::new(window, reasoning, mcp, database, cx));
+                let vault = self.vault.clone();
+                let view =
+                    cx.new(|cx| SettingsView::new(window, reasoning, mcp, vault, database, cx));
                 self._subscriptions.push(cx.subscribe_in(
                     &view,
                     window,
@@ -1401,7 +1672,30 @@ impl MeetingWorkspace {
     fn rebuild_library_index(&mut self, cx: &Context<Self>) {
         let meetings = self.notes.read(cx).snapshot().meetings;
         self.library_index = library::search_index(&self.database, &meetings);
-        self.library_footprint = library::LibraryFootprint::measure(&self.database, &meetings);
+        self.entries = crate::persistence_runtime::block_on(async {
+            rag::Store::open(&self.database).await?.list_entries().await
+        })
+        .unwrap_or_default();
+        self.entry_library_index =
+            library::entry_search_index(&self.database, &self.entries, &meetings);
+        self.library_footprint =
+            library::LibraryFootprint::measure_entries(&self.database, &self.entries, &meetings);
+    }
+
+    fn entry_id_for_session(&self, session_id: SessionId) -> Option<EntryId> {
+        self.entries
+            .iter()
+            .find(|entry| entry.session_ids().contains(&session_id))
+            .map(Entry::id)
+            .or_else(|| {
+                crate::persistence_runtime::block_on(async {
+                    rag::Store::open(&self.database)
+                        .await?
+                        .entry_for_session(session_id)
+                        .await
+                })
+                .ok()
+            })
     }
 
     fn poll_session_clock(&self, cx: &mut Context<Self>) {

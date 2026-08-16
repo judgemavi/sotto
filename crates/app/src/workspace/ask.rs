@@ -68,7 +68,7 @@ pub(super) struct AskPanel {
     focus_handle: FocusHandle,
     input: Entity<InputState>,
     /// The open recording and its name, live or stopped. `None` on Home.
-    scope: Option<(SessionId, String)>,
+    scope: Option<(Vec<SessionId>, String)>,
     backend_ready: bool,
     chosen: AskScope,
     previous_non_selection: AskScope,
@@ -158,14 +158,28 @@ impl AskPanel {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn set_scope(
         &mut self,
         scope: Option<(SessionId, String)>,
         ready: bool,
         live: bool,
     ) {
+        self.set_entry_scope(
+            scope.map(|(session_id, name)| (vec![session_id], name)),
+            ready,
+            live,
+        );
+    }
+
+    pub(super) fn set_entry_scope(
+        &mut self,
+        scope: Option<(Vec<SessionId>, String)>,
+        ready: bool,
+        live: bool,
+    ) {
         if self.chosen == AskScope::OpenRecording
-            && self.scope.as_ref().map(|value| value.0) != scope.as_ref().map(|value| value.0)
+            && self.scope.as_ref().map(|value| &value.0) != scope.as_ref().map(|value| &value.0)
         {
             self.turns.clear();
             self.message = None;
@@ -192,7 +206,17 @@ impl AskPanel {
     /// The open recording's id, when that is what a question would be answered from.
     pub(super) fn open_recording(&self) -> Option<SessionId> {
         (self.chosen == AskScope::OpenRecording)
-            .then_some(self.scope.as_ref().map(|value| value.0))
+            .then_some(
+                self.scope
+                    .as_ref()
+                    .and_then(|value| (value.0.len() == 1).then_some(value.0[0])),
+            )
+            .flatten()
+    }
+
+    pub(super) fn open_entry_sessions(&self) -> Option<Vec<SessionId>> {
+        (self.chosen == AskScope::OpenRecording)
+            .then(|| self.scope.as_ref().map(|value| value.0.clone()))
             .flatten()
     }
 
@@ -326,18 +350,24 @@ impl Render for AskPanel {
                     )
                     .child(
                         ControlRole::Essential,
-                        Button::new("ask-scope-open")
-                            .label(if self.live {
-                                "This recording (live)"
-                            } else {
-                                "This recording"
-                            })
-                            .small()
-                            .selected(effective == AskScope::OpenRecording)
-                            .disabled(self.scope.is_none() || self.running)
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                cx.emit(AskPanelEvent::SelectScope(AskScope::OpenRecording));
-                            })),
+                        div()
+                            .debug_selector(|| "ask-scope-entry-control".into())
+                            .child(
+                                Button::new("ask-scope-open")
+                                    .label(if self.live {
+                                        "This entry (live)"
+                                    } else {
+                                        "This entry"
+                                    })
+                                    .small()
+                                    .selected(effective == AskScope::OpenRecording)
+                                    .disabled(self.scope.is_none() || self.running)
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(AskPanelEvent::SelectScope(
+                                            AskScope::OpenRecording,
+                                        ));
+                                    })),
+                            ),
                     )
                     .finish()
                     .gap(Space::SM)
@@ -445,9 +475,9 @@ fn scope_line(
             },
         ),
         (AskScope::OpenRecording, Some(name)) if live => {
-            format!("This recording, so far · {name}")
+            format!("This entry, so far · {name}")
         }
-        (AskScope::OpenRecording, Some(name)) => format!("This recording · {name}"),
+        (AskScope::OpenRecording, Some(name)) => format!("This entry · {name}"),
         (AskScope::AllRecordings | AskScope::OpenRecording, _) => {
             "Every recording in your library".to_owned()
         }
@@ -531,6 +561,7 @@ impl MeetingWorkspace {
             return;
         }
         let selection = self.ask_panel.read(cx).selected_range();
+        let entry_sessions = self.ask_panel.read(cx).open_entry_sessions();
         let scope = selection
             .as_ref()
             .map(|selection| selection.session_id)
@@ -613,6 +644,7 @@ impl MeetingWorkspace {
         let worker_cancel = cancellation.clone();
         let provider = backend.provider();
         let worker_question = question.clone();
+        let entry_scope = entry_sessions;
         let spawn = std::thread::Builder::new()
             .name("sotto-ask".into())
             .spawn(move || {
@@ -644,7 +676,12 @@ impl MeetingWorkspace {
                             .await
                             .map_err(|error| error.to_string()),
                         None => {
-                            let evidence = retained_evidence(&database, &worker_question).await?;
+                            let evidence = retained_evidence(
+                                &database,
+                                &worker_question,
+                                entry_scope.as_deref(),
+                            )
+                            .await?;
                             engine
                                 .ask_across(
                                     &evidence,
@@ -756,6 +793,7 @@ const LIBRARY_ASK: SessionId = SessionId::new(0);
 async fn retained_evidence(
     database: &std::path::Path,
     question: &str,
+    sessions: Option<&[SessionId]>,
 ) -> Result<Vec<AskEvidence>, String> {
     let store = rag::Store::open(database)
         .await
@@ -770,18 +808,39 @@ async fn retained_evidence(
             session_id.get()
         );
     }
-    let chunks = store
-        .search_filtered(
-            question,
-            5,
-            &SearchFilter {
-                kind: Some(DocumentKind::PriorMeeting),
-                collection_id: None,
-                source_session_id: None,
-            },
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut chunks = Vec::new();
+    if let Some(sessions) = sessions {
+        for session_id in sessions {
+            chunks.extend(
+                store
+                    .search_filtered(
+                        question,
+                        5,
+                        &SearchFilter {
+                            kind: Some(DocumentKind::PriorMeeting),
+                            collection_id: None,
+                            source_session_id: Some(*session_id),
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        chunks.truncate(5);
+    } else {
+        chunks = store
+            .search_filtered(
+                question,
+                5,
+                &SearchFilter {
+                    kind: Some(DocumentKind::PriorMeeting),
+                    collection_id: None,
+                    source_session_id: None,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     chunks
         .into_iter()
         .map(|chunk| {
@@ -838,7 +897,7 @@ mod layout_tests {
     /// person reads before deciding whether to trust an answer, so it must not tell someone who
     /// recorded a lecture that they are asking about a meeting.
     #[test]
-    fn the_scope_line_speaks_about_recordings() {
+    fn the_scope_line_speaks_about_entries() {
         for line in [
             scope_line(None, None, ALL, false),
             scope_line(Some("CS231n lecture"), None, OPEN, false),
@@ -853,8 +912,8 @@ mod layout_tests {
         }
         assert_eq!(
             scope_line(Some("CS231n lecture"), None, OPEN, false),
-            "This recording · CS231n lecture",
-            "a single scope names the recording it would answer from"
+            "This entry · CS231n lecture",
+            "a single scope names the entry it would answer from"
         );
         assert_eq!(
             scope_line(Some("CS231n lecture"), None, ALL, false),
@@ -886,7 +945,7 @@ mod layout_tests {
     fn a_live_scope_says_it_is_still_running() {
         assert_eq!(
             scope_line(Some("Standup"), None, OPEN, true),
-            "This recording, so far · Standup"
+            "This entry, so far · Standup"
         );
     }
 

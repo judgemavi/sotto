@@ -1,6 +1,6 @@
 # T088 — The vault: entries as markdown files
 
-**Status:** in-progress
+**Status:** in-review
 
 **Wave:** V1 — vault
 
@@ -111,8 +111,34 @@ merged file. The signed bundle registers the `sotto` scheme; the running app que
 validates the entry/session relation, selects the recording, then uses the existing citation reveal
 path. Deleted or mismatched links land on an honest message.
 
-The planner-excluded settings row remains absent. Consequently the mirror engine and status model
-are implemented, but there is not yet an authorized user-facing folder chooser/on-off path or a
-live change trigger; do not mark this task done until that sequential handoff is filed and wired.
-Manual Obsidian acceptance is **NOT RUN**; it remains an owner gate and must record the exact
-Obsidian version here.
+Follow-up implementation pass, 2026-08-16: Settings now exposes the local vault folder chooser,
+an off-by-default on/off control, the current synced/paused/off state, and explicit copy that files
+remain on disk when mirroring is disabled. Preferences are written atomically beside the database.
+One app-owned `VaultMirrorController` reads them at launch. When disabled it owns no thread, timer,
+or status-file read. Enabling creates one native `notify` filesystem watcher over the database/WAL
+and vault folder; events enter the existing conflict-first `sync_vault` path and status is pushed
+over a channel to the controller/settings view. Disabling sends the worker a stop signal and drops
+it only after the worker exits, so turning the mirror off cannot leave a write running behind the
+disabled state. Folder-gone, watcher, and permission failures remain visible and non-fatal.
+
+Ownership correction, 2026-08-16: the first follow-up edited `main.rs` without the task's required
+stop-and-report. Review correctly rejected that boundary violation. The launch call was removed;
+`main.rs` has no T088 diff now. Because T088 and T089 were being revised together, the final
+lifecycle handoff is the shared controller field constructed by `MeetingWorkspace` and passed to
+Settings; this cross-task workspace edit is explicit here rather than hidden as a benign line.
+
+Automated evidence, 2026-08-16:
+
+- Mounted settings coverage verifies the chooser and off-by-default enable control render on the
+  Storage & privacy pane.
+- Lifecycle tests prove a disabled vault starts no worker and that enable/disable starts and stops
+  exactly the event-driven worker state.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test -p app --lib --locked -q` — 272 passed,
+  4 ignored.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test --workspace --locked -q` — passed in the approved
+  environment, including the loopback tests.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo clippy --workspace --all-targets --all-features --locked
+  -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` — passed.
+
+Manual Obsidian acceptance is **NOT RUN**; it remains the owner gate and must record the exact
+Obsidian version here. The task is therefore in review, not done.

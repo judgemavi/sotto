@@ -31,8 +31,8 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, Pixels,
-    Render, Subscription, Timer, Window, div, prelude::*, px,
+    AnyElement, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent,
+    PathPromptOptions, Pixels, Render, Subscription, Timer, Window, div, prelude::*, px,
 };
 use gpui_component::{
     Disableable, IconName, WindowExt as _,
@@ -48,6 +48,7 @@ use crate::{
     mcp::McpController,
     reasoning::ReasoningController,
     session::{RecordingLibrary, RecordingLibrarySnapshot},
+    vault::VaultMirrorController,
     workspace::{
         confirm_delete_dialog, delete_icon_button, icon_button,
         tokens::{Space, TypeScale, WorkspaceTokens},
@@ -113,6 +114,8 @@ pub struct SettingsView {
     recording_library: RecordingLibrary,
     recording_snapshot: Option<RecordingLibrarySnapshot>,
     recording_budget_input: Entity<InputState>,
+    vault: Entity<VaultMirrorController>,
+    _vault_subscription: Subscription,
     action_message: Option<String>,
     validation_lease: ValidationLease,
     /// Which of the four panes is showing. Not persisted: the sheet always opens on the pane the
@@ -205,6 +208,7 @@ impl SettingsView {
         window: &mut Window,
         reasoning: Entity<ReasoningController>,
         mcp: Entity<McpController>,
+        vault: Entity<VaultMirrorController>,
         database: PathBuf,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -216,6 +220,7 @@ impl SettingsView {
             window,
             reasoning,
             mcp,
+            vault,
             RecordingLibrary::new(database, recordings),
             cx,
         )
@@ -225,11 +230,13 @@ impl SettingsView {
         window: &mut Window,
         reasoning: Entity<ReasoningController>,
         mcp: Entity<McpController>,
+        vault: Entity<VaultMirrorController>,
         recording_library: RecordingLibrary,
         cx: &mut Context<Self>,
     ) -> Self {
         let reasoning_subscription = cx.observe(&reasoning, |_, _, cx| cx.notify());
         let mcp_subscription = cx.observe(&mcp, |_, _, cx| cx.notify());
+        let vault_subscription = cx.observe(&vault, |_, _, cx| cx.notify());
         let model = reasoning.read(cx).openai_model().to_owned();
         let codex_model = reasoning.read(cx).codex_model().to_owned();
         let recording_result = recording_library.snapshot();
@@ -281,6 +288,8 @@ impl SettingsView {
                     .placeholder("Recording budget in GB")
                     .default_value(recording_budget_gb.to_string())
             }),
+            vault,
+            _vault_subscription: vault_subscription,
             action_message,
             validation_lease: ValidationLease::default(),
             pane: SettingsPane::default(),
@@ -518,6 +527,49 @@ impl SettingsView {
             }
         })
         .detach();
+    }
+
+    fn choose_vault_folder(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose vault".into()),
+        });
+        let view = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let selected = match receiver.await {
+                Ok(Ok(Some(mut paths))) if !paths.is_empty() => Some(paths.remove(0)),
+                _ => None,
+            };
+            let Some(folder) = selected else {
+                return;
+            };
+            let _ = view.update(cx, |this, cx| {
+                this.action_message = this
+                    .vault
+                    .update(cx, |vault, cx| vault.set_folder(folder, cx))
+                    .err();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn set_vault_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.action_message = match self
+            .vault
+            .update(cx, |vault, cx| vault.set_enabled(enabled, cx))
+        {
+            Ok(()) if enabled => {
+                Some("Markdown mirror enabled; rebuilding from the local store.".to_owned())
+            }
+            Ok(()) => Some(
+                "Markdown mirror disabled. Existing files remain in the chosen folder.".to_owned(),
+            ),
+            Err(error) => Some(error),
+        };
+        cx.notify();
     }
 
     fn save_mcp_token(
@@ -853,6 +905,9 @@ impl SettingsView {
     /// Leads, and is the default pane: what is kept, what it costs, and the one egress case.
     fn storage_pane(&self, tokens: WorkspaceTokens, cx: &mut Context<Self>) -> AnyElement {
         let recordings = self.recording_snapshot.clone();
+        let vault = self.vault.read(cx);
+        let vault_preferences = vault.preferences();
+        let vault_status = vault.status();
         let directory = self
             .recording_library
             .recording_directory()
@@ -879,6 +934,51 @@ impl SettingsView {
                 tokens,
                 false,
             ))
+            .child(
+                settings_card(
+                    "Markdown vault",
+                    &format!("Current state · {}", vault_status.summary()),
+                    tokens,
+                )
+                .child(statement(
+                    "Where notes mirror",
+                    &vault_preferences.folder.as_ref().map_or_else(
+                        || "No folder chosen".to_owned(),
+                        |folder| folder.display().to_string(),
+                    ),
+                    tokens,
+                    false,
+                ))
+                .child(
+                    action_row()
+                        .child(
+                            div().debug_selector(|| "choose-vault-folder".into()).child(
+                                Button::new("choose-vault-folder-button")
+                                    .label("Choose folder…")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.choose_vault_folder(cx);
+                                    })),
+                            ),
+                        )
+                        .child(if vault_preferences.enabled {
+                            div().debug_selector(|| "disable-vault".into()).child(
+                                Button::new("disable-vault-button")
+                                    .label("Turn off mirror")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_vault_enabled(false, cx);
+                                    })),
+                            )
+                        } else {
+                            div().debug_selector(|| "enable-vault".into()).child(
+                                Button::new("enable-vault-button")
+                                    .label("Turn on mirror")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_vault_enabled(true, cx);
+                                    })),
+                            )
+                        }),
+                ),
+            )
             .when_some(recordings, |view, snapshot| {
                 let usage = format!(
                     "{} used of {}",
@@ -1689,6 +1789,7 @@ mod tests {
             CodexProbeSource, OpenAiCredentialStore, OpenAiReadiness, ReasoningController,
         },
         session::RecordingLibrary,
+        vault::VaultMirrorController,
     };
     use gpui::{
         AppContext as _, Entity, Modifiers, TestAppContext, VisualTestContext, prelude::*, px, size,
@@ -1805,11 +1906,14 @@ mod tests {
             )
         });
         let mcp = cx.new(|_| McpController::load(Some(mcp_path), Arc::new(NoMcpCredentials)));
-        let library = RecordingLibrary::new(database, recordings);
+        let library = RecordingLibrary::new(&database, recordings);
         let handle = cx.update(|cx| {
             cx.open_window(gpui::WindowOptions::default(), move |window, cx| {
+                let vault = cx.new(|cx| VaultMirrorController::new(database.clone(), cx));
                 let settings = cx.new(|cx| {
-                    SettingsView::new_with_recording_library(window, reasoning, mcp, library, cx)
+                    SettingsView::new_with_recording_library(
+                        window, reasoning, mcp, vault, library, cx,
+                    )
                 });
                 let host = cx.new(|_| SheetHost { settings });
                 cx.new(|cx| gpui_component::Root::new(host, window, cx))
@@ -2075,6 +2179,34 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn vault_controls_render_on_storage_and_privacy() -> Result<(), Box<dyn std::error::Error>> {
+        let mut cx = TestAppContext::single();
+        let sheet = mount(&mut cx, px(900.0))?;
+
+        for selector in ["choose-vault-folder", "enable-vault"] {
+            scroll_into_view(
+                sheet.visual,
+                SettingsPane::StorageAndPrivacy.pane_selector(),
+                selector,
+            )?;
+        }
+        assert!(
+            sheet.visual.update(|_, cx| {
+                sheet
+                    .settings
+                    .read(cx)
+                    .vault
+                    .read(cx)
+                    .status()
+                    .summary()
+                    .contains("Off")
+            }),
+            "the off-by-default state must be visible through the mounted settings model"
+        );
         Ok(())
     }
 

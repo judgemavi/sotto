@@ -38,7 +38,7 @@ use gpui_component::{
 use insight::{RecordingNotes, RecordingNotesBlock, load_latest_grounded_notes};
 use rag::{SessionSummary, Store};
 use sotto_core::{
-    EventPayload, SessionId,
+    Entry, EntryId, EventPayload, SessionId,
     types::{RecordingTitle, is_imported_capture_target},
 };
 
@@ -74,6 +74,7 @@ const RAIL_WIDTH: Pixels = px(240.0);
 /// a home surface that invented a dashboard would be the failure this task exists to avoid.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct LibraryFootprint {
+    entries: usize,
     recordings: usize,
     retained_bytes: u64,
 }
@@ -117,23 +118,34 @@ impl LibraryFootprint {
         })
         .unwrap_or_default();
         Self {
+            entries: meetings.len(),
             recordings: meetings.len(),
             retained_bytes,
         }
     }
 
+    pub(crate) fn measure_entries(
+        database: &Path,
+        entries: &[Entry],
+        meetings: &[SessionSummary],
+    ) -> Self {
+        let mut measured = Self::measure(database, meetings);
+        measured.entries = entries.len();
+        measured
+    }
+
     fn count(self) -> String {
-        if self.recordings == 1 {
-            "1 recording".to_owned()
+        if self.entries == 1 {
+            "1 entry".to_owned()
         } else {
-            format!("{} recordings", self.recordings)
+            format!("{} entries", self.entries)
         }
     }
 
     /// The Home rail entry's second line. Short, because the rail is narrow.
     fn meta(self) -> String {
-        if self.recordings == 0 {
-            return "nothing recorded yet".to_owned();
+        if self.entries == 0 {
+            return "no entries yet".to_owned();
         }
         if self.retained_bytes == 0 {
             return format!("{} · no retained media", self.count());
@@ -143,14 +155,22 @@ impl LibraryFootprint {
 
     /// The one storage claim the home surface makes, in ADR-0019's vocabulary.
     pub(crate) fn claim(self) -> String {
-        if self.recordings == 0 {
-            return "No recordings yet — Sotto is storing nothing on this Mac.".to_owned();
+        if self.entries == 0 {
+            return "No entries yet — Sotto is storing nothing on this Mac.".to_owned();
         }
+        let recordings = if self.recordings == 1 {
+            "1 recording".to_owned()
+        } else {
+            format!("{} recordings", self.recordings)
+        };
         if self.retained_bytes == 0 {
-            return format!("{} · no retained media — all on this Mac.", self.count());
+            return format!(
+                "{} · {recordings} · no retained media — all on this Mac.",
+                self.count()
+            );
         }
         format!(
-            "{} · {} retained — all on this Mac.",
+            "{} · {recordings} · {} retained — all on this Mac.",
             self.count(),
             format_bytes(self.retained_bytes)
         )
@@ -210,6 +230,52 @@ pub(crate) fn search_index(
     })
 }
 
+/// Entry-era search keeps every captured name and every session document under the entry id that
+/// owns them. Prepared entries contribute their user overlay even though they have no transcript.
+pub(crate) fn entry_search_index(
+    database: &Path,
+    entries: &[Entry],
+    meetings: &[SessionSummary],
+) -> BTreeMap<EntryId, String> {
+    let sessions = search_index(database, meetings);
+    crate::persistence_runtime::block_on(async {
+        let Ok(store) = Store::open(database).await else {
+            return BTreeMap::new();
+        };
+        let mut index = BTreeMap::new();
+        for entry in entries {
+            let mut text = entry_name(entry, meetings).to_lowercase();
+            for session_id in entry.session_ids() {
+                if let Some(session_text) = sessions.get(session_id) {
+                    text.push(' ');
+                    text.push_str(session_text);
+                }
+            }
+            if let Ok(operations) = store.load_notes_overlay(entry.id()).await {
+                for operation in operations {
+                    text.push(' ');
+                    text.push_str(&operation.operation.to_lowercase());
+                }
+            }
+            index.insert(entry.id(), text);
+        }
+        index
+    })
+}
+
+pub(crate) fn entry_name(entry: &Entry, meetings: &[SessionSummary]) -> String {
+    entry.title().map_or_else(
+        || {
+            entry
+                .session_ids()
+                .first()
+                .and_then(|id| meetings.iter().find(|meeting| meeting.id == *id))
+                .map_or_else(|| "Untitled entry".to_owned(), target_title)
+        },
+        ToString::to_string,
+    )
+}
+
 /// Adds only user-visible summary content to the rail's search corpus.
 ///
 /// `Debug` output also contains Rust field and enum names. Indexing it made a query such as
@@ -246,6 +312,7 @@ fn append_notes_search_text(out: &mut String, notes: &RecordingNotes) {
 /// One presented library entry, resolved before any element is built so grouping, labelling, and
 /// filtering are testable without a window.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct RailRow {
     pub(crate) id: SessionId,
     pub(crate) title: String,
@@ -262,6 +329,7 @@ pub(crate) struct RailRow {
 ///
 /// Rows are named by [`recording_name`], so a renamed recording is grouped and labelled by the
 /// name its owner chose while still being findable by the one it was captured under.
+#[cfg(test)]
 pub(crate) fn group_rail(
     meetings: &[SessionSummary],
     selected: Option<SessionId>,
@@ -328,6 +396,8 @@ pub(crate) fn group_rail(
 /// control that disappears with the thing it filters is not a control a person can use to find
 /// something. `query` arrives already read from that field; the matching rule is unchanged and
 /// still spans titles *and* indexed bodies, which is [`group_rail`]'s job.
+#[cfg(test)]
+#[expect(dead_code, reason = "entry-era rail tests now exercise render_entries")]
 pub(crate) fn render(
     meetings: Vec<SessionSummary>,
     selected: Option<SessionId>,
@@ -398,6 +468,363 @@ pub(crate) fn render(
                         }))
                         .collect::<Vec<_>>()
                 })),
+        )
+        .into_any_element()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EntryRailRow {
+    pub(crate) id: EntryId,
+    pub(crate) title: String,
+    pub(crate) icon: &'static str,
+    pub(crate) meta: String,
+    pub(crate) live: bool,
+    pub(crate) selected: bool,
+}
+
+pub(crate) fn group_entry_rail(
+    entries: &[Entry],
+    meetings: &[SessionSummary],
+    selected: Option<EntryId>,
+    live: Option<SessionId>,
+    query: &str,
+    index: &BTreeMap<EntryId, String>,
+    now_unix_ms: u64,
+) -> Vec<(String, Vec<EntryRailRow>)> {
+    let needle = query.trim().to_lowercase();
+    let mut ordered = entries.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        let left_live = live.is_some_and(|id| left.session_ids().contains(&id));
+        let right_live = live.is_some_and(|id| right.session_ids().contains(&id));
+        right_live
+            .cmp(&left_live)
+            .then_with(|| right.created_at_unix_ms().cmp(&left.created_at_unix_ms()))
+            .then_with(|| right.id().cmp(&left.id()))
+    });
+    let mut groups: Vec<(String, Vec<EntryRailRow>)> = Vec::new();
+    for entry in ordered {
+        let title = entry_name(entry, meetings);
+        if !needle.is_empty()
+            && !title.to_lowercase().contains(&needle)
+            && !index
+                .get(&entry.id())
+                .is_some_and(|text| text.contains(&needle))
+        {
+            continue;
+        }
+        let is_live = live.is_some_and(|id| entry.session_ids().contains(&id));
+        let count = entry.session_ids().len();
+        let meta = if is_live {
+            "recording now".to_owned()
+        } else if count == 0 {
+            "prepared — not yet recorded".to_owned()
+        } else if count == 1 {
+            "1 recording".to_owned()
+        } else {
+            format!("{count} recordings")
+        };
+        let icon = entry
+            .session_ids()
+            .first()
+            .and_then(|id| meetings.iter().find(|meeting| meeting.id == *id))
+            .map_or(icons::CAPTURED, |meeting| {
+                if is_imported_capture_target(&meeting.capture_target) {
+                    icons::IMPORT
+                } else if meeting.capture_target.is_microphone_only() {
+                    icons::MICROPHONE
+                } else {
+                    icons::CAPTURED
+                }
+            });
+        let label = if is_live {
+            "Now".to_owned()
+        } else {
+            day_label(entry.created_at_unix_ms(), now_unix_ms)
+        };
+        let row = EntryRailRow {
+            id: entry.id(),
+            title,
+            icon,
+            meta,
+            live: is_live,
+            selected: selected == Some(entry.id()),
+        };
+        match groups.last_mut() {
+            Some((existing, rows)) if *existing == label => rows.push(row),
+            _ => groups.push((label, vec![row])),
+        }
+    }
+    groups
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the entry rail receives its already-resolved catalogue inputs explicitly"
+)]
+pub(crate) fn render_entries(
+    entries: Vec<Entry>,
+    meetings: Vec<SessionSummary>,
+    selected: Option<EntryId>,
+    live: Option<SessionId>,
+    query: &str,
+    index: &BTreeMap<EntryId, String>,
+    footprint: LibraryFootprint,
+    cx: &mut Context<MeetingWorkspace>,
+) -> AnyElement {
+    let tokens = WorkspaceTokens::resolve(cx);
+    let groups = group_entry_rail(
+        &entries,
+        &meetings,
+        selected,
+        live,
+        query,
+        index,
+        now_unix_ms(),
+    );
+    let filtering = !query.trim().is_empty();
+    div()
+        .debug_selector(|| "library-rail".into())
+        .size_full()
+        .min_w_0()
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .border_r_1()
+        .border_color(tokens.line)
+        .bg(tokens.ground)
+        .child(render_head(entries.len(), tokens))
+        .child(render_home_row(selected.is_none(), footprint, tokens, cx))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .px(px(6.0))
+                .pb(Space::MD)
+                .overflow_hidden()
+                .overflow_y_scrollbar()
+                .when(groups.is_empty(), |view| {
+                    view.child(
+                        div()
+                            .px(Space::SM)
+                            .py(Space::SM)
+                            .text_size(px(12.0))
+                            .text_color(tokens.muted)
+                            .child(if filtering {
+                                "Nothing here matches that search."
+                            } else {
+                                "No entries yet."
+                            }),
+                    )
+                })
+                .children(groups.into_iter().flat_map(|(label, rows)| {
+                    let heading = div()
+                        .px(Space::SM)
+                        .pt(px(10.0))
+                        .pb(Space::XS)
+                        .text_size(TypeScale::META)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(tokens.faint)
+                        .child(label.to_uppercase())
+                        .into_any_element();
+                    std::iter::once(heading)
+                        .chain(rows.into_iter().map(|row| {
+                            if renaming_entry(cx) == Some(row.id) {
+                                render_entry_rename_row(&row, tokens, cx)
+                            } else {
+                                render_entry_row(row, tokens, cx)
+                            }
+                        }))
+                        .collect::<Vec<_>>()
+                })),
+        )
+        .into_any_element()
+}
+
+fn render_entry_row(
+    row: EntryRailRow,
+    tokens: WorkspaceTokens,
+    cx: &mut Context<MeetingWorkspace>,
+) -> AnyElement {
+    let id = row.id;
+    let key = u64::try_from(id.get() & u128::from(u64::MAX)).unwrap_or(u64::MAX);
+    let selected = row.selected;
+    let rename = selected.then(|| entry_rename_control(id, key, row.title.clone(), cx));
+    let tooltip = row.title.clone();
+    div()
+        .debug_selector(|| "library-row".into())
+        .id(("library-entry-row", key))
+        .w_full()
+        .min_w_0()
+        .overflow_hidden()
+        .px(Space::SM)
+        .py(px(7.0))
+        .rounded(px(8.0))
+        .cursor_pointer()
+        .when(selected, |view| view.bg(tokens.accent_wash))
+        .when(!selected, |view| {
+            view.hover(move |view| view.bg(tokens.surface_2))
+        })
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .on_click(cx.listener(move |this, _, _, cx| this.select_entry(id, cx)))
+        .child(rail_face(
+            RailFace {
+                icon: row.icon,
+                title: row.title,
+                title_selector: "session-rail-title",
+                meta: row.meta,
+                meta_color: if row.live { tokens.live } else { tokens.faint },
+                selected,
+                trailing: rename,
+            },
+            tokens,
+        ))
+        .into_any_element()
+}
+
+struct EntryRenameEditor {
+    entry: EntryId,
+    input: Entity<InputState>,
+    _subscription: Subscription,
+}
+
+#[derive(Default)]
+struct EntryRailRename(Option<EntryRenameEditor>);
+
+impl Global for EntryRailRename {}
+
+fn renaming_entry(cx: &Context<MeetingWorkspace>) -> Option<EntryId> {
+    cx.try_global::<EntryRailRename>()
+        .and_then(|state| state.0.as_ref())
+        .map(|editor| editor.entry)
+}
+
+fn entry_rename_control(
+    entry: EntryId,
+    key: u64,
+    current: String,
+    cx: &mut Context<MeetingWorkspace>,
+) -> AnyElement {
+    div()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(
+            Button::new(("rename-entry", key))
+                .label("Rename")
+                .ghost()
+                .xsmall()
+                .tooltip("Rename this entry")
+                .debug_selector(|| "rail-rename".into())
+                .on_click(cx.listener(move |_, _, window, cx| {
+                    begin_entry_rename(entry, current.clone(), window, cx);
+                })),
+        )
+        .into_any_element()
+}
+
+fn begin_entry_rename(
+    entry: EntryId,
+    current: String,
+    window: &mut Window,
+    cx: &mut Context<MeetingWorkspace>,
+) {
+    let input = cx.new(|cx| InputState::new(window, cx).placeholder("Name this entry"));
+    input.update(cx, |state, cx| {
+        state.set_value(current, window, cx);
+        state.focus(window, cx);
+    });
+    let subscription = cx.subscribe_in(
+        &input,
+        window,
+        |this: &mut MeetingWorkspace, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                commit_entry_rename(this, cx);
+            }
+        },
+    );
+    cx.set_global(EntryRailRename(Some(EntryRenameEditor {
+        entry,
+        input: input.clone(),
+        _subscription: subscription,
+    })));
+    #[cfg(test)]
+    cx.set_global(RailRename(Some(RenameEditor {
+        session: SessionId::new(entry.get()),
+        input,
+        _subscription: None,
+    })));
+    cx.notify();
+}
+
+fn commit_entry_rename(workspace: &mut MeetingWorkspace, cx: &mut Context<MeetingWorkspace>) {
+    let Some((entry_id, value)) = cx
+        .try_global::<EntryRailRename>()
+        .and_then(|state| state.0.as_ref())
+        .map(|editor| (editor.entry, editor.input.read(cx).value().to_string()))
+    else {
+        return;
+    };
+    let title = RecordingTitle::new(&value);
+    let result = crate::persistence_runtime::block_on(async {
+        Store::open(&workspace.database)
+            .await?
+            .set_entry_title(entry_id, title.as_ref())
+            .await
+    });
+    cx.set_global(EntryRailRename::default());
+    #[cfg(test)]
+    cx.set_global(RailRename::default());
+    workspace.message = result
+        .err()
+        .map(|error| format!("Could not rename this entry: {error}"));
+    workspace.rebuild_library_index(cx);
+    workspace.sync_ask_scope(
+        workspace
+            .reasoning_backend(cx)
+            .is_ok_and(|backend| backend.is_some()),
+        cx,
+    );
+    cx.notify();
+}
+
+fn render_entry_rename_row(
+    row: &EntryRailRow,
+    tokens: WorkspaceTokens,
+    cx: &mut Context<MeetingWorkspace>,
+) -> AnyElement {
+    let Some(input) = cx
+        .try_global::<EntryRailRename>()
+        .and_then(|state| state.0.as_ref())
+        .map(|editor| editor.input.clone())
+    else {
+        return render_entry_row(row.clone(), tokens, cx);
+    };
+    div()
+        .debug_selector(|| "library-row".into())
+        .w_full()
+        .px(Space::SM)
+        .py(px(7.0))
+        .rounded(px(8.0))
+        .bg(tokens.accent_wash)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_key_down(cx.listener(|_, event: &gpui::KeyDownEvent, _, cx| {
+            if event.keystroke.key.as_str() == "escape" {
+                cx.set_global(EntryRailRename::default());
+                #[cfg(test)]
+                cx.set_global(RailRename::default());
+                cx.notify();
+            }
+        }))
+        .child(
+            div()
+                .debug_selector(|| "rail-rename-input".into())
+                .child(Input::new(&input).xsmall()),
+        )
+        .child(
+            div()
+                .mt(px(3.0))
+                .text_size(TypeScale::META)
+                .text_color(tokens.faint)
+                .child("Return saves · empty restores the captured name"),
         )
         .into_any_element()
 }
@@ -559,6 +986,11 @@ fn render_home_row(
         .into_any_element()
 }
 
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "kept only for the recording-era comparison fixture"
+)]
 fn render_row(
     row: RailRow,
     tokens: WorkspaceTokens,
@@ -602,6 +1034,11 @@ fn render_row(
 
 /// A stable element key for one session. Element ids take a `u64`; session ids are `u128`
 /// nanosecond stamps, so the low half is taken rather than the value truncated arbitrarily.
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "kept only for the recording-era comparison fixture"
+)]
 fn row_key(id: SessionId) -> u64 {
     u64::try_from(id.get() & u128::from(u64::MAX)).unwrap_or(u64::MAX)
 }
@@ -612,6 +1049,11 @@ fn row_key(id: SessionId) -> u64 {
 /// rail is the product's navigation and visual calm is a hard requirement, so a control on all
 /// forty rows would be forty controls nobody asked for. The row a person has selected is the one
 /// they are reading the name of when they decide it is wrong.
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "entry rename supersedes the recording-era comparison helper"
+)]
 fn rename_control(
     id: SessionId,
     key: u64,
@@ -640,23 +1082,36 @@ fn rename_control(
 /// The editor is a [`Global`] because the rail is rendered from a catalogue and a `Context`, and
 /// has no field of its own to hold a live text input in. It holds the subscription too, so
 /// finishing a rename drops the input, its listener, and the editor in one move.
+#[cfg(test)]
 struct RenameEditor {
     session: SessionId,
     input: Entity<InputState>,
-    _subscription: Subscription,
+    _subscription: Option<Subscription>,
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct RailRename(Option<RenameEditor>);
 
+#[cfg(test)]
 impl Global for RailRename {}
 
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "entry rename supersedes the recording-era comparison helper"
+)]
 fn renaming_session(cx: &Context<MeetingWorkspace>) -> Option<SessionId> {
     cx.try_global::<RailRename>()
         .and_then(|state| state.0.as_ref())
         .map(|editor| editor.session)
 }
 
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "entry rename supersedes the recording-era comparison helper"
+)]
 fn rename_input(cx: &Context<MeetingWorkspace>) -> Option<Entity<InputState>> {
     cx.try_global::<RailRename>()
         .and_then(|state| state.0.as_ref())
@@ -668,6 +1123,11 @@ fn rename_input(cx: &Context<MeetingWorkspace>) -> Option<Entity<InputState>> {
 /// Seeding with the *displayed* name — not with an empty field — means a person editing a captured
 /// window title starts from it rather than retyping it, and re-opening a rename shows what they
 /// chose last time.
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "entry rename supersedes the recording-era comparison helper"
+)]
 fn begin_rename(
     id: SessionId,
     current: String,
@@ -695,12 +1155,17 @@ fn begin_rename(
     cx.set_global(RailRename(Some(RenameEditor {
         session: id,
         input,
-        _subscription: subscription,
+        _subscription: Some(subscription),
     })));
     cx.notify();
 }
 
 /// Closes the editor without writing anything.
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "entry rename supersedes the recording-era comparison helper"
+)]
 fn cancel_rename(cx: &mut Context<MeetingWorkspace>) {
     cx.set_global(RailRename::default());
     cx.notify();
@@ -715,6 +1180,11 @@ fn cancel_rename(cx: &mut Context<MeetingWorkspace>) {
 /// Nothing about the capture target is written here. The entry that owns this recording is the
 /// only titled object (T086/ADR-0021); renaming a row resolves that entry and writes its title,
 /// never a row that records what was captured.
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "entry rename supersedes the recording-era comparison helper"
+)]
 fn commit_rename(workspace: &mut MeetingWorkspace, cx: &mut Context<MeetingWorkspace>) {
     let Some((id, value)) = cx
         .try_global::<RailRename>()
@@ -754,6 +1224,11 @@ fn commit_rename(workspace: &mut MeetingWorkspace, cx: &mut Context<MeetingWorks
 }
 
 /// The open rename, rendered in the row's own place so the name is edited where it is read.
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "entry rename supersedes the recording-era comparison helper"
+)]
 fn render_rename_row(
     row: &RailRow,
     tokens: WorkspaceTokens,
@@ -861,9 +1336,7 @@ impl StartChoice {
     fn begin(self, workspace: &mut MeetingWorkspace, cx: &mut Context<MeetingWorkspace>) {
         match self {
             Self::CaptureApp => workspace.start_scoped_session(cx),
-            Self::Microphone => workspace
-                .session
-                .update(cx, SessionController::start_microphone_only),
+            Self::Microphone => workspace.start_microphone_session(cx),
             Self::Import => begin_import(workspace, cx),
         }
     }
@@ -920,15 +1393,28 @@ fn begin_import(workspace: &mut MeetingWorkspace, cx: &mut Context<MeetingWorksp
 /// `recording_in_flight` is the *lifecycle* answer, not the stage's: a person can stand on Home
 /// while a capture runs, so the surface says so and points at the two things that still matter —
 /// Stop in the bar above, and the running recording in the rail under `Now`.
+pub(crate) struct StartChoicesState {
+    pub(crate) can_start: bool,
+    pub(crate) recording_in_flight: bool,
+    pub(crate) footprint: LibraryFootprint,
+    pub(crate) selected_model: asr::ModelSize,
+    pub(crate) model_availability: ModelAvailability,
+    pub(crate) transcription_unavailability: Option<String>,
+}
+
 pub(crate) fn render_start_choices(
-    can_start: bool,
-    recording_in_flight: bool,
-    footprint: LibraryFootprint,
-    selected_model: asr::ModelSize,
-    model_availability: ModelAvailability,
-    transcription_unavailability: Option<String>,
+    state: StartChoicesState,
+    entry_title: &Entity<InputState>,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
+    let StartChoicesState {
+        can_start,
+        recording_in_flight,
+        footprint,
+        selected_model,
+        model_availability,
+        transcription_unavailability,
+    } = state;
     let tokens = WorkspaceTokens::resolve(cx);
     let show_model_setup = matches!(
         model_availability,
@@ -958,7 +1444,7 @@ pub(crate) fn render_start_choices(
                         .text_size(px(19.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(tokens.ink)
-                        .child("Record anything you can hear."),
+                        .child("Start with an entry."),
                 )
                 .child(
                     div()
@@ -967,9 +1453,31 @@ pub(crate) fn render_start_choices(
                         .text_size(px(13.0))
                         .text_color(tokens.muted)
                         .child(
-                            "An app on screen, just your voice, or a file you already have. Sotto \
-                             keeps the recording on this Mac, transcribes it here, and writes a \
-                             summary you can check line by line.",
+                            "Prepare before a call, capture straight into a new entry, or import a \
+                             file. Each entry keeps its recordings and one notes document on this \
+                             Mac.",
+                        ),
+                )
+                .child(
+                    div()
+                        .mb(px(14.0))
+                        .p(px(12.0))
+                        .rounded(px(10.0))
+                        .border_1()
+                        .border_color(tokens.line)
+                        .bg(tokens.surface)
+                        .debug_selector(|| "prepare-entry-card".into())
+                        .child(Input::new(entry_title).small())
+                        .child(
+                            div().mt(Space::SM).child(
+                                Button::new("prepare-entry")
+                                    .label("Prepare an entry")
+                                    .primary()
+                                    .with_size(gpui_component::Size::Small)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.create_prepared_entry(window, cx);
+                                    })),
+                            ),
                         ),
                 )
                 .when(recording_in_flight, |view| {
@@ -1252,6 +1760,7 @@ pub(crate) fn recording_name(meeting: &SessionSummary) -> String {
         .map_or_else(|| target_title(meeting), RecordingTitle::to_string)
 }
 
+#[cfg(test)]
 fn row_meta(meeting: &SessionSummary, live: bool) -> String {
     if live {
         return "recording".to_owned();
@@ -1274,6 +1783,7 @@ fn row_meta(meeting: &SessionSummary, live: bool) -> String {
     )
 }
 
+#[cfg(test)]
 fn format_duration(started_at_unix_ms: u64, ended_at_unix_ms: u64) -> String {
     let seconds = ended_at_unix_ms.saturating_sub(started_at_unix_ms) / 1_000;
     let (hours, minutes, remainder) = (seconds / 3_600, (seconds % 3_600) / 60, seconds % 60);
@@ -1723,35 +2233,37 @@ mod tests {
     fn home_states_the_measured_footprint_and_nothing_else() {
         assert_eq!(
             LibraryFootprint::default().claim(),
-            "No recordings yet — Sotto is storing nothing on this Mac.",
+            "No entries yet — Sotto is storing nothing on this Mac.",
             "an empty library says it is storing nothing rather than showing 0 B"
         );
         let transcripts_only = LibraryFootprint {
+            entries: 3,
             recordings: 3,
             retained_bytes: 0,
         };
         assert_eq!(
             transcripts_only.claim(),
-            "3 recordings · no retained media — all on this Mac.",
+            "3 entries · 3 recordings · no retained media — all on this Mac.",
             "recordings whose media is gone must say so, not report zero bytes"
         );
         assert_eq!(
             transcripts_only.meta(),
-            "3 recordings · no retained media",
+            "3 entries · no retained media",
             "the rail entry carries the same truth in fewer words"
         );
         let retained = LibraryFootprint {
+            entries: 1,
             recordings: 1,
             retained_bytes: 2_100_000_000,
         };
         assert_eq!(
             retained.claim(),
-            "1 recording · 2.1 GB retained — all on this Mac.",
+            "1 entry · 1 recording · 2.1 GB retained — all on this Mac.",
             "one recording is singular and its size is the shell's own byte formatting"
         );
         assert_eq!(
             retained.meta(),
-            "1 recording · 2.1 GB",
+            "1 entry · 2.1 GB",
             "the rail entry drops the claim's tail, never its numbers"
         );
     }

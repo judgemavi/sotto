@@ -1,6 +1,6 @@
 # T089 — The workspace speaks in entries
 
-**Status:** todo
+**Status:** in-review
 
 **Wave:** N8 — entry workspace
 
@@ -83,3 +83,41 @@ below the entry, recordings stay recordings.
 
 The notes document mechanics (T087), the vault (T088), the brief (T090), series pages beyond
 showing an entry's series chip, and any capture-pipeline change.
+
+## Notes
+
+Implementation pass, 2026-08-16: the library rail now loads and groups entries, distinguishes a
+prepared entry from a failed/empty recording, carries Home/search/rename/footprint/Now behavior
+over the entry model, and searches entry titles, captured names, transcripts, generated notes, and
+user overlay text. Home can create and enter a named prepared entry. Prep notes append only T087
+user-layer overlay operations against an empty base document; they do not synthesize a generated
+artifact.
+
+Capture start now accepts an optional entry id and persists the session with
+`save_session_in_entry`; Home retains T086's implicit-entry path. Entry pages retain one notes
+document while a multi-recording strip switches the per-session transcript. Record again, delete
+one recording while preserving its entry, delete the whole entry with explicit consequences, and
+entry-wide Ask scope are wired. Launch remains Home, capture completion opens its entry, deleting
+the entry returns Home, `open_sotto_link` remains on the citation-reveal path, and the
+`Root -> KeyboardRoot -> MeetingWorkspace` lookup is unchanged.
+
+Automated evidence, 2026-08-16:
+
+- Mounted minimum-width prepared-entry and two-recording-entry tests cover prep notes, the record
+  control, distinct transcript tabs, the single notes document, and delete-one-keeps-entry.
+- Separate mounted destructive-control tests click the real entry-delete and recording-delete
+  controls. Entry deletion removes the entry and both attached sessions; recording deletion keeps
+  the entry and its other session. These tests use fresh mounted roots so stale `debug_bounds`
+  cannot satisfy either assertion.
+- Mounted regressions also prove a prepared-note search result opens the correct entry, Record
+  again passes that entry id into the pending picker request, and This entry Ask contains both
+  attached session ids.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test -p app --lib --locked -q` — 272 passed,
+  4 ignored.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test --workspace --locked -q` — passed in the approved
+  environment, including the loopback tests.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo clippy --workspace --all-targets --all-features --locked
+  -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` — passed.
+
+The task is in review pending owner inspection against the v3 mock; no signed-app or browser gate
+was claimed by this implementation pass.

@@ -36,7 +36,7 @@ use gpui_component::{
     input::{Input, InputState},
 };
 use rag::SessionSummary;
-use sotto_core::TargetKind;
+use sotto_core::{Entry, TargetKind};
 
 use crate::notes::NotesState;
 use crate::session::SessionLifecycle;
@@ -91,6 +91,8 @@ enum Stage {
     /// library already holds. Reached at launch and from the rail's Home entry, which is the only
     /// thing that clears `transcript_session` outside teardown.
     Home,
+    /// An entry exists and can hold prep notes before any recording is attached.
+    Prepared,
     /// A recording runs: transcript and notes sit side by side.
     Recording,
     /// A stopped session is open: one tabbed stage, Notes leading.
@@ -123,6 +125,18 @@ impl Render for MeetingWorkspace {
             .iter()
             .find(|session| Some(session.id) == self.transcript_session)
             .cloned();
+        let selected_entry = self
+            .selected_entry
+            .and_then(|id| self.entries.iter().find(|entry| entry.id() == id))
+            .cloned();
+        let entry_sessions = selected_entry.as_ref().map_or_else(Vec::new, |entry| {
+            entry
+                .session_ids()
+                .iter()
+                .filter_map(|id| snapshot.meetings.iter().find(|meeting| meeting.id == *id))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
         let lifecycle = self.session.read(cx).lifecycle().clone();
         let session = self.session.read(cx);
         let transcription_unavailability = session.transcription_unavailability();
@@ -133,7 +147,12 @@ impl Render for MeetingWorkspace {
         let library_query = self.library_filter.read(cx).value().to_string();
         let stage = if transcript_live {
             Stage::Recording
-        } else if open_session.is_some() {
+        } else if selected_entry
+            .as_ref()
+            .is_some_and(|entry| entry.session_ids().is_empty())
+        {
+            Stage::Prepared
+        } else if selected_entry.is_some() && open_session.is_some() {
             Stage::Review
         } else {
             Stage::Home
@@ -151,12 +170,23 @@ impl Render for MeetingWorkspace {
 
         let start_choices = if stage == Stage::Home {
             library::render_start_choices(
+                library::StartChoicesState {
+                    can_start,
+                    recording_in_flight: lifecycle.requires_visible_control(),
+                    footprint: self.library_footprint,
+                    selected_model: transcription_model.selected(),
+                    model_availability: transcription_model.availability().clone(),
+                    transcription_unavailability: transcription_home_reason,
+                },
+                &self.entry_title_input,
+                cx,
+            )
+        } else if stage == Stage::Prepared {
+            render_prepared_entry(
+                &self.prepared_notes,
+                &self.annotation_input,
                 can_start,
-                lifecycle.requires_visible_control(),
-                self.library_footprint,
-                transcription_model.selected(),
-                transcription_model.availability().clone(),
-                transcription_home_reason,
+                tokens,
                 cx,
             )
         } else {
@@ -240,10 +270,12 @@ impl Render for MeetingWorkspace {
                 ))
             })
             .when_some(
-                open_session.filter(|_| stage == Stage::Review),
-                |view, session| {
-                    view.child(render_view_bar(
-                        &session,
+                selected_entry.filter(|_| stage == Stage::Review || stage == Stage::Prepared),
+                |view, entry| {
+                    view.child(render_entry_view_bar(
+                        &entry,
+                        &snapshot.meetings,
+                        open_session.as_ref(),
                         self.open_recording.as_ref(),
                         self.stage_tab,
                         live.is_some(),
@@ -255,6 +287,14 @@ impl Render for MeetingWorkspace {
                     ))
                 },
             )
+            .when(entry_sessions.len() > 1 && stage == Stage::Review, |view| {
+                view.child(render_sessions_strip(
+                    &entry_sessions,
+                    self.transcript_session,
+                    tokens,
+                    cx,
+                ))
+            })
             .child(
                 div()
                     .flex_1()
@@ -277,12 +317,13 @@ impl Render for MeetingWorkspace {
                                 .border_r_1()
                                 .border_color(tokens.line)
                                 .debug_selector(|| "library-rail".into())
-                                .child(library::render(
+                                .child(library::render_entries(
+                                    self.entries.clone(),
                                     snapshot.meetings,
-                                    self.transcript_session,
+                                    self.selected_entry,
                                     live,
                                     &library_query,
-                                    &self.library_index,
+                                    &self.entry_library_index,
                                     self.library_footprint,
                                     cx,
                                 )),
@@ -478,7 +519,7 @@ fn render_stage(
     match stage {
         // Nothing is open, so the stage is Home: the three equally weighted ways a recording
         // begins and what the library already holds, not an empty transcript.
-        Stage::Home => stage_root.flex().child(
+        Stage::Home | Stage::Prepared => stage_root.flex().child(
             div()
                 .h_full()
                 .flex_1()
@@ -656,9 +697,255 @@ fn render_capture_bar(
         .into_any_element()
 }
 
+fn render_prepared_entry(
+    notes: &[String],
+    input: &Entity<InputState>,
+    can_start: bool,
+    tokens: WorkspaceTokens,
+    cx: &mut Context<MeetingWorkspace>,
+) -> AnyElement {
+    div()
+        .size_full()
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .p(px(24.0))
+        .bg(tokens.surface)
+        .debug_selector(|| "prepared-entry".into())
+        .child(
+            div()
+                .text_size(px(19.0))
+                .font_weight(gpui::FontWeight::BOLD)
+                .child("Prepared — no recording yet"),
+        )
+        .child(
+            div()
+                .mt(Space::XS)
+                .text_size(px(12.5))
+                .text_color(tokens.muted)
+                .child(
+                    "Write prep here now. The recording lands on this same entry when you start.",
+                ),
+        )
+        .children(notes.iter().map(|note| {
+            div()
+                .mt(Space::MD)
+                .p(Space::MD)
+                .rounded(px(8.0))
+                .bg(tokens.sunken)
+                .text_size(TypeScale::BODY)
+                .debug_selector(|| "prepared-note-block".into())
+                .child(note.clone())
+        }))
+        .child(
+            div()
+                .mt(Space::LG)
+                .debug_selector(|| "prepared-note-input".into())
+                .child(Input::new(input)),
+        )
+        .child(
+            div()
+                .mt(Space::SM)
+                .flex()
+                .gap(Space::SM)
+                .child(
+                    Button::new("save-prep-note")
+                        .label("Save prep note")
+                        .with_size(Size::Small)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.submit_prepared_note(window, cx);
+                        })),
+                )
+                .child(
+                    div().debug_selector(|| "record-into-entry".into()).child(
+                        Button::new("record-into-entry-button")
+                            .label("Record into this entry")
+                            .primary()
+                            .with_size(Size::Small)
+                            .disabled(!can_start)
+                            .on_click(cx.listener(|this, _, _, cx| this.start_scoped_session(cx))),
+                    ),
+                ),
+        )
+        .into_any_element()
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the entry bar receives resolved entry and selected-recording facts explicitly"
+)]
+fn render_entry_view_bar(
+    entry: &Entry,
+    meetings: &[SessionSummary],
+    session: Option<&SessionSummary>,
+    recording: Option<&OpenRecording>,
+    tab: StageTab,
+    live_elsewhere: bool,
+    retranscribing: bool,
+    transcription_unavailability: Option<String>,
+    width: Pixels,
+    tokens: WorkspaceTokens,
+    cx: &mut Context<MeetingWorkspace>,
+) -> AnyElement {
+    let count = entry.session_ids().len();
+    let meta = if count == 0 {
+        "no recording yet".to_owned()
+    } else if count == 1 {
+        "1 recording".to_owned()
+    } else {
+        format!("{count} recordings")
+    };
+    let retranscription_unavailable = transcription_unavailability.is_some();
+    ControlRow::for_width(width)
+        .child(
+            ControlRole::Ellipsizing,
+            div()
+                .text_size(TypeScale::TITLE)
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .debug_selector(|| "view-title".into())
+                .child(library::entry_name(entry, meetings)),
+        )
+        .child(
+            ControlRole::Essential,
+            div()
+                .font_family("Menlo")
+                .text_size(TypeScale::META)
+                .text_color(tokens.faint)
+                .debug_selector(|| "view-meta".into())
+                .child(meta),
+        )
+        .spacer()
+        .child_when(session.is_some(), ControlRole::Essential, || {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .p(px(2.0))
+                .rounded_md()
+                .bg(tokens.sunken)
+                .border_1()
+                .border_color(tokens.line_soft)
+                .debug_selector(|| "view-tabs".into())
+                .child(stage_tab_button(StageTab::Notes, tab, tokens, cx))
+                .child(stage_tab_button(StageTab::Transcript, tab, tokens, cx))
+                .into_any_element()
+        })
+        .child_when(live_elsewhere, ControlRole::Expendable, || {
+            Button::new("back-to-live")
+                .label("Back to recording")
+                .with_size(Size::Small)
+                .on_click(cx.listener(|this, _, _, cx| this.return_to_live(cx)))
+                .into_any_element()
+        })
+        .child(
+            ControlRole::Essential,
+            div().debug_selector(|| "record-again".into()).child(
+                Button::new("record-again-button")
+                    .label(if count == 0 { "Record" } else { "Record again" })
+                    .with_size(Size::Small)
+                    .on_click(cx.listener(|this, _, _, cx| this.start_scoped_session(cx))),
+            ),
+        )
+        .child_when(session.is_some(), ControlRole::Expendable, || {
+            Button::new("retranscribe-session")
+                .label(retranscription_label(
+                    retranscribing,
+                    retranscription_unavailable,
+                ))
+                .with_size(Size::Small)
+                .disabled(retranscribing || transcription_unavailability.is_some())
+                .when_some(transcription_unavailability, |button, reason| {
+                    button.tooltip(reason)
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.retranscribe_selected(cx)))
+                .into_any_element()
+        })
+        .child_when(session.is_some(), ControlRole::Expendable, || {
+            Button::new("reveal-recording")
+                .label("Reveal")
+                .tooltip("Show this recording in Finder")
+                .with_size(Size::Small)
+                .disabled(recording.is_none_or(|value| value.path.is_none()))
+                .on_click(cx.listener(|this, _, _, cx| this.reveal_open_recording(cx)))
+                .into_any_element()
+        })
+        .child(
+            ControlRole::Essential,
+            div().debug_selector(|| "view-delete-control".into()).child(
+                delete_icon_button("delete-entry", "this entry").on_click(
+                    cx.listener(|this, _, window, cx| this.delete_open_entry(window, cx)),
+                ),
+            ),
+        )
+        .finish()
+        .w_full()
+        .min_w(MIN_WORKSPACE_WIDTH)
+        .flex_none()
+        .gap(Space::MD)
+        .px(Space::MD)
+        .py(Space::SM)
+        .min_h(px(46.0))
+        .bg(tokens.surface)
+        .border_b_1()
+        .border_color(tokens.line)
+        .debug_selector(|| "view-bar".into())
+        .into_any_element()
+}
+
+fn render_sessions_strip(
+    sessions: &[SessionSummary],
+    selected: Option<sotto_core::SessionId>,
+    tokens: WorkspaceTokens,
+    cx: &mut Context<MeetingWorkspace>,
+) -> AnyElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(Space::XS)
+        .px(Space::MD)
+        .py(Space::XS)
+        .bg(tokens.sunken)
+        .border_b_1()
+        .border_color(tokens.line)
+        .debug_selector(|| "entry-sessions-strip".into())
+        .children(sessions.iter().enumerate().map(|(index, session)| {
+            let id = session.id;
+            Button::new(("entry-recording-tab", index))
+                .label(format!(
+                    "Recording {} · {}",
+                    index + 1,
+                    view_meta(session, None)
+                ))
+                .ghost()
+                .selected(selected == Some(id))
+                .with_size(Size::Small)
+                .on_click(cx.listener(move |this, _, _, cx| this.select_meeting(id, cx)))
+        }))
+        .child(
+            div()
+                .debug_selector(|| "entry-delete-recording-control".into())
+                .child(
+                    Button::new("delete-selected-recording")
+                        .label("Delete recording…")
+                        .ghost()
+                        .with_size(Size::Small)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.delete_open_session(window, cx);
+                        })),
+                ),
+        )
+        .into_any_element()
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the view bar's inputs stay explicit rather than reaching back into the workspace"
+)]
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "legacy session-bar tests retain this comparison helper during T089"
 )]
 fn render_view_bar(
     session: &SessionSummary,
@@ -916,6 +1203,7 @@ pub(super) fn format_bytes(bytes: u64) -> String {
     }
 }
 
+#[cfg(test)]
 fn format_wall_clock(unix_ms: u64) -> String {
     let timestamp = std::time::UNIX_EPOCH + Duration::from_millis(unix_ms);
     chrono::DateTime::<chrono::Local>::from(timestamp)
@@ -961,8 +1249,8 @@ mod tests {
     use rag::{SessionSummary, Store};
     use secrecy::SecretString;
     use sotto_core::{
-        CaptureTarget, EventPayload, Session, SessionId, Source, TargetKind, TimelineBuilder,
-        Utterance,
+        CaptureTarget, Entry, EntryId, EventPayload, Session, SessionId, Source, TargetKind,
+        TimelineBuilder, Utterance,
     };
 
     use super::{
@@ -1555,6 +1843,190 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_prepared_entry_renders_notes_and_record_control_at_minimum_width()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("sotto.sqlite3");
+        let store = Store::open(&database).await?;
+        let entry_id = EntryId::new(700);
+        let title = sotto_core::types::RecordingTitle::new("Prepared security review")
+            .ok_or_else(|| std::io::Error::other("fixture title must be valid"))?;
+        store
+            .create_entry(&Entry::new(entry_id, 1_786_625_633_040, Some(title)))
+            .await?;
+        insight::append_notes_overlay_operation(
+            &store,
+            entry_id,
+            &insight::RecordingNotes::default(),
+            &insight::NotesOverlayOperation::Add {
+                user_block_id: "prep-one".to_owned(),
+                section: insight::RecordingNotesSectionKind::Overview,
+                text: "Confirm the threat-model owner".to_owned(),
+                action: false,
+                owner: None,
+                due_date: None,
+            },
+            1_786_625_633_041,
+        )
+        .await?;
+
+        let shell = mount(&mut cx, directory.path(), None, MIN_WORKSPACE_WIDTH)?;
+        let workspace = shell.workspace;
+        let visual = shell.visual;
+        visual.update(|_, cx| workspace.update(cx, |this, cx| this.select_entry(entry_id, cx)));
+        visual.refresh()?;
+        visual.run_until_parked();
+
+        let stage = visual
+            .debug_bounds("prepared-entry")
+            .ok_or_else(|| std::io::Error::other("prepared entry must render"))?;
+        for selector in ["prepared-note-block", "record-into-entry"] {
+            let bounds = visual
+                .debug_bounds(selector)
+                .ok_or_else(|| std::io::Error::other(format!("{selector} must render")))?;
+            assert!(
+                bounds.left() >= stage.left() && bounds.right() <= stage.right(),
+                "{selector} must stay inside the prepared entry at minimum width"
+            );
+        }
+        assert!(visual.debug_bounds("stage-transcript").is_none());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_two_recording_entry_keeps_one_entry_and_two_distinct_transcript_tabs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("sotto.sqlite3");
+        let entry_id = EntryId::new(701);
+        let first = SessionId::new(711);
+        let second = SessionId::new(712);
+        persist_two_recording_entry(&database, entry_id, first, second).await?;
+
+        let shell = mount(&mut cx, directory.path(), None, MIN_WORKSPACE_WIDTH)?;
+        let workspace = shell.workspace;
+        let visual = shell.visual;
+        visual.update(|_, cx| workspace.update(cx, |this, cx| this.select_entry(entry_id, cx)));
+        visual.refresh()?;
+        visual.run_until_parked();
+
+        assert!(visual.debug_bounds("entry-sessions-strip").is_some());
+        assert!(visual.debug_bounds("record-again").is_some());
+        assert_eq!(
+            visual.update(|_, cx| workspace.read(cx).transcript_session),
+            Some(second),
+            "the newest recording opens without splicing its media clock to the first"
+        );
+        visual.update(|_, cx| workspace.update(cx, |this, cx| this.select_meeting(first, cx)));
+        assert_eq!(
+            visual.update(|_, cx| workspace.read(cx).transcript_session),
+            Some(first)
+        );
+        assert_eq!(
+            visual.update(|_, cx| workspace.read(cx).selected_entry),
+            Some(entry_id),
+            "switching recordings must not leave the entry"
+        );
+        let prompt =
+            visual.update(|_, cx| workspace.update(cx, |this, cx| this.delete_prompt(first, cx)));
+        assert!(
+            prompt.contains("the entry, its other recordings and its notes stay"),
+            "single-recording deletion must state what the entry keeps"
+        );
+        visual.update(|_, cx| {
+            workspace.update(cx, |this, cx| this.confirm_delete_session(first, cx));
+        });
+        let reopened = Store::open(&database).await?;
+        let remaining = reopened.list_entries().await?;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].session_ids(), &[second]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mounted_record_again_control_targets_the_open_entry_before_picker_completion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("sotto.sqlite3");
+        let entry_id = EntryId::new(721);
+        persist_two_recording_entry(
+            &database,
+            entry_id,
+            SessionId::new(722),
+            SessionId::new(723),
+        )
+        .await?;
+        let shell = mount(&mut cx, directory.path(), None, WIDE_WORKSPACE_WIDTH)?;
+        let workspace = shell.workspace;
+        let session = shell.session;
+        let visual = shell.visual;
+        visual.update(|_, cx| {
+            workspace.update(cx, |this, cx| this.select_entry(entry_id, cx));
+            session.update(cx, |session, _| {
+                session.set_transcription_availability_for_test(
+                    crate::session::ModelAvailability::Ready("/tmp/model.bin".into()),
+                );
+            });
+        });
+        visual.refresh()?;
+        visual.run_until_parked();
+
+        let record_again = visual
+            .debug_bounds("record-again")
+            .ok_or_else(|| std::io::Error::other("Record again must render"))?;
+        visual.simulate_click(record_again.center(), Modifiers::none());
+        assert_eq!(
+            visual.update(|_, cx| session.read(cx).pending_entry_for_test()),
+            Some(entry_id),
+            "the real Record again control must scope the pending picker result to this entry"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mounted_this_entry_ask_scope_contains_every_attached_recording()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("sotto.sqlite3");
+        let entry_id = EntryId::new(731);
+        let first = SessionId::new(732);
+        let second = SessionId::new(733);
+        persist_two_recording_entry(&database, entry_id, first, second).await?;
+        let app = mount_as_the_product_does(&mut cx, directory.path(), None, WIDE_WORKSPACE_WIDTH)?;
+        let workspace = app.workspace;
+        let visual = app.visual;
+        visual.update(|_, cx| workspace.update(cx, |this, cx| this.select_entry(entry_id, cx)));
+        visual.refresh()?;
+        visual.run_until_parked();
+
+        let ask_toggle = visual
+            .debug_bounds("toolbar-ask-toggle")
+            .ok_or_else(|| std::io::Error::other("Ask toggle must render"))?;
+        visual.simulate_click(ask_toggle.center(), Modifiers::none());
+        visual.refresh()?;
+        visual.run_until_parked();
+        let entry_scope = visual
+            .debug_bounds("ask-scope-entry-control")
+            .ok_or_else(|| std::io::Error::other("This entry Ask scope must render"))?;
+        visual.simulate_click(entry_scope.center(), Modifiers::none());
+
+        assert_eq!(
+            visual.update(|_, cx| { workspace.read(cx).ask_panel.read(cx).open_entry_sessions() }),
+            Some(vec![first, second]),
+            "the mounted This entry choice must carry every recording, not only the open tab"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn home_is_reachable_from_an_open_recording() -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
@@ -1734,7 +2206,7 @@ mod tests {
         );
         assert_eq!(
             measured.claim(),
-            "1 recording · no retained media — all on this Mac.",
+            "1 entry · 1 recording · no retained media — all on this Mac.",
             "Home must report what the store actually holds, never an invented figure"
         );
         Ok(())
@@ -2307,13 +2779,33 @@ mod tests {
             .is_ok_and(|events| !events.is_empty())
     }
 
-    /// Opens the view bar's trash control and returns the dialog's Cancel and OK bounds.
-    fn open_view_bar_delete_dialog(
+    async fn persist_two_recording_entry(
+        database: &std::path::Path,
+        entry_id: EntryId,
+        first: SessionId,
+        second: SessionId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let store = Store::open(database).await?;
+        let title = sotto_core::types::RecordingTitle::new("Dropped-call review")
+            .ok_or_else(|| std::io::Error::other("fixture title must be valid"))?;
+        store
+            .create_entry(&Entry::new(entry_id, 1_786_625_633_040, Some(title)))
+            .await?;
+        for (id, started) in [(first, 1_000_u64), (second, 3_000_u64)] {
+            let mut session = Session::new(id, CaptureTarget::microphone_only(), started);
+            session.end(started + 1_000);
+            store.save_session_in_entry(&session, entry_id).await?;
+        }
+        Ok(())
+    }
+
+    fn open_delete_dialog(
         visual: &mut VisualTestContext,
+        selector: &'static str,
     ) -> Result<(Bounds<gpui::Pixels>, Bounds<gpui::Pixels>), Box<dyn std::error::Error>> {
         let delete = visual
-            .debug_bounds("view-delete-control")
-            .ok_or_else(|| std::io::Error::other("the view bar must carry a delete control"))?;
+            .debug_bounds(selector)
+            .ok_or_else(|| std::io::Error::other(format!("{selector} must render")))?;
         visual.simulate_click(delete.center(), Modifiers::none());
         visual.refresh()?;
         visual.run_until_parked();
@@ -2324,6 +2816,13 @@ mod tests {
             .debug_bounds(CONFIRM_OK_SELECTOR)
             .ok_or_else(|| std::io::Error::other("a destructive confirmation must offer OK"))?;
         Ok((cancel, ok))
+    }
+
+    /// Opens the view bar's trash control and returns the dialog's Cancel and OK bounds.
+    fn open_view_bar_delete_dialog(
+        visual: &mut VisualTestContext,
+    ) -> Result<(Bounds<gpui::Pixels>, Bounds<gpui::Pixels>), Box<dyn std::error::Error>> {
+        open_delete_dialog(visual, "view-delete-control")
     }
 
     /// Delete is a glyph in the view bar, so the dialog it opens carries the whole target: which
@@ -2341,8 +2840,8 @@ mod tests {
 
         assert_eq!(
             visual.update(|_, cx| workspace.update(cx, |this, cx| this.delete_prompt(session_id, cx))),
-            "Delete “This is a persisted recording” and its 412 MB? This removes the recording, \
-             its transcript and its notes from this Mac.",
+            "Delete “This is a persisted recording” and its 412 MB? This removes the recording \
+             and transcript; its automatically created empty entry is removed too.",
             "the dialog must keep every word the armed state earned: the recording, its measured \
              size, and everything the deletion takes with it"
         );
@@ -2409,9 +2908,9 @@ mod tests {
         Ok(())
     }
 
-    /// Confirming removes the recording the dialog named — and only that one.
+    /// Confirming the entry-level control removes that single-recording entry and not a bystander.
     #[tokio::test(flavor = "multi_thread")]
-    async fn confirming_the_view_bar_dialog_deletes_only_that_recording()
+    async fn confirming_the_view_bar_dialog_deletes_only_that_entry()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
@@ -2431,16 +2930,105 @@ mod tests {
         );
         assert!(
             !session_survives(&database, session_id).await,
-            "confirming must delete the recording the dialog named"
+            "confirming must delete the single-recording entry the dialog named"
         );
         assert!(
             session_survives(&database, BYSTANDER_SESSION).await,
-            "confirming must delete exactly the recording named and nothing else"
+            "confirming must delete exactly the entry named and nothing else"
         );
         assert_eq!(
             visual.update(|_, cx| workspace.read(cx).transcript_session),
             None,
             "deleting what you were reading lands on Home rather than inside another recording"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mounted_entry_delete_control_removes_the_entry_and_both_recordings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("sotto.sqlite3");
+        let entry_id = EntryId::new(8_001);
+        let first = SessionId::new(8_011);
+        let second = SessionId::new(8_012);
+        persist_two_recording_entry(&database, entry_id, first, second).await?;
+        let app = mount_as_the_product_does(&mut cx, directory.path(), None, WIDE_WORKSPACE_WIDTH)?;
+        let workspace = app.workspace;
+        let visual = app.visual;
+        visual.update(|_, cx| workspace.update(cx, |this, cx| this.select_entry(entry_id, cx)));
+        visual.refresh()?;
+        visual.run_until_parked();
+
+        let (_, confirm) = open_delete_dialog(visual, "view-delete-control")?;
+        visual.simulate_click(confirm.center(), Modifiers::none());
+        visual.refresh()?;
+        visual.run_until_parked();
+
+        let store = Store::open(&database).await?;
+        assert!(
+            store.list_entries().await?.is_empty(),
+            "the entry control must invoke entry deletion"
+        );
+        let remaining = store.list_sessions().await?;
+        assert!(
+            remaining
+                .iter()
+                .all(|session| session.id != first && session.id != second),
+            "entry deletion must remove every recording attached to that entry"
+        );
+        assert_eq!(
+            visual.update(|_, cx| workspace.read(cx).selected_entry),
+            None,
+            "deleting the open entry must land Home"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mounted_recording_delete_control_keeps_the_entry_and_other_recording()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("sotto.sqlite3");
+        let entry_id = EntryId::new(8_101);
+        let first = SessionId::new(8_111);
+        let second = SessionId::new(8_112);
+        persist_two_recording_entry(&database, entry_id, first, second).await?;
+        let app = mount_as_the_product_does(&mut cx, directory.path(), None, WIDE_WORKSPACE_WIDTH)?;
+        let workspace = app.workspace;
+        let visual = app.visual;
+        visual.update(|_, cx| workspace.update(cx, |this, cx| this.select_entry(entry_id, cx)));
+        visual.refresh()?;
+        visual.run_until_parked();
+        assert_eq!(
+            visual.update(|_, cx| workspace.read(cx).transcript_session),
+            Some(second)
+        );
+
+        let (_, confirm) = open_delete_dialog(visual, "entry-delete-recording-control")?;
+        visual.simulate_click(confirm.center(), Modifiers::none());
+        visual.refresh()?;
+        visual.run_until_parked();
+
+        let store = Store::open(&database).await?;
+        let entries = store.list_entries().await?;
+        assert_eq!(entries.len(), 1, "recording deletion must keep its entry");
+        assert_eq!(
+            entries[0].session_ids(),
+            &[first],
+            "recording deletion must keep the other recording attached"
+        );
+        let remaining = store.list_sessions().await?;
+        assert!(remaining.iter().any(|session| session.id == first));
+        assert!(remaining.iter().all(|session| session.id != second));
+        assert_eq!(
+            visual.update(|_, cx| workspace.read(cx).selected_entry),
+            Some(entry_id),
+            "recording deletion must leave the person in the surviving entry"
         );
         Ok(())
     }
@@ -2754,12 +3342,35 @@ mod tests {
     /// Search moved to the toolbar because it used to live in the rail, and a search control that
     /// disappears with the list it filters is not one a person can use to find anything.
     #[tokio::test(flavor = "multi_thread")]
-    async fn toolbar_search_reaches_a_collapsed_library_and_still_matches_bodies()
+    async fn toolbar_search_reaches_a_collapsed_entry_rail_and_opens_the_note_match()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        persist_stopped_session(&dir.path().join("sotto.sqlite3"), 4).await?;
+        let database = dir.path().join("sotto.sqlite3");
+        persist_stopped_session(&database, 4).await?;
+        let store = Store::open(&database).await?;
+        let prepared = EntryId::new(9_001);
+        let title = sotto_core::types::RecordingTitle::new("Prepared audit")
+            .ok_or_else(|| std::io::Error::other("fixture title must be valid"))?;
+        store
+            .create_entry(&Entry::new(prepared, 1_786_625_633_050, Some(title)))
+            .await?;
+        insight::append_notes_overlay_operation(
+            &store,
+            prepared,
+            &insight::RecordingNotes::default(),
+            &insight::NotesOverlayOperation::Add {
+                user_block_id: "search-note".to_owned(),
+                section: insight::RecordingNotesSectionKind::Overview,
+                text: "Verify zirconium ownership".to_owned(),
+                action: false,
+                owner: None,
+                due_date: None,
+            },
+            1_786_625_633_051,
+        )
+        .await?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = shell.workspace;
         let visual = shell.visual;
@@ -2789,12 +3400,12 @@ mod tests {
             "the search field must keep real width, clear of the traffic lights"
         );
 
-        // "persisted final" appears only in the transcript rows, never in the recording's title,
-        // so a match on it can only have come from the indexed body.
+        // "zirconium" appears only in a prepared entry's user-layer note, so a match proves the
+        // entry index includes notes even before any recording exists.
         visual.update(|window, cx| {
             workspace.update(cx, |this, cx| {
                 this.library_filter.update(cx, |state, cx| {
-                    state.set_value("persisted final", window, cx);
+                    state.set_value("zirconium", window, cx);
                 });
             });
         });
@@ -2805,29 +3416,23 @@ mod tests {
             visual.update(|_, cx| !workspace.read(cx).library_collapsed),
             "typing a query must bring the rail back — results that land nowhere are no results"
         );
-        let (query, indexed_by_body, title) = visual.update(|_, cx| {
+        let (query, indexed_by_note) = visual.update(|_, cx| {
             let workspace = workspace.read(cx);
             (
                 workspace.library_filter.read(cx).value().to_string(),
                 workspace
-                    .library_index
-                    .values()
-                    .any(|text| text.contains("persisted final")),
-                workspace
-                    .library_index
-                    .keys()
-                    .next()
-                    .copied()
-                    .map(|id| id.get()),
+                    .entry_library_index
+                    .get(&prepared)
+                    .is_some_and(|text| text.contains("zirconium")),
             )
         });
         assert_eq!(
-            query, "persisted final",
+            query, "zirconium",
             "the rail is filtered by the toolbar field's own value"
         );
         assert!(
-            indexed_by_body && title.is_some(),
-            "the haystack must still hold what was said, not only the recording's title"
+            indexed_by_note,
+            "the entry haystack must include user notes, not only titles"
         );
         let stage = visual
             .debug_bounds("workspace-stage")
@@ -2835,6 +3440,15 @@ mod tests {
         assert!(
             stage.left() >= LIBRARY_WIDTH,
             "the restored rail must occupy its width again so the matches are visible"
+        );
+        let row = visual
+            .debug_bounds("library-row")
+            .ok_or_else(|| std::io::Error::other("the matching entry row must render"))?;
+        visual.simulate_click(row.center(), Modifiers::none());
+        assert_eq!(
+            visual.update(|_, cx| workspace.read(cx).selected_entry),
+            Some(prepared),
+            "the sole rendered search result must be the prepared entry whose note matched"
         );
         Ok(())
     }

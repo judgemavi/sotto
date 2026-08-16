@@ -206,6 +206,7 @@ dependencies = [
  "insight",
  "keyring",
  "mcp",
+ "notify",
  "objc2",
  "prosody",
  "providers",
