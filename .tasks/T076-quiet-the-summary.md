@@ -26,9 +26,16 @@ decision only. Do not touch the citation contract, and do not let a display togg
 to stop requiring evidence.
 
 Default to quiet. A claim should read as a sentence, with its evidence available on demand — a
-per-summary toggle that reveals every chip, and a compact affordance on each claim so a reader can
-check one line without revealing all of them. Keyboard and screen-reader users must still reach the
+per-summary toggle that reveals every chip. Keyboard and screen-reader users must still reach the
 evidence.
+
+**Amended 2026-08-15.** This originally also required "a compact affordance on each claim so a
+reader can check one line without revealing all of them", and that was built. On a real summary it
+worked against the task: a compact control under every claim is a line of chrome under every claim,
+so six claims meant six rows of `3 timecodes` and a column meant to read as prose read as a form.
+The per-claim path is removed; `Show timecodes` is the only one. The cost is accepted — evidence is
+all-or-nothing, and a reader checking one claim reveals every chip. The normative mock is unaffected:
+it asks that every claim carry a timecode, never how it is revealed.
 
 ### 2. The sources block explains a feature nobody is using
 
@@ -52,8 +59,8 @@ note text selectable. A note-taking product whose notes cannot be copied is fail
 
 ## Acceptance
 
-- A summary reads as prose at a glance; chips are hidden by default and revealed by an explicit
-  toggle, with a per-claim path to its own evidence.
+- A summary reads as prose at a glance; chips are hidden by default and revealed by one explicit
+  whole-summary toggle. There is deliberately no per-claim path — see the amendment above.
 - Every revealed chip still resolves to the row it cites.
 - Validation is untouched: an unsupported claim still fails closed, asserted by test.
 - With no sources configured the block is absent or one quiet line; with sources it states the
@@ -72,10 +79,11 @@ The notes taxonomy (T070), the transcript column (T077), the shell and library (
 
 All three defects are closed inside `crates/app/src/workspace/notes.rs`. No other file was edited.
 
-The final review found and corrected one regression in the current tree: the compact per-claim
-evidence control had been removed in favour of the whole-summary toggle alone, despite the
-acceptance contract requiring both paths. `EvidenceDisclosure` once again tracks individual claim
-reveals as well as the whole-summary reveal. Mounted coverage opens the first claim, observes both
+The final review restored a compact per-claim evidence control, which the contract then required.
+**That control was subsequently removed for good** — see the amendment under "Why this exists".
+`EvidenceDisclosure` now tracks only the whole-summary reveal, and the mounted test pins the
+*absence* of the per-claim controls so they cannot return unnoticed. The paragraph below describes
+the superseded two-path design and is kept for the record. Mounted coverage opens the first claim, observes both
 of its citations, and proves the neighbouring claims remain quiet before exercising the global
 toggle.
 
@@ -84,11 +92,10 @@ claims spend vertical space on chips. It is *display* state and holds nothing el
 window element state (`Window::use_keyed_state`), not on `MeetingWorkspace` and not in the record,
 so revealing evidence cannot touch a session. Two ways to see the evidence:
 
-- **One claim:** each claim carries a compact ghost control labelled with what it is holding —
-  `10 timecodes`, `2 timecodes · 1 source`. Activating it opens that claim's chips and no others;
-  the control then reads `Hide evidence`.
+- ~~**One claim:** each claim carries a compact ghost control labelled with what it is holding.~~
+  **Superseded and removed** — it made every claim carry a row of chrome.
 - **The whole summary:** one control above the first section reads `Show timecodes` /
-  `Hide timecodes`. While it is on, the per-claim controls retire — the chips are already there.
+  `Hide timecodes`. This is now the only path to the chips.
 
 A summary's identity is a fingerprint over its headings and claim texts; a re-summarize starts
 quiet, because claim ordinals do not survive it.
@@ -124,9 +131,10 @@ escape never reaches the clipboard.
   than a `Context`, so it cannot re-lease the entity `MeetingWorkspace::render` already holds.
 - **`VisualTestContext::debug_bounds` never clears between frames.** `Frame::clear()` skips
   `debug_bounds`, so an "is_none" assertion is only meaningful for a selector that has *never* been
-  drawn in that window. Two absence assertions here are written against selectors that were never
-  rendered; the "per-claim control retires once everything is revealed" behaviour is asserted over
-  `Revealed` directly instead. Worth knowing before writing another mounted test.
+  drawn in that window. Every absence assertion here is written against a selector that is never
+  rendered — including the `summary-evidence-N` controls, which no longer exist at all, so their
+  `is_none` assertions are sound. Worth knowing before writing another mounted test: an assertion
+  that something *disappeared* after being drawn will pass whether or not it did.
 - **`cargo fmt -p app` was run once and may have reformatted `crates/app/src/workspace/
   transcript.rs`** (T077's file) while that task was mid-flight. Formatting only, no semantic edit;
   subsequent formatting used `rustfmt` on `notes.rs` alone. Flagged because it crosses an ownership
@@ -136,7 +144,7 @@ escape never reaches the clipboard.
 
 | Item | State |
 |---|---|
-| Reads as prose; chips hidden by default, per-claim and per-summary reveal | PASS — `the_summary_reads_as_prose_and_gives_up_its_evidence_only_when_asked`, `evidence_is_hidden_until_a_reader_asks_for_one_claim_or_for_all_of_them` |
+| Reads as prose; chips hidden by default, revealed by the whole-summary toggle | PASS — `the_summary_reads_as_prose_and_gives_up_its_evidence_only_when_asked` also pins that no per-claim control renders, and `evidence_is_hidden_until_a_reader_asks_for_all_of_it` |
 | Every revealed chip resolves to the row it cites | PASS — same rendered test follows a chip to `focused_event` |
 | Validation untouched; an unsupported claim fails closed | PASS — `an_unsupported_claim_still_fails_closed` |
 | Empty sources = one quiet line; configured = policy where it applies | PASS — `the_sources_block_is_one_quiet_line_until_a_source_exists`, `a_configured_source_states_its_policy_where_the_controls_are` |
