@@ -126,6 +126,7 @@ impl Render for MeetingWorkspace {
         let lifecycle = self.session.read(cx).lifecycle().clone();
         let session = self.session.read(cx);
         let transcription_unavailability = session.transcription_unavailability();
+        let transcription_home_reason = session.transcription_home_reason();
         let transcription_model = session.transcription_model().clone();
         let can_start = lifecycle.can_start();
         let tokens = WorkspaceTokens::resolve(cx);
@@ -155,7 +156,7 @@ impl Render for MeetingWorkspace {
                 self.library_footprint,
                 transcription_model.selected(),
                 transcription_model.availability().clone(),
-                transcription_unavailability.clone(),
+                transcription_home_reason,
                 cx,
             )
         } else {

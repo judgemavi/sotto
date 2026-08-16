@@ -1,6 +1,6 @@
 # T077 — The transcript must be selectable and copyable
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N7 — v2 workspace
 

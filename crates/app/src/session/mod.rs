@@ -683,6 +683,12 @@ impl SessionController {
         self.transcription_model.unavailable_reason()
     }
 
+    /// The same refusal, worded for a card that sits under the model choice itself.
+    #[must_use]
+    pub fn transcription_home_reason(&self) -> Option<String> {
+        self.transcription_model.home_card_reason()
+    }
+
     /// Verifies the persisted choice away from GPUI's launch thread and never contacts a server.
     pub fn begin_launch_model_check(&mut self, cx: &mut Context<Self>) {
         self.model_operation_generation = self.model_operation_generation.saturating_add(1);

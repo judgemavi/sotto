@@ -171,6 +171,26 @@ renders the lifecycle's full phase/percentage label instead of dropping progress
 - Ready transition takes effect through the shared session entity without relaunch — implemented.
 - Correct model-aware phase and percentage labels — implemented and covered by focused unit tests.
 
+## Maintainer review — 2026-08-16
+
+Validated in the built app: the choice appears on launch with no model, the download runs, and
+**cancel and resume work** — a cancelled download leaves its partial and resumes from where it
+stopped rather than restarting. That was the one acceptance line no test covered, because the
+partial's retention belongs to `crates/asr/**`, which this task held read-only.
+
+One defect found and fixed here: **the progress sentence was printed four times.** Home draws the
+choice panel and then one card per way of starting, and every card was handed
+`unavailable_reason` — so `Downloading small.en… 56% (276 of 488 MB). Cancelling keeps a resumable
+partial.` appeared under Capture an app, Record just your microphone and Import audio or video as
+well as in the panel itself. Three of those sit beside a control that can neither cancel nor resume
+anything.
+
+The two audiences now have two sentences. `unavailable_reason` is unchanged and still names Home,
+because its readers — the re-transcribe control and the status line — are on other surfaces.
+`home_card_reason` is for a card sitting directly under the choice panel: it names the model and
+says it is still downloading, without the percentage, the byte counts, or the cancel instruction.
+`a_start_card_does_not_repeat_the_downloads_own_progress_line` holds the two apart.
+
 ## Verification
 
 - `WHISPER_DONT_GENERATE_BINDINGS=1 cargo check -p app --lib` — passed.

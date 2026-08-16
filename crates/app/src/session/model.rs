@@ -154,6 +154,31 @@ impl TranscriptionModel {
         }
     }
 
+    /// The reason a Home card presents, where the choice panel is on the same surface.
+    ///
+    /// Deliberately not [`Self::unavailable_reason`]. That sentence has to name the surface to go
+    /// to, and while a download runs it carries the percentage, the byte counts and the cancel
+    /// instruction — all of which belong beside the progress bar and its Cancel control. Repeating
+    /// it under every start card put the same sentence on Home four times, three of them next to a
+    /// control that cannot act on it.
+    #[must_use]
+    pub fn home_card_reason(&self) -> Option<String> {
+        match &self.availability {
+            ModelAvailability::Ready(_) => None,
+            ModelAvailability::Checking => {
+                Some("Checking the selected transcription model.".to_owned())
+            }
+            ModelAvailability::Missing => Some("Choose a transcription model above.".to_owned()),
+            ModelAvailability::Provisioning(_) => Some(format!(
+                "{} is still downloading.",
+                model_label(self.selected)
+            )),
+            ModelAvailability::Error(_) => Some(
+                "The selected transcription model is unavailable — choose one above.".to_owned(),
+            ),
+        }
+    }
+
     pub fn choose(&mut self, selected: ModelSize) -> Result<(), String> {
         save_selection(&self.settings_path, selected)?;
         self.selected = selected;
@@ -350,6 +375,52 @@ mod tests {
         assert_eq!(download_size_label(ModelSize::SmallEn), "488 MB");
         assert_eq!(download_size_label(ModelSize::MediumEn), "1.53 GB");
         assert_eq!(model_label(ModelSize::SmallEn), "small.en");
+    }
+
+    /// A start card says it is waiting; it does not restate the download's own progress line.
+    ///
+    /// Home draws the choice panel and then one card per way of starting. Handing every card
+    /// `unavailable_reason` put the identical `Downloading small.en… 56% (276 of 488 MB).
+    /// Cancelling keeps a resumable partial.` sentence on screen four times — three of them beside
+    /// a control that can neither cancel nor resume it.
+    #[test]
+    fn a_start_card_does_not_repeat_the_downloads_own_progress_line()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut state = TranscriptionModel::for_test(
+            directory.path().join("transcription.json"),
+            directory.path().join("models"),
+            None,
+        );
+        state.set_provisioning(asr::model::ProvisionProgress {
+            phase: asr::model::ProvisionPhase::Downloading,
+            downloaded: 276_000_000,
+            total: 487_614_201,
+        });
+
+        let panel = state
+            .unavailable_reason()
+            .ok_or_else(|| std::io::Error::other("the panel must state progress"))?;
+        let card = state
+            .home_card_reason()
+            .ok_or_else(|| std::io::Error::other("the card must state it is blocked"))?;
+        assert!(
+            panel.contains("276") && panel.contains('%'),
+            "the panel beside Cancel keeps the byte counts and the percentage, got {panel:?}"
+        );
+        assert_ne!(
+            card, panel,
+            "a card must not restate the sentence the panel above it already carries"
+        );
+        assert!(
+            !card.contains('%') && !card.to_lowercase().contains("cancel"),
+            "a card offers neither the percentage nor the cancel instruction, got {card:?}"
+        );
+        assert!(
+            card.contains("small.en"),
+            "the card still names the model it is waiting on, got {card:?}"
+        );
+        Ok(())
     }
 
     #[test]
