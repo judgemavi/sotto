@@ -1,6 +1,6 @@
 # T075 — The summary column: your notes, then what the recording supports
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N7 — v2 workspace
 
@@ -139,3 +139,10 @@ Final combined T075/T095 gate after T070 and T072 landed:
 
 NOT RUN: a signed-app visual pass over a real summary. Cached/stale reports still cannot disclose a
 past downgrade because that runtime diagnostic is deliberately not persisted today.
+
+**Closed 2026-08-16.** The downgrade residual above is retired: T096 persists the normalizations
+alongside the derived view and asserts a downgraded run still names what it lost after a reopen,
+with this task's renderer unchanged — cached and fresh reports reach the column in the same shape.
+The visual pass was met in use rather than as a set-piece: the maintainer worked this column
+through T087, T098 and T099, exercising reword, hide, check and the action editor on real
+summaries.

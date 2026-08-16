@@ -1,6 +1,6 @@
 # T095 — A control marked expendable must be able to collapse
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N7 — v2 workspace
 

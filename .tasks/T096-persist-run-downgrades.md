@@ -1,6 +1,6 @@
 # T096 — A cached summary must still say what its run lost
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** R3 — reasoning product
 

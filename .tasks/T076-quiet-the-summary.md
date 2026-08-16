@@ -154,6 +154,12 @@ escape never reaches the clipboard.
 
 **NOT RUN**
 
+**Maintainer review, 2026-08-16 — held.** The visual pass is met in use and screen-reader
+announcement is unassertable, but the keyboard residual turned out to be worse than untested:
+Tab highlights nothing anywhere in the app, so the evidence control cannot be focused, let alone
+activated. Filed as T100, which owns the diagnosis and the fix. This task closes when T100 does;
+nothing else here is outstanding.
+
 - **Keyboard activation of the evidence controls.** The controls are tab stops with spoken text
   labels, and `evidence_control` adds an Enter/Space listener because `gpui-component`'s button
   binds no key activation. That key path has no automated coverage: the mounted-render harness
