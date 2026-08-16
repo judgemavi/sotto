@@ -111,6 +111,7 @@ entity_without_relations!(grounded_derived_views, "grounded_derived_views", {
     pub grant_fingerprint: Option<String>,
     pub source_status: String,
     pub bundle: String,
+    pub normalizations: String,
     pub created_at: i64,
 });
 

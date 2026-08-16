@@ -19,10 +19,13 @@ fn main() {
         gpui_component::init(cx);
         let (timeline_ingress, timeline) = devwindow::attach_ingress(cx, 1_024);
 
-        // Cold launch is intentionally idle. Constructing this controller performs no picker,
-        // model, network, capture, or session-replay work. Only the visible Start action invokes
-        // it, and every live event then crosses through the one existing TimelineState seam.
-        let session_controller = cx.new(|_| session::SessionController::new(timeline_ingress));
+        // Cold launch remains network-idle. The only model work is a background integrity check of
+        // the persisted choice so Home can state whether transcription is ready before an action.
+        let session_controller = cx.new(|cx| {
+            let mut controller = session::SessionController::new(timeline_ingress);
+            controller.begin_launch_model_check(cx);
+            controller
+        });
         let reasoning_controller = cx.new(|_| reasoning::ReasoningController::load_default());
         let mcp_controller = cx.new(|_| mcp::McpController::load_default());
         let quit_controller = session_controller.clone();

@@ -1,6 +1,6 @@
 # T097 — Choose a transcription model before you need it
 
-**Status:** todo
+**Status:** in-review
 
 **Wave:** M4 — recording
 
@@ -122,3 +122,64 @@ current behaviour: T023 is cited elsewhere as the provisioning precedent — "fi
 integrity check, progress, lazy load and idle unload" — but that task file is no longer on the
 board, and "first run" was implemented as first *recording* rather than first *launch*. This is an
 open design question, not a regression against a recorded decision.
+
+## Decisions
+
+### Home owns the choice; launch never owns the network
+
+The persisted selection is checked on launch, off GPUI's thread, but launch never downloads. A
+missing or invalid selected artifact produces a dismissible Home panel; a person opening Sotto only
+to read history can ignore it. An already-present artifact is SHA-256 checked against
+`ModelSize::spec()` and the panel stays absent. The temporary `Checking` state also keeps the panel
+absent, avoiding a false missing-model flash while a large cached file is hashed.
+
+The default remains `small.en` to preserve Sotto's existing transcription behaviour. No accuracy
+ranking is claimed: T065 lacked an independent reference. Home states runtime tradeoffs only as
+smallest/lightest, current default, and largest/heaviest. **No runtime-cost figures are displayed
+and none were measured for this task.** Download byte counts come exclusively from
+`ModelSize::spec()`.
+
+### Transcription actions consume availability; they do not provision
+
+Start-recording, microphone-only recording, import, and re-transcription now require the session
+controller's already-verified path. None calls `resolve_configured_or_download` itself. Their Home
+cards remain present and state that the model choice on Home resolves the unavailable state;
+re-transcription's disabled control itself reads `Choose model on Home` and carries the detailed
+reason. Once the Home download verifies, the shared entity changes to `Ready` and every action is
+live without relaunch.
+
+The explicit Home download persists the selected size before requesting exactly that artifact.
+Progress and completion are generation-fenced, so a cancelled or superseded download cannot
+overwrite a newer choice. Cancel signals the provisioner's cancellation token; its existing
+contract retains the `.partial` file, and Home returns to the missing state ready to resume.
+
+### Progress names the selected model
+
+`SessionLifecycle::ProvisioningModel` now carries `ModelSize`, and its status label derives
+`base.en`, `small.en`, or `medium.en` from that value rather than claiming `base.en`. The capture bar
+renders the lifecycle's full phase/percentage label instead of dropping progress behind
+`Preparing`. Import no longer has a progress callback to discard because import cannot provision.
+
+## Acceptance status
+
+- Launch-time persisted selection and background availability check — implemented.
+- Home choice with all three spec-derived download sizes and honest qualitative tradeoffs —
+  implemented.
+- Explicit, cancellable, resumable, generation-fenced download of the selected model —
+  implemented.
+- Start, import, and re-transcribe inert with an in-place route to Home until ready — implemented.
+- Ready transition takes effect through the shared session entity without relaunch — implemented.
+- Correct model-aware phase and percentage labels — implemented and covered by focused unit tests.
+
+## Verification
+
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo check -p app --lib` — passed.
+- Focused model, missing-action, cancellation-fencing, cached-check no-flash, Home mounting, and
+  model-aware progress regressions pass.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test -p app --lib` — 249 passed, 4 explicitly gated
+  real-media tests ignored.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test --workspace --locked` — passed across the workspace;
+  only the repository's explicitly gated real-model, real-media, live-provider, and manual tests
+  remain ignored.
+- Strict workspace Clippy over all targets and features with `-D warnings` — passed.
+- Repository-wide formatting and `git diff --check` — passed.

@@ -567,6 +567,7 @@ mod tests {
                 Some("mcp-grant-v1-test"),
                 "available",
                 r#"{"excerpts":[],"digest":"test","estimated_tokens":0}"#,
+                r#"[{"dispatch_id":17,"backend_id":"test.notes","control":"temperature"}]"#,
             )
             .await?;
         let replay = store
@@ -583,6 +584,29 @@ mod tests {
             Some("mcp-grant-v1-test")
         );
         assert_eq!(replay.source_status, "available");
+        assert_eq!(
+            replay.normalizations,
+            r#"[{"dispatch_id":17,"backend_id":"test.notes","control":"temperature"}]"#
+        );
+        assert!(
+            store
+                .save_grounded_derived_view(
+                    SessionId::new(7),
+                    "meeting_notes.v2",
+                    "backend-fingerprint",
+                    "timeline-bundle-hash",
+                    r#"{"overview":[]}"#,
+                    r#"{"input_tokens":1}"#,
+                    "mock-model",
+                    Some("mcp-grant-v1-test"),
+                    "available",
+                    r#"{"excerpts":[],"digest":"test","estimated_tokens":0}"#,
+                    "[]",
+                )
+                .await
+                .is_err(),
+            "the run's downgrade history participates in replay integrity"
+        );
         assert!(
             store
                 .save_grounded_derived_view(
@@ -596,6 +620,7 @@ mod tests {
                     Some("mcp-grant-v1-test"),
                     "available",
                     r#"{"excerpts":[],"digest":"test","estimated_tokens":0}"#,
+                    r#"[{"dispatch_id":17,"backend_id":"test.notes","control":"temperature"}]"#,
                 )
                 .await
                 .is_err()
@@ -637,6 +662,65 @@ mod tests {
                 )
                 .await?
                 .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn grounded_artifact_from_before_downgrade_persistence_stays_readable_after_upgrade()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("normalizations-upgrade.sqlite3");
+        let store = Store::open(&path).await?;
+        let stored_session = session();
+        store.save_session(&stored_session).await?;
+        store
+            .save_grounded_derived_view(
+                stored_session.id(),
+                "meeting_notes.v2",
+                "backend-fingerprint",
+                "timeline-bundle-hash",
+                r#"{"overview":[]}"#,
+                r#"{"input_tokens":1}"#,
+                "mock-model",
+                None,
+                "not_selected",
+                r#"{"excerpts":[],"digest":"test","estimated_tokens":0}"#,
+                "[]",
+            )
+            .await?;
+        drop(store);
+
+        let connection = database(&path).await?;
+        connection
+            .execute_unprepared(
+                "ALTER TABLE grounded_derived_views DROP COLUMN normalizations;\
+                 DELETE FROM seaql_migrations \
+                 WHERE version='m0002_persist_grounded_normalizations';\
+                 PRAGMA user_version=15;",
+            )
+            .await?;
+        connection.close().await?;
+
+        let reopened = Store::open(&path).await?;
+        let artifact = reopened
+            .load_grounded_derived_view(
+                stored_session.id(),
+                "meeting_notes.v2",
+                "backend-fingerprint",
+                "timeline-bundle-hash",
+            )
+            .await?
+            .ok_or("pre-normalization artifact disappeared during upgrade")?;
+        assert_eq!(artifact.artifact, r#"{"overview":[]}"#);
+        assert_eq!(artifact.normalizations, "[]");
+        assert_eq!(
+            reopened
+                .load_session_record(stored_session.id())
+                .await?
+                .capture_target(),
+            stored_session.capture_target(),
+            "the derived-run migration must not rewrite the captured session fact"
         );
         Ok(())
     }

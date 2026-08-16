@@ -124,6 +124,9 @@ impl Render for MeetingWorkspace {
             .find(|session| Some(session.id) == self.transcript_session)
             .cloned();
         let lifecycle = self.session.read(cx).lifecycle().clone();
+        let session = self.session.read(cx);
+        let transcription_unavailability = session.transcription_unavailability();
+        let transcription_model = session.transcription_model().clone();
         let can_start = lifecycle.can_start();
         let tokens = WorkspaceTokens::resolve(cx);
         let library_query = self.library_filter.read(cx).value().to_string();
@@ -150,6 +153,9 @@ impl Render for MeetingWorkspace {
                 can_start,
                 lifecycle.requires_visible_control(),
                 self.library_footprint,
+                transcription_model.selected(),
+                transcription_model.availability().clone(),
+                transcription_unavailability.clone(),
                 cx,
             )
         } else {
@@ -238,6 +244,7 @@ impl Render for MeetingWorkspace {
                         self.stage_tab,
                         live.is_some(),
                         self.retranscription_running,
+                        transcription_unavailability.clone(),
                         width,
                         tokens,
                         cx,
@@ -542,17 +549,25 @@ fn render_capture_bar(
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
     let (kind, target, stopping) = match lifecycle {
-        SessionLifecycle::ProvisioningModel { target, .. } => ("Preparing", target, false),
+        SessionLifecycle::ProvisioningModel {
+            target,
+            model,
+            progress,
+        } => (
+            crate::session::progress_label(*model, *progress),
+            target,
+            false,
+        ),
         SessionLifecycle::Running { target } => (
             if target.is_microphone_only() {
-                "Recording · mic"
+                "Recording · mic".to_owned()
             } else {
-                "Recording"
+                "Recording".to_owned()
             },
             target,
             false,
         ),
-        SessionLifecycle::Stopping { target, .. } => ("Finishing", target, true),
+        SessionLifecycle::Stopping { target, .. } => ("Finishing".to_owned(), target, true),
         _ => return div().into_any_element(),
     };
     let elapsed = started_at.map_or(Duration::ZERO, |value| value.elapsed());
@@ -571,7 +586,7 @@ fn render_capture_bar(
                 .text_size(TypeScale::CHIP)
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(tokens.live_ink)
-                .child(kind.to_uppercase()),
+                .child(kind),
         )
         .child(
             ControlRole::Ellipsizing,
@@ -647,10 +662,12 @@ fn render_view_bar(
     tab: StageTab,
     live_elsewhere: bool,
     retranscribing: bool,
+    transcription_unavailability: Option<String>,
     width: Pixels,
     tokens: WorkspaceTokens,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
+    let retranscription_unavailable = transcription_unavailability.is_some();
     ControlRow::for_width(width)
         .child(
             ControlRole::Ellipsizing,
@@ -711,13 +728,15 @@ fn render_view_bar(
             ControlRole::Expendable,
             div().child(
                 Button::new("retranscribe-session")
-                    .label(if retranscribing {
-                        "Re-transcribing…"
-                    } else {
-                        "Re-transcribe"
-                    })
+                    .label(retranscription_label(
+                        retranscribing,
+                        retranscription_unavailable,
+                    ))
                     .with_size(Size::Small)
-                    .disabled(retranscribing)
+                    .disabled(retranscribing || transcription_unavailability.is_some())
+                    .when_some(transcription_unavailability, |button, reason| {
+                        button.tooltip(reason)
+                    })
                     .on_click(cx.listener(|this, _, _, cx| this.retranscribe_selected(cx))),
             ),
         )
@@ -755,6 +774,16 @@ fn render_view_bar(
         .border_color(tokens.line)
         .debug_selector(|| "view-bar".into())
         .into_any_element()
+}
+
+const fn retranscription_label(running: bool, model_unavailable: bool) -> &'static str {
+    if running {
+        "Re-transcribing…"
+    } else if model_unavailable {
+        "Choose model on Home"
+    } else {
+        "Re-transcribe"
+    }
 }
 
 fn stage_tab_button(
@@ -935,7 +964,8 @@ mod tests {
     use super::{
         ASK_PANEL_WIDTH, LIBRARY_WIDTH, MIN_WORKSPACE_WIDTH, Stage, TOOLBAR_LEADING_INSET,
         TRANSCRIPT_STAGE_SHARE, available_stage_width, available_transcript_width, format_bytes,
-        format_clock, format_wall_clock, load_workspace_state, save_workspace_state, view_meta,
+        format_clock, format_wall_clock, load_workspace_state, retranscription_label,
+        save_workspace_state, view_meta,
     };
     use crate::workspace::{
         Appearance, CONFIRM_CANCEL_SELECTOR, CONFIRM_OK_SELECTOR, FollowSystemAppearance,
@@ -976,6 +1006,12 @@ mod tests {
             px(900.0),
             "a collapsed rail takes no width"
         );
+    }
+
+    #[test]
+    fn unavailable_retranscription_points_to_the_home_model_choice() {
+        assert_eq!(retranscription_label(false, true), "Choose model on Home");
+        assert_eq!(retranscription_label(false, false), "Re-transcribe");
     }
 
     impl reasoning::OpenAiCredentialStore for NoOpenAiCredentials {
@@ -1412,7 +1448,17 @@ mod tests {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir()?;
-        let visual = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?.visual;
+        let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
+        let workspace = shell.workspace;
+        let visual = shell.visual;
+        visual.update(|_, cx| {
+            let session = workspace.read(cx).session.clone();
+            session.update(cx, |session, _| {
+                session.set_transcription_availability_for_test(
+                    crate::session::ModelAvailability::Missing,
+                );
+            });
+        });
         visual.refresh()?;
         visual.run_until_parked();
 
@@ -1425,6 +1471,10 @@ mod tests {
             "the three ways a session begins must be mounted, not merely built"
         );
         assert!(
+            visual.debug_bounds("home-model-setup").is_some(),
+            "Home must offer a model choice before any transcription action is available"
+        );
+        assert!(
             visual.debug_bounds("capture-bar").is_none()
                 && visual.debug_bounds("view-bar").is_none(),
             "an idle shell shows neither bar"
@@ -1432,6 +1482,37 @@ mod tests {
         assert!(
             visual.debug_bounds("home-live-note").is_none(),
             "with nothing recording Home must not claim a recording is running"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checking_a_cached_model_does_not_flash_the_choice_panel()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir()?;
+        let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
+        let workspace = shell.workspace;
+        let visual = shell.visual;
+        visual.refresh()?;
+        visual.run_until_parked();
+        assert!(
+            visual.debug_bounds("home-model-setup").is_none(),
+            "the launch-time integrity check must not flash a false missing-model choice"
+        );
+        visual.update(|_, cx| {
+            let session = workspace.read(cx).session.clone();
+            session.update(cx, |session, _| {
+                session.set_transcription_availability_for_test(
+                    crate::session::ModelAvailability::Ready("/tmp/model.bin".into()),
+                );
+            });
+        });
+        visual.refresh()?;
+        assert!(
+            visual.debug_bounds("home-model-setup").is_none(),
+            "a ready model must keep setup entirely off Home"
         );
         Ok(())
     }

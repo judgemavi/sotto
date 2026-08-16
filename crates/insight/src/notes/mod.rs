@@ -15,7 +15,8 @@ use mcp::{
     GrantRunFingerprint, SessionContextGrant,
 };
 use providers::{
-    BackendFingerprint, ReasoningProvider, backend::ObservedRequestNormalization,
+    BackendFingerprint, ReasoningProvider,
+    backend::{BackendId, ObservedRequestNormalization, RequestNormalization, SamplingControl},
     text_reasoning_provider,
 };
 use rag::Store;
@@ -68,9 +69,26 @@ pub struct GroundedMeetingNotesReport {
     pub grant_fingerprint: Option<GrantRunFingerprint>,
     pub cached: bool,
     pub calls: usize,
-    /// Backend controls explicitly downgraded while producing this fresh result.
+    /// Backend controls explicitly downgraded while producing this run.
+    ///
+    /// These observations remain attached when the report is loaded from durable cache.
     #[serde(skip)]
     pub normalizations: Vec<ObservedRequestNormalization>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PersistedRequestNormalization {
+    dispatch_id: u64,
+    backend_id: String,
+    control: PersistedSamplingControl,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedSamplingControl {
+    MaxTokens,
+    Temperature,
+    JsonObjectOutput,
 }
 
 /// Latest durable meeting notes together with whether the session changed after generation.
@@ -147,7 +165,7 @@ pub async fn load_latest_grounded_notes_status(
             grant_fingerprint,
             cached: true,
             calls: 0,
-            normalizations: Vec::new(),
+            normalizations: deserialize_normalizations(&stored.view.normalizations)?,
         },
         stale,
     }))
@@ -194,6 +212,8 @@ pub enum MeetingNotesError {
     InvalidSourceStatus,
     #[error("persisted grounded notes do not match the frozen grant")]
     GrantFingerprintMismatch,
+    #[error("persisted grounded notes contain an invalid backend downgrade")]
+    InvalidPersistedNormalization,
     #[error(transparent)]
     Mcp(#[from] mcp::ContextError),
 }
@@ -362,7 +382,7 @@ impl MeetingNotesGenerator {
                 grant_fingerprint,
                 cached: true,
                 calls: 0,
-                normalizations: Vec::new(),
+                normalizations: deserialize_normalizations(&stored.normalizations)?,
             });
         }
 
@@ -432,6 +452,7 @@ impl MeetingNotesGenerator {
                 grant_fingerprint.as_ref().map(GrantRunFingerprint::as_str),
                 source_status.as_str(),
                 &serde_json::to_string(&bundle)?,
+                &serialize_normalizations(&normalizations)?,
             )
             .await?;
         Ok(GroundedMeetingNotesReport {
@@ -447,6 +468,51 @@ impl MeetingNotesGenerator {
             normalizations,
         })
     }
+}
+
+fn serialize_normalizations(
+    normalizations: &[ObservedRequestNormalization],
+) -> Result<String, MeetingNotesError> {
+    let persisted = normalizations
+        .iter()
+        .map(|observed| {
+            let control = match observed.normalization.control {
+                SamplingControl::MaxTokens => PersistedSamplingControl::MaxTokens,
+                SamplingControl::Temperature => PersistedSamplingControl::Temperature,
+                SamplingControl::JsonObjectOutput => PersistedSamplingControl::JsonObjectOutput,
+            };
+            PersistedRequestNormalization {
+                dispatch_id: observed.dispatch_id,
+                backend_id: observed.normalization.backend_id.as_str().to_owned(),
+                control,
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::to_string(&persisted)?)
+}
+
+fn deserialize_normalizations(
+    persisted: &str,
+) -> Result<Vec<ObservedRequestNormalization>, MeetingNotesError> {
+    serde_json::from_str::<Vec<PersistedRequestNormalization>>(persisted)?
+        .into_iter()
+        .map(|observed| {
+            let backend_id = BackendId::new(observed.backend_id)
+                .map_err(|_| MeetingNotesError::InvalidPersistedNormalization)?;
+            let control = match observed.control {
+                PersistedSamplingControl::MaxTokens => SamplingControl::MaxTokens,
+                PersistedSamplingControl::Temperature => SamplingControl::Temperature,
+                PersistedSamplingControl::JsonObjectOutput => SamplingControl::JsonObjectOutput,
+            };
+            Ok(ObservedRequestNormalization {
+                dispatch_id: observed.dispatch_id,
+                normalization: RequestNormalization {
+                    backend_id,
+                    control,
+                },
+            })
+        })
+        .collect()
 }
 
 fn source_status_matches(

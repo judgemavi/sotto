@@ -2,7 +2,7 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use sea_orm_migration::{MigrationName, MigrationTrait, MigratorTrait, SchemaManager};
 use sotto_core::{RagError, SQLITE_SCHEMA};
 
-pub(crate) const SCHEMA_VERSION: u32 = 15;
+pub(crate) const SCHEMA_VERSION: u32 = 16;
 
 const RAG_SCHEMA: &str = r#"
 CREATE TABLE documents (
@@ -120,6 +120,8 @@ CREATE INDEX entry_sessions_entry_idx ON entry_sessions(entry_id,session_id);
 
 struct BaselineMigration;
 
+struct GroundedNormalizationsMigration;
+
 impl MigrationName for BaselineMigration {
     fn name(&self) -> &str {
         "m0001_current_schema_baseline"
@@ -154,11 +156,44 @@ impl MigrationTrait for BaselineMigration {
     }
 }
 
+impl MigrationName for GroundedNormalizationsMigration {
+    fn name(&self) -> &str {
+        "m0002_persist_grounded_normalizations"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for GroundedNormalizationsMigration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), sea_orm::DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE grounded_derived_views \
+                 ADD COLUMN normalizations TEXT NOT NULL DEFAULT '[]';",
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(&format!("PRAGMA user_version={SCHEMA_VERSION};"))
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), sea_orm::DbErr> {
+        Err(sea_orm::DbErr::Migration(
+            "grounded downgrade history is intentionally durable".to_owned(),
+        ))
+    }
+}
+
 struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(BaselineMigration)]
+        vec![
+            Box::new(BaselineMigration),
+            Box::new(GroundedNormalizationsMigration),
+        ]
     }
 }
 

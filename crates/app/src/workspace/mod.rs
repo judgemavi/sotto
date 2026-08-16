@@ -11,7 +11,12 @@ mod runtime;
 pub(crate) mod tokens;
 mod transcript;
 
-use std::{collections::BTreeMap, path::PathBuf, sync::mpsc::TryRecvError, time::Instant};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    sync::mpsc::TryRecvError,
+    time::Instant,
+};
 
 use gpui::{
     App, Context, ElementId, Entity, KeyBinding, ListAlignment, ListState, Menu, MenuItem,
@@ -1061,6 +1066,17 @@ impl MeetingWorkspace {
         if self.retranscription_running {
             return;
         }
+        let Some(model_path) = self
+            .session
+            .read(cx)
+            .transcription_model()
+            .ready_path()
+            .map(Path::to_path_buf)
+        else {
+            self.message = self.session.read(cx).transcription_unavailability();
+            cx.notify();
+            return;
+        };
         let Some(session_id) = self.transcript_session.filter(|_| !self.transcript_live) else {
             self.message = Some("Select a stopped recording before re-transcribing.".to_owned());
             cx.notify();
@@ -1077,26 +1093,8 @@ impl MeetingWorkspace {
         let spawn = std::thread::Builder::new()
             .name("sotto-retranscription".to_owned())
             .spawn(move || {
-                let result = (|| -> Result<usize, String> {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|error| {
-                            format!("Could not start the re-transcription runtime: {error}")
-                        })?;
-                    let provisioner = asr::model::ModelProvisioner::for_current_user()
-                        .map_err(|error| error.to_string())?;
-                    let cancellation = sotto_core::CancellationToken::new();
-                    let model_path = runtime
-                        .block_on(provisioner.resolve_configured_or_download(
-                            asr::ModelSize::default(),
-                            &cancellation,
-                            |_| {},
-                        ))
-                        .map_err(|error| error.to_string())?;
-                    RecordingLibrary::new(database, recording_directory)
-                        .retranscribe(session_id, &model_path)
-                })();
+                let result = RecordingLibrary::new(database, recording_directory)
+                    .retranscribe(session_id, &model_path);
                 let _ = sender.send(result);
             });
         if let Err(error) = spawn {

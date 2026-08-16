@@ -20,13 +20,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use crate::session::{
+    MODEL_CHOICES, ModelAvailability, SessionController, download_size_label, model_label,
+};
 use chrono::Datelike as _;
 use gpui::{
     AnyElement, Context, Entity, FontWeight, Global, MouseButton, Pixels, Rgba, Subscription,
     Timer, Window, div, prelude::*, px,
 };
 use gpui_component::{
-    Sizable as _,
+    Disableable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement,
@@ -46,7 +49,7 @@ use super::{
     layout::format_bytes,
     tokens::{Space, TypeScale, WorkspaceTokens},
 };
-use crate::session::{RecordingLibrary, SessionController};
+use crate::session::RecordingLibrary;
 
 /// The rail's nominal width, matching the shell's default left panel. It is well below
 /// [`ControlRow::COLLAPSE_WIDTH`], which is the honest answer for every row in here: the rail is
@@ -921,9 +924,18 @@ pub(crate) fn render_start_choices(
     can_start: bool,
     recording_in_flight: bool,
     footprint: LibraryFootprint,
+    selected_model: asr::ModelSize,
+    model_availability: ModelAvailability,
+    transcription_unavailability: Option<String>,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
     let tokens = WorkspaceTokens::resolve(cx);
+    let show_model_setup = matches!(
+        model_availability,
+        ModelAvailability::Missing
+            | ModelAvailability::Provisioning(_)
+            | ModelAvailability::Error(_)
+    );
     div()
         .debug_selector(|| "start-choices".into())
         .flex_1()
@@ -979,11 +991,23 @@ pub(crate) fn render_start_choices(
                             ),
                     )
                 })
-                .children(
-                    START_CHOICES
-                        .into_iter()
-                        .map(|choice| render_start_card(choice, can_start, tokens, cx)),
-                )
+                .when(show_model_setup, |view| {
+                    view.child(render_model_setup(
+                        selected_model,
+                        model_availability,
+                        tokens,
+                        cx,
+                    ))
+                })
+                .children(START_CHOICES.into_iter().map(|choice| {
+                    render_start_card(
+                        choice,
+                        can_start,
+                        transcription_unavailability.clone(),
+                        tokens,
+                        cx,
+                    )
+                }))
                 .child(
                     div()
                         .debug_selector(|| "home-footprint".into())
@@ -1006,13 +1030,16 @@ pub(crate) fn render_start_choices(
 fn render_start_card(
     choice: StartChoice,
     can_start: bool,
+    model_blocked: Option<String>,
     tokens: WorkspaceTokens,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
-    let blocked = choice.unavailability().or(if can_start {
-        None
-    } else {
-        Some("A recording is already running — stop it first.")
+    let blocked = choice.unavailability().map(str::to_owned).or_else(|| {
+        if can_start {
+            model_blocked
+        } else {
+            Some("A recording is already running — stop it first.".to_owned())
+        }
     });
     let card = div()
         .debug_selector(move || choice.element_id().into())
@@ -1064,7 +1091,7 @@ fn render_start_card(
                         .text_color(tokens.muted)
                         .child(choice.description()),
                 )
-                .when_some(blocked, |view, note| {
+                .when_some(blocked.clone(), |view, note| {
                     view.child(
                         div()
                             .mt(Space::XS)
@@ -1080,6 +1107,109 @@ fn render_start_card(
     card.cursor_pointer()
         .hover(move |view| view.bg(tokens.surface_2).border_color(tokens.accent_line))
         .on_click(cx.listener(move |this, _, _, cx| choice.begin(this, cx)))
+        .into_any_element()
+}
+
+fn render_model_setup(
+    selected: asr::ModelSize,
+    availability: ModelAvailability,
+    tokens: WorkspaceTokens,
+    cx: &mut Context<MeetingWorkspace>,
+) -> AnyElement {
+    let provisioning = matches!(availability, ModelAvailability::Provisioning(_));
+    let status = match availability {
+        ModelAvailability::Checking => "Checking the selected model on this Mac…".to_owned(),
+        ModelAvailability::Missing => format!(
+            "{} is selected. Download it now so recording, import, and re-transcription are ready when you need them.",
+            model_label(selected)
+        ),
+        ModelAvailability::Provisioning(progress) => {
+            crate::session::progress_label(selected, progress)
+        }
+        ModelAvailability::Error(error) => format!("Model setup needs attention: {error}"),
+        ModelAvailability::Ready(_) => String::new(),
+    };
+    div()
+        .debug_selector(|| "home-model-setup".into())
+        .mb(px(16.0))
+        .px(px(12.0))
+        .py(px(10.0))
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(tokens.accent_line)
+        .bg(tokens.accent_wash)
+        .child(
+            div()
+                .text_size(px(13.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(tokens.ink)
+                .child("Choose your local transcription model"),
+        )
+        .child(
+            div()
+                .mt(px(3.0))
+                .text_size(px(11.5))
+                .text_color(tokens.muted)
+                .child(status),
+        )
+        .children(MODEL_CHOICES.into_iter().enumerate().map(|(index, size)| {
+            let description = match size {
+                asr::ModelSize::BaseEn => "Smallest download and lightest runtime cost.",
+                asr::ModelSize::SmallEn => {
+                    "Default · preserves Sotto's existing transcription behavior; no accuracy ranking is claimed."
+                }
+                asr::ModelSize::MediumEn => {
+                    "Largest download and heaviest runtime cost."
+                }
+            };
+            div()
+                .mt(px(7.0))
+                .flex()
+                .items_center()
+                .gap(Space::SM)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(11.5))
+                        .text_color(tokens.muted)
+                        .child(format!(
+                            "{} · {} download — {description}",
+                            model_label(size),
+                            download_size_label(size)
+                        )),
+                )
+                .child(
+                    Button::new(("choose-transcription-model", index))
+                        .label(if selected == size && provisioning {
+                            "Downloading…"
+                        } else if selected == size {
+                            "Selected"
+                        } else {
+                            "Choose"
+                        })
+                        .with_size(gpui_component::Size::Small)
+                        .disabled(provisioning)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.session.update(cx, |session, cx| {
+                                session.choose_transcription_model(size, cx)
+                            });
+                        })),
+                )
+        }))
+        .when(provisioning, |view| {
+            view.child(
+                div().mt(px(8.0)).child(
+                    Button::new("cancel-transcription-model")
+                        .label("Cancel download")
+                        .with_size(gpui_component::Size::Small)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.session
+                                .update(cx, SessionController::cancel_model_download);
+                        })),
+                ),
+            )
+        })
         .into_any_element()
 }
 

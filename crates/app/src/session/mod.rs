@@ -1,9 +1,13 @@
 //! Explicit, picker-scoped map-session lifecycle.
 
 mod import;
+mod model;
 mod recordings;
 
 pub use import::ImportOutcome;
+pub use model::{
+    MODEL_CHOICES, ModelAvailability, TranscriptionModel, download_size_label, model_label,
+};
 pub use recordings::{RecordingLibrary, RecordingLibraryItem, RecordingLibrarySnapshot};
 
 use std::{
@@ -70,6 +74,7 @@ pub enum SessionLifecycle {
     ChoosingTarget,
     ProvisioningModel {
         target: CaptureTarget,
+        model: ModelSize,
         progress: ProvisionProgress,
     },
     Running {
@@ -118,7 +123,9 @@ impl SessionLifecycle {
             Self::ChoosingTarget => {
                 "Choose one application, window, or display in the system picker.".to_owned()
             }
-            Self::ProvisioningModel { progress, .. } => progress_label(*progress),
+            Self::ProvisioningModel {
+                model, progress, ..
+            } => progress_label(*model, *progress),
             Self::Running { target } if target.is_microphone_only() => {
                 "A microphone-only audio recording is being kept on this Mac.".to_owned()
             }
@@ -235,6 +242,7 @@ impl SessionFailure {
         }
     }
 
+    #[cfg(test)]
     fn from_model(error: ModelProvisionError) -> Self {
         let kind = match error {
             ModelProvisionError::Cancelled { .. } => SessionFailureKind::Cancelled,
@@ -302,6 +310,7 @@ struct SessionCompletion {
 }
 
 enum WorkerEvent {
+    #[cfg(test)]
     Progress(ProvisionProgress),
     Identified(SessionId),
     Running,
@@ -430,16 +439,18 @@ impl LifecycleModel {
         &mut self,
         generation: u64,
         target: CaptureTarget,
+        model: ModelSize,
         start_gate: StartGate,
     ) -> bool {
         if generation != self.generation || !matches!(self.state, SessionLifecycle::ChoosingTarget)
         {
             return false;
         }
-        let spec = ModelSize::default().spec();
+        let spec = model.spec();
         self.start_gate = Some(start_gate);
         self.state = SessionLifecycle::ProvisioningModel {
             target,
+            model,
             progress: ProvisionProgress {
                 phase: ProvisionPhase::Resolving,
                 downloaded: 0,
@@ -471,6 +482,7 @@ impl LifecycleModel {
             return;
         }
         match event {
+            #[cfg(test)]
             WorkerEvent::Progress(progress) => {
                 if let SessionLifecycle::ProvisioningModel {
                     progress: current, ..
@@ -522,6 +534,9 @@ impl LifecycleModel {
 pub struct SessionController {
     ingress: TimelineIngress,
     model: LifecycleModel,
+    transcription_model: TranscriptionModel,
+    model_operation_generation: u64,
+    model_download_cancellation: Option<CancellationToken>,
     worker: Option<WorkerThread>,
     active_session_id: Option<SessionId>,
     completed_session_id: Option<SessionId>,
@@ -551,6 +566,17 @@ struct WorkerThread {
 enum CaptureSelection {
     Scoped(PickedTarget),
     MicrophoneOnly,
+}
+
+enum ModelDownloadEvent {
+    Progress(ProvisionProgress),
+    Finished(ModelDownloadResult),
+}
+
+enum ModelDownloadResult {
+    Ready(PathBuf),
+    Cancelled,
+    Failed(String),
 }
 
 impl CaptureSelection {
@@ -629,6 +655,9 @@ impl SessionController {
         Self {
             ingress,
             model: LifecycleModel::default(),
+            transcription_model: TranscriptionModel::load_default(),
+            model_operation_generation: 0,
+            model_download_cancellation: None,
             worker: None,
             active_session_id: None,
             completed_session_id: None,
@@ -643,9 +672,190 @@ impl SessionController {
         &self.model.state
     }
 
+    #[must_use]
+    pub const fn transcription_model(&self) -> &TranscriptionModel {
+        &self.transcription_model
+    }
+
+    /// The in-place reason start, import, and re-transcribe must present while Whisper is absent.
+    #[must_use]
+    pub fn transcription_unavailability(&self) -> Option<String> {
+        self.transcription_model.unavailable_reason()
+    }
+
+    /// Verifies the persisted choice away from GPUI's launch thread and never contacts a server.
+    pub fn begin_launch_model_check(&mut self, cx: &mut Context<Self>) {
+        self.model_operation_generation = self.model_operation_generation.saturating_add(1);
+        let generation = self.model_operation_generation;
+        let state = self.transcription_model.clone();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let spawn = std::thread::Builder::new()
+            .name("sotto-model-check".to_owned())
+            .spawn(move || {
+                let _ = sender.send(state.inspect());
+            });
+        if let Err(error) = spawn {
+            self.transcription_model
+                .set_error(format!("Could not check the selected model: {error}"));
+            cx.notify();
+            return;
+        }
+        let controller = cx.entity();
+        cx.spawn(async move |_, cx| {
+            loop {
+                Timer::after(LIFECYCLE_POLL_INTERVAL).await;
+                match receiver.try_recv() {
+                    Ok(availability) => {
+                        let _ = controller.update(cx, |controller, cx| {
+                            if controller.model_operation_is_current(generation) {
+                                controller
+                                    .transcription_model
+                                    .set_availability(availability);
+                                cx.notify();
+                            }
+                        });
+                        return;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => return,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Persists the user's model choice, then downloads exactly that artifact with live progress.
+    pub fn choose_transcription_model(&mut self, selected: ModelSize, cx: &mut Context<Self>) {
+        self.cancel_model_download_inner();
+        self.model_operation_generation = self.model_operation_generation.saturating_add(1);
+        let generation = self.model_operation_generation;
+        if let Err(error) = self.transcription_model.choose(selected) {
+            self.transcription_model.set_error(error);
+            cx.notify();
+            return;
+        }
+        if self.transcription_model.ready_path().is_some() {
+            cx.notify();
+            return;
+        }
+        let spec = selected.spec();
+        let cancellation = CancellationToken::new();
+        self.model_download_cancellation = Some(cancellation.clone());
+        self.transcription_model
+            .set_provisioning(ProvisionProgress {
+                phase: ProvisionPhase::Resolving,
+                downloaded: 0,
+                total: spec.byte_len,
+            });
+        let (sender, receiver) = mpsc::sync_channel(LIFECYCLE_CHANNEL_CAPACITY);
+        let spawn = std::thread::Builder::new()
+            .name("sotto-model-download".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("Could not start model setup: {error}"));
+                let result = match runtime {
+                    Err(error) => ModelDownloadResult::Failed(error),
+                    Ok(runtime) => match ModelProvisioner::for_current_user() {
+                        Err(error) => ModelDownloadResult::Failed(error.to_string()),
+                        Ok(provisioner) => {
+                            match runtime.block_on(provisioner.resolve_configured_or_download(
+                                selected,
+                                &cancellation,
+                                |progress| {
+                                    let _ = sender.try_send(ModelDownloadEvent::Progress(progress));
+                                },
+                            )) {
+                                Ok(path) => ModelDownloadResult::Ready(path),
+                                Err(ModelProvisionError::Cancelled { .. }) => {
+                                    ModelDownloadResult::Cancelled
+                                }
+                                Err(error) => ModelDownloadResult::Failed(error.to_string()),
+                            }
+                        }
+                    },
+                };
+                let _ = sender.send(ModelDownloadEvent::Finished(result));
+            });
+        if let Err(error) = spawn {
+            self.transcription_model
+                .set_error(format!("Could not start model setup: {error}"));
+            cx.notify();
+            return;
+        }
+        let controller = cx.entity();
+        cx.spawn(async move |_, cx| {
+            loop {
+                Timer::after(LIFECYCLE_POLL_INTERVAL).await;
+                match receiver.try_recv() {
+                    Ok(ModelDownloadEvent::Progress(progress)) => {
+                        let _ = controller.update(cx, |controller, cx| {
+                            if controller.model_operation_is_current(generation) {
+                                controller.transcription_model.set_provisioning(progress);
+                                cx.notify();
+                            }
+                        });
+                    }
+                    Ok(ModelDownloadEvent::Finished(result)) => {
+                        let _ = controller.update(cx, |controller, cx| {
+                            if !controller.model_operation_is_current(generation) {
+                                return;
+                            }
+                            controller.model_download_cancellation = None;
+                            match result {
+                                ModelDownloadResult::Ready(path) => {
+                                    controller.transcription_model.set_ready(path)
+                                }
+                                ModelDownloadResult::Cancelled => {
+                                    controller.transcription_model.mark_missing()
+                                }
+                                ModelDownloadResult::Failed(error) => {
+                                    controller.transcription_model.set_error(error)
+                                }
+                            }
+                            cx.notify();
+                        });
+                        return;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => return,
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Cancels only model setup. The provisioner retains its `.partial` file for the next choice.
+    pub fn cancel_model_download(&mut self, cx: &mut Context<Self>) {
+        self.cancel_model_download_inner();
+        self.model_operation_generation = self.model_operation_generation.saturating_add(1);
+        self.transcription_model.mark_missing();
+        cx.notify();
+    }
+
+    fn cancel_model_download_inner(&mut self) {
+        if let Some(cancellation) = self.model_download_cancellation.take() {
+            cancellation.cancel();
+        }
+    }
+
+    const fn model_operation_is_current(&self, generation: u64) -> bool {
+        self.model_operation_generation == generation
+    }
+
     #[cfg(test)]
     pub(crate) fn set_lifecycle_for_test(&mut self, lifecycle: SessionLifecycle) {
         self.model.state = lifecycle;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_transcription_availability_for_test(
+        &mut self,
+        availability: ModelAvailability,
+    ) {
+        self.transcription_model.set_availability(availability);
     }
 
     #[cfg(test)]
@@ -668,6 +878,10 @@ impl SessionController {
     /// Starts only the system picker. No model or session work happens until selection succeeds.
     pub fn start(&mut self, cx: &mut Context<Self>) {
         self.reap_finished_worker();
+        if self.transcription_model.ready_path().is_none() {
+            cx.notify();
+            return;
+        }
         let Some(generation) = self.model.begin() else {
             return;
         };
@@ -692,6 +906,10 @@ impl SessionController {
     /// Screen & System Audio Recording permission.
     pub fn start_microphone_only(&mut self, cx: &mut Context<Self>) {
         self.reap_finished_worker();
+        if self.transcription_model.ready_path().is_none() {
+            cx.notify();
+            return;
+        }
         let Some(generation) = self.model.begin() else {
             return;
         };
@@ -725,6 +943,10 @@ impl SessionController {
     /// workspace's existing `refresh_after_session` opens the imported session exactly the way it
     /// opens a freshly captured one, with no separate wiring for import to duplicate.
     pub fn start_import(&mut self, cx: &mut Context<Self>) {
+        let Some(model_path) = self.transcription_model.ready_path().map(Path::to_path_buf) else {
+            cx.notify();
+            return;
+        };
         if self.importing {
             return;
         }
@@ -764,6 +986,7 @@ impl SessionController {
                                 &source,
                                 &database,
                                 &recording_directory,
+                                &model_path,
                             ))
                         })
                         .and_then(|result| result);
@@ -874,10 +1097,14 @@ impl SessionController {
         cx: &mut Context<Self>,
     ) {
         let target = selection.description();
+        let Some(model_path) = self.transcription_model.ready_path().map(Path::to_path_buf) else {
+            return;
+        };
+        let selected_model = self.transcription_model.selected();
         let start_gate = StartGate::new();
         if !self
             .model
-            .target_picked(generation, target, start_gate.clone())
+            .target_picked(generation, target, selected_model, start_gate.clone())
         {
             return;
         }
@@ -895,6 +1122,7 @@ impl SessionController {
                     selection,
                     ingress,
                     start_gate,
+                    model_path,
                     sender,
                     annotation_receiver,
                     &worker_shutdown,
@@ -990,6 +1218,7 @@ impl SessionController {
     /// GPUI's quit hook allows only 100 ms for returned futures, so perform the bounded worker
     /// join synchronously while the quit callback itself is being constructed.
     pub fn shutdown_for_app_quit(&mut self) {
+        self.cancel_model_download_inner();
         if let Some(start_gate) = &self.model.start_gate {
             start_gate.cancel();
         }
@@ -1012,6 +1241,7 @@ impl SessionController {
 
 impl Drop for SessionController {
     fn drop(&mut self) {
+        self.cancel_model_download_inner();
         if let Some(start_gate) = &self.model.start_gate {
             start_gate.cancel();
         }
@@ -1023,6 +1253,7 @@ fn run_worker(
     target: CaptureSelection,
     ingress: TimelineIngress,
     start_gate: StartGate,
+    model_path: PathBuf,
     sender: mpsc::SyncSender<WorkerEvent>,
     annotation_receiver: tokio::sync::mpsc::UnboundedReceiver<AnnotationRequest>,
     app_shutdown: &std::sync::atomic::AtomicBool,
@@ -1039,6 +1270,7 @@ fn run_worker(
         .and_then(|runtime| {
             runtime.block_on(resolve_and_run(
                 target,
+                model_path,
                 ingress,
                 &start_gate,
                 &sender,
@@ -1069,31 +1301,12 @@ fn send_finished(
 
 async fn resolve_and_run(
     target: CaptureSelection,
+    model_path: PathBuf,
     ingress: TimelineIngress,
     start_gate: &StartGate,
     sender: &mpsc::SyncSender<WorkerEvent>,
     annotation_receiver: tokio::sync::mpsc::UnboundedReceiver<AnnotationRequest>,
 ) -> Result<SessionCompletion, SessionFailure> {
-    let provisioner = ModelProvisioner::for_current_user().map_err(SessionFailure::from_model)?;
-    let progress_sender = sender.clone();
-    let progress_cancellation = start_gate.cancellation().clone();
-    let mut last_phase = None;
-    let model_path = provisioner
-        .resolve_configured_or_download(
-            ModelSize::default(),
-            start_gate.cancellation(),
-            move |progress| {
-                let phase_changed = last_phase != Some(progress.phase);
-                last_phase = Some(progress.phase);
-                if phase_changed {
-                    send_phase_progress(&progress_sender, &progress_cancellation, progress);
-                } else {
-                    let _ = progress_sender.try_send(WorkerEvent::Progress(progress));
-                }
-            },
-        )
-        .await
-        .map_err(SessionFailure::from_model)?;
     ensure_not_cancelled(start_gate.cancellation())?;
     Box::pin(run(
         target,
@@ -1106,6 +1319,7 @@ async fn resolve_and_run(
     .await
 }
 
+#[cfg(test)]
 fn send_phase_progress(
     sender: &mpsc::SyncSender<WorkerEvent>,
     cancellation: &CancellationToken,
@@ -1822,7 +2036,8 @@ fn completion_message(
     format!("{reason} Saved {count} timeline events ({tail}).{discrepancy}")
 }
 
-fn progress_label(progress: ProvisionProgress) -> String {
+pub(crate) fn progress_label(model: ModelSize, progress: ProvisionProgress) -> String {
+    let model = model_label(model);
     let percent = progress
         .downloaded
         .saturating_mul(100)
@@ -1830,14 +2045,14 @@ fn progress_label(progress: ProvisionProgress) -> String {
         .unwrap_or(0)
         .min(100);
     match progress.phase {
-        ProvisionPhase::Resolving => "Checking the verified base.en model cache…".to_owned(),
+        ProvisionPhase::Resolving => format!("Checking the verified {model} model cache…"),
         ProvisionPhase::Downloading => format!(
-            "Downloading base.en… {percent}% ({} of {} MB). Stop keeps a resumable partial.",
-            progress.downloaded / 1_000_000,
-            progress.total / 1_000_000
+            "Downloading {model}… {percent}% ({} of {} MB). Cancelling keeps a resumable partial.",
+            progress.downloaded.saturating_add(500_000) / 1_000_000,
+            progress.total.saturating_add(500_000) / 1_000_000
         ),
-        ProvisionPhase::Verifying => format!("Verifying base.en integrity… {percent}%"),
-        ProvisionPhase::Ready => "Verified base.en is ready. Starting capture…".to_owned(),
+        ProvisionPhase::Verifying => format!("Verifying {model} integrity… {percent}%"),
+        ProvisionPhase::Ready => format!("Verified {model} is ready. Starting capture…"),
     }
 }
 
@@ -1880,8 +2095,12 @@ mod tests {
         time::Duration,
     };
 
-    use asr::model::{ModelProvisionError, ProvisionPhase, ProvisionProgress};
+    use asr::{
+        ModelSize,
+        model::{ModelProvisionError, ProvisionPhase, ProvisionProgress},
+    };
     use capture::macos::CaptureStatus;
+    use gpui::{AppContext as _, TestAppContext};
     use sotto_core::types::{MediaTimeMapping, RecordingContainer, SessionRecording};
     use sotto_core::{
         CancellationToken, CaptureError, CaptureTarget, EventBus, EventId, EventPayload, MarkKind,
@@ -2171,7 +2390,7 @@ mod tests {
         let start_gate = StartGate::new();
         let cancellation = start_gate.cancellation().clone();
         assert!(
-            model.target_picked(generation, target(false), start_gate),
+            model.target_picked(generation, target(false), ModelSize::SmallEn, start_gate,),
             "current picker result must enter provisioning"
         );
         assert!(model.request_stop(), "provisioning must expose Stop");
@@ -2206,7 +2425,12 @@ mod tests {
         };
         let start_gate = StartGate::new();
         assert!(
-            model.target_picked(generation, target(false), start_gate.clone()),
+            model.target_picked(
+                generation,
+                target(false),
+                ModelSize::SmallEn,
+                start_gate.clone(),
+            ),
             "current picker result must enter provisioning"
         );
         let started = start_gate.start_if_not_cancelled(|| Ok::<_, ()>(()));
@@ -2335,7 +2559,12 @@ mod tests {
             return;
         };
         assert!(
-            model.target_picked(generation, target(true), StartGate::new()),
+            model.target_picked(
+                generation,
+                target(true),
+                ModelSize::SmallEn,
+                StartGate::new(),
+            ),
             "current picker result must enter provisioning"
         );
         let progress = ProvisionProgress {
@@ -2345,9 +2574,72 @@ mod tests {
         };
         model.apply(generation, WorkerEvent::Progress(progress));
         assert!(
-            model.state.status_message().contains("50%"),
-            "download progress must render measured percentage"
+            model
+                .state
+                .status_message()
+                .contains("Downloading small.en… 50%"),
+            "download progress must render the selected model and measured percentage"
         );
+    }
+
+    #[test]
+    fn missing_model_keeps_start_and_import_inert() {
+        let mut cx = TestAppContext::single();
+        let (ingress, _receiver) = test_ingress(4);
+        let controller = cx.new(|_| SessionController::new(ingress));
+        cx.update(|cx| {
+            controller.update(cx, |controller, cx| {
+                controller
+                    .transcription_model
+                    .set_availability(super::ModelAvailability::Missing);
+                controller.start(cx);
+                assert!(
+                    matches!(controller.lifecycle(), SessionLifecycle::Idle { .. }),
+                    "missing weights must stop before the target picker lifecycle"
+                );
+                controller.start_import(cx);
+                assert!(
+                    !controller.is_importing(),
+                    "missing weights must stop before the import picker"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn cancelling_a_download_fences_its_generation_and_restores_missing() {
+        let mut cx = TestAppContext::single();
+        let (ingress, _receiver) = test_ingress(4);
+        let controller = cx.new(|_| SessionController::new(ingress));
+        let cancellation = CancellationToken::new();
+        let observed = cancellation.clone();
+        cx.update(|cx| {
+            controller.update(cx, |controller, cx| {
+                controller.model_operation_generation = 7;
+                controller.model_download_cancellation = Some(cancellation);
+                controller
+                    .transcription_model
+                    .set_provisioning(ProvisionProgress {
+                        phase: ProvisionPhase::Downloading,
+                        downloaded: 10,
+                        total: 100,
+                    });
+                controller.cancel_model_download(cx);
+                assert!(
+                    observed.is_cancelled(),
+                    "Cancel must reach the provisioner token"
+                );
+                assert!(
+                    controller.model_operation_is_current(8)
+                        && !controller.model_operation_is_current(7),
+                    "the cancelled generation must not be allowed to publish later progress"
+                );
+                assert_eq!(
+                    controller.transcription_model.availability(),
+                    &super::ModelAvailability::Missing
+                );
+            });
+        });
     }
 
     #[test]
@@ -2453,6 +2745,7 @@ mod tests {
         for state in [
             SessionLifecycle::ProvisioningModel {
                 target: target.clone(),
+                model: ModelSize::SmallEn,
                 progress: ProvisionProgress {
                     phase: ProvisionPhase::Resolving,
                     downloaded: 0,

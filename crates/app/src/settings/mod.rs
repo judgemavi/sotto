@@ -1333,33 +1333,43 @@ fn recording_pane(tokens: WorkspaceTokens) -> AnyElement {
         .into_any_element()
 }
 
-/// The local Whisper pass.
-///
-/// The mock names several model sizes. The app resolves exactly one, so exactly one is named here;
-/// `small.en` and `medium.en` are provisionable but unranked against real recordings (T065), and a
-/// picker over unmeasured options would be a guess dressed as a setting.
+/// The local Whisper pass. Selection lives on Home because it gates all three beginnings; this
+/// pane records the same exact artifact costs and the compatibility reason for the default.
 fn transcription_pane(tokens: WorkspaceTokens) -> AnyElement {
+    let choices = crate::session::MODEL_CHOICES
+        .into_iter()
+        .map(|size| {
+            format!(
+                "{} · {} download",
+                crate::session::model_label(size),
+                crate::session::download_size_label(size)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
     pane_column()
         .child(statement(
-            "Model · Whisper base.en",
-            "Sotto downloads ggml-base.en.bin (about 148 MB) once, verifies it against a pinned \
-             SHA-256, and keeps it in ~/Library/Application Support/Sotto/models. No other size is \
-             offered: small.en and medium.en can be provisioned, but nothing has ranked them \
-             against real recordings yet, so a picker here would be a guess.",
+            "Model · choose on Home",
+            &format!(
+                "{choices}. Every size comes from the pinned model specification. small.en is the \
+                 default to preserve existing transcription behavior; T065 lacked an independent \
+                 reference and established no accuracy ranking. Runtime cost stays qualitative \
+                 because no complete three-model measurement is recorded."
+            ),
             tokens,
             false,
         ))
         .child(statement(
             "Model override",
-            "SOTTO_WHISPER_MODEL points transcription at a specific model file. Sotto neither \
-             downloads nor digest-checks an override, and progress still reads base.en, so it is a \
-             developer tool rather than a setting.",
+            "SOTTO_WHISPER_MODEL points transcription at a specific non-empty model file. Sotto \
+             neither downloads nor digest-checks an override, so it remains a developer tool \
+             rather than a managed choice.",
             tokens,
             false,
         ))
         .child(statement(
             "Language — not built",
-            "base.en is an English-only model and Sotto passes no language option. Speech in \
+            "All offered .en models are English-only and Sotto passes no language option. Speech in \
              another language is transcribed as though it were English.",
             tokens,
             true,

@@ -1,6 +1,6 @@
 # T096 — A cached summary must still say what its run lost
 
-**Status:** todo
+**Status:** in-review
 
 **Wave:** R3 — reasoning product
 
@@ -54,3 +54,39 @@ T075 already built.
 Found reviewing T075's handoff on 2026-08-15, where it is recorded as a residual: *"Cached downgrade
 history remains unavailable because it is not persisted."* Filed as its own task rather than left as
 a note, because a residual with no owner is how an acceptance item quietly stops being true.
+
+## Implementation notes — 2026-08-15
+
+Backend downgrade observations now travel with the grounded derived view they qualify. Schema v16
+adds a non-null JSON `normalizations` column with `[]` as the upgrade default; the RAG persistence
+contract returns it and treats a conflicting replay as an evidence-integrity error. The migration
+touches only `grounded_derived_views`, not the session or timeline fact tables.
+
+`insight` owns the durable wire projection for the provider-domain observations. It stores dispatch
+id, open-ended backend id, and the requested control using an explicit snake-case enum, reconstructs
+the checked provider types on both exact cache hits and latest/stale loads, and fails closed on
+malformed persisted JSON or backend ids. The app controller therefore receives the same
+`normalizations` shape for fresh, cached, and stale reports; no rendering branch was added.
+
+Acceptance evidence:
+
+- `grounded_artifact_bundle_commit_replay_conflict_and_delete_atomically` passes and asserts the
+  downgrade JSON round-trip plus conflict rejection when only that run qualification changes.
+- `grounded_artifact_from_before_downgrade_persistence_stays_readable_after_upgrade` passes against
+  a simulated v15 database. The v16 migration restores the column with `[]`, preserves the older
+  artifact as readable, and leaves the captured session target unchanged.
+- `downgraded_summary_keeps_its_qualification_after_reopen` passes through a real normalized
+  backend dispatch, disk persistence, store close, and a new `NotesController`; the reopened cached
+  observations equal the fresh run. `cold_reopen_stays_ready_when_reasoning_is_disabled_without_new_provider_work`
+  also passes and now asserts a clean run remains empty after reopen.
+- `cargo test -p rag --locked` passes: 34 passed, 1 explicit model-cache performance check
+  ignored. `cargo test -p insight --locked` passes: 46 tests across unit and integration targets.
+- Strict focused Clippy passes for `rag` and `insight` with all targets/features and `-D warnings`.
+- `rustfmt --edition 2024 --check` over all owned Rust files and `git diff --check` pass.
+
+After T096 and T097 integration, `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test --workspace --locked`
+passes across the workspace (only the repository's explicitly gated real-model, live-provider, and
+manual tests remain ignored). Strict workspace Clippy passes over all targets and features with
+`-D warnings`; repository-wide formatting and `git diff --check` pass. No signed-app or visual gate
+is required: T075 owns the unchanged renderer, while this task proves cached-load shape parity
+headlessly.

@@ -33,10 +33,8 @@ pub enum NotesState {
         source_status: SourceStatus,
         cached: bool,
         model: String,
-        /// Controls the selected backend could not honor on this fresh run.
-        ///
-        /// Cached reports leave this empty because the observations are diagnostic runtime data
-        /// and are deliberately excluded from the durable artifact.
+        /// Controls the selected backend could not honor while producing this run.
+        /// Cached reports retain the same run qualification as fresh reports.
         normalizations: Vec<ObservedRequestNormalization>,
     },
     Stale {
@@ -44,7 +42,7 @@ pub enum NotesState {
         bundle: mcp::ContextBundle,
         source_status: SourceStatus,
         model: String,
-        /// Empty for stale cached reports; request normalizations are not persisted.
+        /// Controls the selected backend could not honor while producing this cached run.
         normalizations: Vec<ObservedRequestNormalization>,
     },
     Failed(String),
@@ -400,7 +398,9 @@ mod tests {
 
     use futures_util::stream;
     use providers::backend::{ObservedRequestNormalization, RequestNormalization, SamplingControl};
-    use providers::{AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendId};
+    use providers::{
+        AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendId, Registry, Role,
+    };
     use rag::Store;
     use sotto_core::{
         BoxFuture, BoxStream, CaptureTarget, CompletionProvider, CompletionRequest, Delta,
@@ -502,6 +502,83 @@ mod tests {
             return Err("fresh notes result did not become ready".into());
         };
         assert_eq!(normalizations, vec![normalization]);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn downgraded_summary_keeps_its_qualification_after_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("sotto.sqlite3");
+        let store = Store::open(&database).await?;
+        let mut session = Session::new(
+            SessionId::new(96),
+            CaptureTarget {
+                bundle_id: None,
+                display_name: "Meeting".to_owned(),
+                window_title: None,
+                kind: TargetKind::Window,
+                audio_scoped: true,
+            },
+            1,
+        );
+        session.end(2);
+        store.save_session(&session).await?;
+        let mut timeline = TimelineBuilder::new(session);
+        timeline.append(
+            std::time::Duration::from_secs(1),
+            EventPayload::UtteranceFinal(Utterance {
+                source: Source::Mic,
+                start: std::time::Duration::from_secs(1),
+                end: std::time::Duration::from_secs(2),
+                text: "Plan".to_owned(),
+                avg_logprob: 0.0,
+                annotations: Vec::new(),
+            }),
+        );
+        store.append_events(timeline.events()).await?;
+
+        let backend_id = BackendId::new("test.downgraded-reopen")?;
+        let descriptor = BackendDescriptor::new(
+            backend_id.clone(),
+            "Downgraded reopen",
+            "replay-model",
+            1,
+            BackendCapabilities::reasoning_baseline(),
+            AuthKind::None,
+            AuthStatus::Ready,
+        )?;
+        let mut registry = Registry::default();
+        registry.register(descriptor, Arc::new(ReplayProvider(AtomicBool::new(false))))?;
+        registry.select(Role::Summarizer, Some(&backend_id))?;
+        let backend = registry
+            .resolve(Role::Summarizer)?
+            .ok_or("summarizer resolution missing")?;
+        let fresh =
+            MeetingNotesGenerator::new(&store, Arc::new(ReplayProvider(AtomicBool::new(false))))
+                .with_reasoning_provider(backend.provider())
+                .with_backend_fingerprint(backend.cache_fingerprint().clone())
+                .generate_grounded_with_cancellation(
+                    SessionId::new(96),
+                    None,
+                    sotto_core::CancellationToken::new(),
+                )
+                .await?;
+        assert!(!fresh.normalizations.is_empty());
+        drop(store);
+
+        let mut reopened = NotesController::new(database);
+        reopened.refresh_catalogue()?;
+        let NotesState::Ready {
+            cached,
+            normalizations,
+            ..
+        } = reopened.snapshot().state
+        else {
+            return Err("reopened downgraded notes did not remain ready".into());
+        };
+        assert!(cached);
+        assert_eq!(normalizations, fresh.normalizations);
         Ok(())
     }
 
@@ -759,10 +836,10 @@ mod tests {
 
         let mut controller = NotesController::new(database);
         controller.refresh_catalogue()?;
-        assert!(matches!(
-            controller.snapshot().state,
-            NotesState::Ready { .. }
-        ));
+        let NotesState::Ready { normalizations, .. } = controller.snapshot().state else {
+            return Err("clean reopened notes did not remain ready".into());
+        };
+        assert!(normalizations.is_empty());
         controller.set_reasoning_enabled(false);
         assert!(matches!(
             controller.snapshot().state,

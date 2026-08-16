@@ -18,14 +18,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use asr::{
-    Config as AsrConfig, LaggedRecordingTranscriber, ModelSize, RecordingConfig,
-    model::ModelProvisioner,
-};
+use asr::{Config as AsrConfig, LaggedRecordingTranscriber, RecordingConfig};
 use rag::Store;
 use sotto_core::{
-    AsrError, CancellationToken, RecordingStatus, RecordingTranscriber, Session, SessionId,
-    TranscriptUpdate,
+    AsrError, RecordingStatus, RecordingTranscriber, Session, SessionId, TranscriptUpdate,
     types::{MediaTimeMapping, RecordingContainer, SessionRecording, imported_capture_target},
 };
 
@@ -99,15 +95,9 @@ pub(super) async fn import_recording(
     source: &Path,
     database: &Path,
     recording_directory: &Path,
+    model_path: &Path,
 ) -> Result<ImportOutcome, String> {
     validate_container(source)?;
-
-    let provisioner = ModelProvisioner::for_current_user().map_err(|error| error.to_string())?;
-    let cancellation = CancellationToken::new();
-    let model_path = provisioner
-        .resolve_configured_or_download(ModelSize::default(), &cancellation, |_| {})
-        .await
-        .map_err(|error| error.to_string())?;
 
     // Reused unmodified, per the plan: this is exactly the layout a captured recording's own tail
     // read uses. An import has no verified channel convention to apply (T061's left=meeting,
@@ -390,10 +380,10 @@ mod tests {
             ) else {
                 return Err("this host is missing say or afconvert".into());
             };
-            let _ = &model;
+            let model = PathBuf::from(model);
             let database = directory.path().join("sotto.sqlite3");
             let recordings = directory.path().join("recordings");
-            let outcome = import_recording(&source, &database, &recordings).await?;
+            let outcome = import_recording(&source, &database, &recordings, &model).await?;
 
             assert!(
                 outcome.utterance_count > 0,
@@ -442,14 +432,14 @@ mod tests {
                         .into(),
                 );
             };
-            let _ = &model;
+            let model = PathBuf::from(model);
             let database = directory.path().join("sotto.sqlite3");
             let recordings = directory.path().join("recordings");
             // Awaited on this test's own runtime rather than nested inside a second one. The two
             // sibling rejection tests below are synchronous and legitimately build their own
             // runtime; this one is `async` because it awaits the store afterwards, and
             // `Runtime::block_on` panics outright when a runtime is already driving the thread.
-            let outcome = import_recording(&source, &database, &recordings).await?;
+            let outcome = import_recording(&source, &database, &recordings, &model).await?;
 
             let store = rag::Store::open(&database).await?;
             let transcript = transcript_of(&store, outcome.session_id).await;
@@ -489,7 +479,7 @@ mod tests {
         -> Result<(), Box<dyn std::error::Error>> {
             let model = std::env::var_os("SOTTO_WHISPER_MODEL")
                 .ok_or("SOTTO_WHISPER_MODEL must point to ggml Whisper weights")?;
-            let _ = &model;
+            let model = PathBuf::from(model);
             let directory = tempfile::tempdir()?;
             let source = directory.path().join("mono-voice-memo.m4a");
             let produced = Command::new("say")
@@ -509,7 +499,7 @@ mod tests {
                 .enable_all()
                 .build()?;
             let error = runtime
-                .block_on(import_recording(&source, &database, &recordings))
+                .block_on(import_recording(&source, &database, &recordings, &model))
                 .err()
                 .ok_or("a genuinely mono recording must be rejected, not silently accepted")?;
             assert!(
@@ -529,7 +519,7 @@ mod tests {
         -> Result<(), Box<dyn std::error::Error>> {
             let model = std::env::var_os("SOTTO_WHISPER_MODEL")
                 .ok_or("SOTTO_WHISPER_MODEL must point to ggml Whisper weights")?;
-            let _ = &model;
+            let model = PathBuf::from(model);
             let directory = tempfile::tempdir()?;
             let source = directory.path().join("silent-screen-share.mp4");
             let produced = Command::new("ffmpeg")
@@ -562,7 +552,7 @@ mod tests {
                 .enable_all()
                 .build()?;
             let error = runtime
-                .block_on(import_recording(&source, &database, &recordings))
+                .block_on(import_recording(&source, &database, &recordings, &model))
                 .err()
                 .ok_or("a video with no audio track must be rejected, not silently accepted")?;
             assert!(
