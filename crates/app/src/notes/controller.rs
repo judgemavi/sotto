@@ -7,8 +7,9 @@ use std::{
 };
 
 use insight::{
-    GroundedMeetingNotesReport, GroundingInput, MeetingNotesGenerator, RecordingNotes,
-    SourceStatus, load_latest_grounded_notes_status,
+    GroundedMeetingNotesReport, GroundingInput, MeetingNotesGenerator, NotesOverlayOperation,
+    PresentedNotesDocument, RecordingNotes, SourceStatus, append_notes_overlay_operation,
+    load_latest_grounded_notes_status, load_presented_notes_document,
 };
 use providers::backend::ObservedRequestNormalization;
 use providers::{BackendFingerprint, ReasoningProvider, ResolvedBackend};
@@ -29,6 +30,7 @@ pub enum NotesState {
     Generating,
     Ready {
         notes: Box<RecordingNotes>,
+        document: Box<PresentedNotesDocument>,
         bundle: mcp::ContextBundle,
         source_status: SourceStatus,
         cached: bool,
@@ -39,6 +41,7 @@ pub enum NotesState {
     },
     Stale {
         notes: Box<RecordingNotes>,
+        document: Box<PresentedNotesDocument>,
         bundle: mcp::ContextBundle,
         source_status: SourceStatus,
         model: String,
@@ -268,9 +271,13 @@ impl NotesController {
             return false;
         }
         self.screen_consultations = result.consultations;
-        self.state = match result.result {
-            Ok(report) => NotesState::Ready {
+        self.state = match result.result.and_then(|report| {
+            let document = self.presented_document(result.session_id, &report.artifact)?;
+            Ok((report, document))
+        }) {
+            Ok((report, document)) => NotesState::Ready {
                 notes: Box::new(report.artifact),
+                document: Box::new(document),
                 bundle: report.bundle,
                 source_status: report.source_status,
                 cached: report.cached,
@@ -290,6 +297,64 @@ impl NotesController {
             state: self.state.clone(),
             screen_consultations: self.screen_consultations.clone(),
         }
+    }
+
+    pub fn append_overlay_operation(
+        &mut self,
+        operation: &NotesOverlayOperation,
+        created_at_unix_ms: u64,
+    ) -> Result<(), String> {
+        let session_id = self
+            .selected_session
+            .ok_or_else(|| "Select a recording first.".to_owned())?;
+        let artifact = match &self.state {
+            NotesState::Ready { notes, .. } | NotesState::Stale { notes, .. } => notes.clone(),
+            _ => return Err("Generate a summary before editing its blocks.".to_owned()),
+        };
+        let document = block_on(async {
+            let store = Store::open(&self.database).await?;
+            let entry_id = store.entry_for_session(session_id).await?;
+            append_notes_overlay_operation(
+                &store,
+                entry_id,
+                &artifact,
+                operation,
+                created_at_unix_ms,
+            )
+            .await
+            .map_err(|error| sotto_core::RagError::Storage(error.to_string()))?;
+            load_presented_notes_document(&store, entry_id, &artifact)
+                .await
+                .map_err(|error| sotto_core::RagError::Storage(error.to_string()))
+        })
+        .map_err(|error| error.to_string())?;
+        match &mut self.state {
+            NotesState::Ready {
+                document: current, ..
+            }
+            | NotesState::Stale {
+                document: current, ..
+            } => **current = document,
+            _ => {
+                return Err("The selected summary changed while its edit was saved.".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn presented_document(
+        &self,
+        session_id: SessionId,
+        artifact: &RecordingNotes,
+    ) -> Result<PresentedNotesDocument, String> {
+        block_on(async {
+            let store = Store::open(&self.database).await?;
+            let entry_id = store.entry_for_session(session_id).await?;
+            load_presented_notes_document(&store, entry_id, artifact)
+                .await
+                .map_err(|error| sotto_core::RagError::Storage(error.to_string()))
+        })
+        .map_err(|error| error.to_string())
     }
 
     fn invalidate_pending(&mut self) {
@@ -320,19 +385,29 @@ impl NotesController {
         };
         self.state = match block_on(async {
             let store = Store::open(&self.database).await?;
-            load_latest_grounded_notes_status(&store, session_id)
+            let cached = load_latest_grounded_notes_status(&store, session_id)
                 .await
-                .map_err(|error| sotto_core::RagError::Storage(error.to_string()))
+                .map_err(|error| sotto_core::RagError::Storage(error.to_string()))?;
+            let Some(cached) = cached else {
+                return Ok::<_, sotto_core::RagError>(None);
+            };
+            let entry_id = store.entry_for_session(session_id).await?;
+            let document = load_presented_notes_document(&store, entry_id, &cached.report.artifact)
+                .await
+                .map_err(|error| sotto_core::RagError::Storage(error.to_string()))?;
+            Ok(Some((cached, document)))
         }) {
-            Ok(Some(cached)) if cached.stale => NotesState::Stale {
+            Ok(Some((cached, document))) if cached.stale => NotesState::Stale {
                 notes: Box::new(cached.report.artifact),
+                document: Box::new(document),
                 bundle: cached.report.bundle,
                 source_status: cached.report.source_status,
                 model: cached.report.model,
                 normalizations: cached.report.normalizations,
             },
-            Ok(Some(cached)) => NotesState::Ready {
+            Ok(Some((cached, document))) => NotesState::Ready {
                 notes: Box::new(cached.report.artifact),
+                document: Box::new(document),
                 bundle: cached.report.bundle,
                 source_status: cached.report.source_status,
                 cached: true,

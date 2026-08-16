@@ -1,6 +1,6 @@
 # T087 — The notes document: a summary you can edit without losing either author
 
-**Status:** todo
+**Status:** in-review
 
 **Wave:** D1 — living notes
 
@@ -82,3 +82,42 @@ directly.
 
 The artifact schema itself (T070), the markdown projection (T088), entry UI (T089), commitment
 carry-forward (T093), rich text, and any change to live-call annotation.
+
+## Implementation notes — 2026-08-15
+
+The notes document now has one canonical composed representation in `insight`. Generated artifacts
+remain immutable; a SHA-256 artifact version and an append-only sequence of typed operations (`add`,
+`reword`, `set_checked`, `hide`, `reorder`) produce `PresentedNotesDocument`. Every targeted
+operation records the original block id, section/type, and complete meeting/external citation set.
+Composition first binds an exact id, then deterministically chooses the greatest same-section,
+same-type citation overlap with block-id tie-breaking. An unmatched reword becomes an uncited,
+flagged user block. User additions are structurally unable to carry citations.
+
+Schema v17 adds `entry_note_overlay_ops`, keyed to the entry with an increasing SQLite sequence.
+The store exposes append and ordered replay only; there is no update/delete path. High-level tests
+append typed punctuation/spacing/Unicode, close the database, reopen it, and assert the entire
+composed document and user bytes are identical.
+
+`NotesController` now loads and refreshes the composed document for both current and stale generated
+artifacts. The summary column consumes that document, labels every block `Generated`, `Edited from
+draft`, or `Your words`, flags orphaned edits, exposes check/edit/hide controls on pointer hover, and
+uses the post-close composer for add/reword operations. Action edits expose text plus editable Owner
+and Due lines. The old boxed post-close `Your notes` composer is gone; completed anchored annotations
+render inline as user-authored blocks. The live-call anchored annotation path and its composer are
+unchanged.
+
+The reasoning generator never loads the overlay. An integration test persists a sentinel user edit,
+forces a fresh provider dispatch under a different backend fingerprint, and asserts the serialized
+requests contain neither the sentinel text nor its user block id.
+
+### Verification
+
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test -p app notes:: --locked` — 40 passed.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test -p insight notes::overlay:: --locked` — 4 passed.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test -p insight --test meeting_notes --locked` — 2 passed,
+  including overlay-content request exclusion.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test --workspace --locked` — passed across the workspace;
+  live-provider, real-model, real-media, and performance tests remained explicitly ignored.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo clippy --workspace --all-targets --locked -- -D warnings`
+  — passed.
+- `cargo fmt --all -- --check` and `git diff --check` — passed.

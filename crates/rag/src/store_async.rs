@@ -204,7 +204,7 @@ pub struct GroundedDerivedArtifact {
 #[derive(Clone)]
 pub struct Store {
     pub(crate) writer: DatabaseConnection,
-    reader: DatabaseConnection,
+    pub(crate) reader: DatabaseConnection,
     embedding: Arc<Mutex<Option<TextEmbedding>>>,
 }
 
@@ -628,7 +628,7 @@ pub(crate) async fn query_one<C: ConnectionTrait>(
         .map_err(storage)
 }
 
-async fn query_all<C: ConnectionTrait>(
+pub(crate) async fn query_all<C: ConnectionTrait>(
     connection: &C,
     sql: &str,
     values: Vec<SeaValue>,
@@ -643,14 +643,14 @@ async fn query_all<C: ConnectionTrait>(
         .map_err(storage)
 }
 
-fn get<T>(row: &QueryResult, column: &str) -> Result<T, RagError>
+pub(crate) fn get<T>(row: &QueryResult, column: &str) -> Result<T, RagError>
 where
     T: sea_orm::TryGetable,
 {
     row.try_get("", column).map_err(storage)
 }
 
-fn to_i64<T>(value: T) -> Result<i64, RagError>
+pub(crate) fn to_i64<T>(value: T) -> Result<i64, RagError>
 where
     T: TryInto<i64>,
     T::Error: std::fmt::Display,
@@ -658,7 +658,7 @@ where
     value.try_into().map_err(message)
 }
 
-fn from_i64<T>(value: i64) -> Result<T, RagError>
+pub(crate) fn from_i64<T>(value: i64) -> Result<T, RagError>
 where
     T: TryFrom<i64>,
     T::Error: std::fmt::Display,

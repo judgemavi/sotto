@@ -33,9 +33,11 @@ use gpui_component::{
     text::TextView,
 };
 use insight::{
-    RecordingNotes, RecordingNotesBlock, RecordingNotesSection, RecordingNotesSectionKind,
-    SourceStatus,
+    NotesBlockProvenance, NotesOverlayOperation, OverlayTarget, PresentedNotesBlock,
+    PresentedNotesBlockId, PresentedNotesDocument, RecordingNotesSectionKind, SourceStatus,
 };
+#[cfg(test)]
+use insight::{RecordingNotes, RecordingNotesBlock, RecordingNotesSection};
 use providers::backend::ObservedRequestNormalization;
 use sotto_core::{EventId, EventPayload, MarkKind, TimelineEvent, replay_lenient};
 
@@ -92,7 +94,10 @@ pub(crate) fn render_with_citation_times(
                 .overflow_y_scrollbar()
                 .px_4()
                 .py_3()
-                .child(render_your_notes(annotations, citation_times, cx))
+                .children(live.then(|| render_your_notes(annotations, citation_times, cx)))
+                .children(
+                    (!live).then(|| render_completed_annotations(annotations, citation_times, cx)),
+                )
                 .child(SummaryBody {
                     summary,
                     citation_times: citation_times.clone(),
@@ -114,15 +119,18 @@ pub(crate) fn render_with_citation_times(
                     ControlRow::new()
                         .child(
                             ControlRole::Ellipsizing,
-                            Input::new(annotation_input)
-                                .disabled(selected_anchor.is_none() && latest_anchor.is_none()),
+                            Input::new(annotation_input).disabled(
+                                live && selected_anchor.is_none() && latest_anchor.is_none(),
+                            ),
                         )
                         .child(
                             ControlRole::Essential,
                             Button::new("append-note")
-                                .label("Add")
+                                .label(if live { "Add" } else { "Save block" })
                                 .small()
-                                .disabled(selected_anchor.is_none() && latest_anchor.is_none())
+                                .disabled(
+                                    live && selected_anchor.is_none() && latest_anchor.is_none(),
+                                )
                                 .debug_selector(|| "append-note-control".into())
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.submit_annotation(window, cx);
@@ -145,6 +153,45 @@ pub(crate) fn render_with_citation_times(
                     }),
                 ),
         )
+        .into_any_element()
+}
+
+fn render_completed_annotations(
+    annotations: &[AnnotationView],
+    citation_times: &CitationTimes,
+    cx: &mut Context<MeetingWorkspace>,
+) -> gpui::AnyElement {
+    let tokens = WorkspaceTokens::resolve(cx);
+    div()
+        .children((!annotations.is_empty()).then(|| {
+            div()
+                .mt_3()
+                .pb_1()
+                .mb_2()
+                .border_b_1()
+                .border_color(tokens.line_soft)
+                .child("Your notes")
+        }))
+        .children(annotations.iter().map(|annotation| {
+            let anchor = annotation.anchor;
+            div()
+                .mb_2()
+                .child(SelectableText {
+                    id: ("completed-user-note", annotation.event_id.get()).into(),
+                    text: annotation.text.clone(),
+                    color: tokens.ink_2,
+                })
+                .child(
+                    Button::new(("completed-user-note-anchor", annotation.event_id.get()))
+                        .label(moment_label(anchor, citation_times))
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_citation(anchor, cx);
+                        })),
+                )
+                .child(div().text_xs().text_color(tokens.faint).child("Your words"))
+        }))
         .into_any_element()
 }
 
@@ -199,6 +246,12 @@ pub(crate) struct AnnotationView {
     pub(crate) anchor: EventId,
     pub(crate) text: String,
     pub(crate) mark: MarkKind,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EditingNotesBlock {
+    target: OverlayTarget,
+    action: bool,
 }
 
 /// Returns the active append-only annotation versions in event order.
@@ -541,6 +594,15 @@ impl MeetingWorkspace {
     }
 
     pub(crate) fn submit_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.transcript_live
+            && matches!(
+                self.notes.read(cx).snapshot().state,
+                NotesState::Ready { .. } | NotesState::Stale { .. }
+            )
+        {
+            self.submit_notes_block(window, cx);
+            return;
+        }
         let Some(id) = self.transcript_session else {
             self.message = Some("No recording is selected for this typed note.".to_owned());
             cx.notify();
@@ -656,6 +718,116 @@ impl MeetingWorkspace {
         }
         cx.notify();
     }
+
+    fn begin_notes_block_edit(
+        &mut self,
+        target: OverlayTarget,
+        text: String,
+        owner: Option<String>,
+        due_date: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let action = target.action;
+        let editable = if action {
+            format!(
+                "{text}\nOwner: {}\nDue: {}",
+                owner.unwrap_or_default(),
+                due_date.unwrap_or_default()
+            )
+        } else {
+            text
+        };
+        self.annotation_input
+            .update(cx, |input, cx| input.set_value(editable, window, cx));
+        self.editing_notes_block = Some(EditingNotesBlock { target, action });
+        self.message = Some(if action {
+            "Editing block. Its Owner and Due lines are part of this verbatim edit.".to_owned()
+        } else {
+            "Editing block; save keeps your wording verbatim.".to_owned()
+        });
+        cx.notify();
+    }
+
+    fn apply_notes_operation(&mut self, operation: NotesOverlayOperation, cx: &mut Context<Self>) {
+        let created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+        let result = created_at
+            .map_err(|error| format!("The system clock cannot date this edit: {error}"))
+            .and_then(|created_at| {
+                self.notes.update(cx, |notes, _| {
+                    notes.append_overlay_operation(&operation, created_at)
+                })
+            });
+        self.message = Some(match result {
+            Ok(()) => "Notes document saved. The generated artifact is unchanged.".to_owned(),
+            Err(error) => error,
+        });
+        cx.notify();
+    }
+
+    fn submit_notes_block(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.annotation_input.read(cx).value().to_string();
+        if input.trim().is_empty() {
+            self.message = Some("Type a block before saving it.".to_owned());
+            cx.notify();
+            return;
+        }
+        let operation = if let Some(editing) = self.editing_notes_block.take() {
+            let (text, owner, due_date) = parse_editable_block(&input, editing.action);
+            NotesOverlayOperation::Reword {
+                target: editing.target,
+                text,
+                owner,
+                due_date,
+            }
+        } else {
+            let id = format!(
+                "user-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_nanos())
+            );
+            NotesOverlayOperation::Add {
+                user_block_id: id,
+                section: RecordingNotesSectionKind::Overview,
+                text: input,
+                action: false,
+                owner: None,
+                due_date: None,
+            }
+        };
+        self.apply_notes_operation(operation, cx);
+        self.annotation_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+    }
+}
+
+fn parse_editable_block(input: &str, action: bool) -> (String, Option<String>, Option<String>) {
+    if !action {
+        return (input.to_owned(), None, None);
+    }
+    let mut lines = input.lines().collect::<Vec<_>>();
+    let due_date = lines
+        .last()
+        .and_then(|line| line.strip_prefix("Due:"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if lines.last().is_some_and(|line| line.starts_with("Due:")) {
+        lines.pop();
+    }
+    let owner = lines
+        .last()
+        .and_then(|line| line.strip_prefix("Owner:"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if lines.last().is_some_and(|line| line.starts_with("Owner:")) {
+        lines.pop();
+    }
+    (lines.join("\n"), owner, due_date)
 }
 
 #[must_use]
@@ -815,6 +987,13 @@ struct Claim {
     detail: Option<String>,
     meeting: Vec<EventId>,
     external: Vec<mcp::EvidenceId>,
+    provenance: NotesBlockProvenance,
+    checked: bool,
+    orphaned: bool,
+    target: Option<OverlayTarget>,
+    action: bool,
+    owner: Option<String>,
+    due_date: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -842,6 +1021,7 @@ struct SummarySection {
 /// `RecordingNotes` is expected to already exclude empty sections — its validation rejects one —
 /// but the filter below does not lean on that alone: a heading with nothing under it must never be
 /// producible from this function no matter what the artifact contains.
+#[cfg(test)]
 fn summary_sections(notes: RecordingNotes) -> Vec<SummarySection> {
     notes
         .sections
@@ -851,6 +1031,55 @@ fn summary_sections(notes: RecordingNotes) -> Vec<SummarySection> {
         .collect()
 }
 
+fn document_sections(document: PresentedNotesDocument) -> Vec<SummarySection> {
+    let mut sections = Vec::<SummarySection>::new();
+    for block in document.blocks {
+        let (heading, shape) = section_heading(block.section);
+        if sections
+            .last()
+            .is_none_or(|section| section.heading != heading)
+        {
+            sections.push(SummarySection {
+                heading: heading.to_owned(),
+                shape,
+                claims: Vec::new(),
+            });
+        }
+        if let Some(section) = sections.last_mut() {
+            section.claims.push(presented_claim(block));
+        }
+    }
+    sections
+}
+
+fn presented_claim(block: PresentedNotesBlock) -> Claim {
+    let target = Some(OverlayTarget {
+        block_id: match &block.id {
+            PresentedNotesBlockId::Generated(block_id) => block_id.as_str().to_owned(),
+            PresentedNotesBlockId::User(block_id) => block_id.clone(),
+        },
+        section: block.section,
+        action: block.action,
+        meeting_citations: block.meeting_citations.clone(),
+        external_citations: block.external_citations.clone(),
+    });
+    Claim {
+        lead: block.owner.clone(),
+        text: block.text,
+        detail: block.due_date.clone().map(|date| format!("due {date}")),
+        meeting: block.meeting_citations,
+        external: block.external_citations,
+        provenance: block.provenance,
+        checked: block.checked,
+        orphaned: block.orphaned,
+        target,
+        action: block.action,
+        owner: block.owner,
+        due_date: block.due_date,
+    }
+}
+
+#[cfg(test)]
 fn summary_section(section: RecordingNotesSection) -> SummarySection {
     let (heading, shape) = section_heading(section.kind);
     SummarySection {
@@ -876,6 +1105,7 @@ const fn section_heading(kind: RecordingNotesSectionKind) -> (&'static str, Sect
     }
 }
 
+#[cfg(test)]
 fn block_claim(block: RecordingNotesBlock) -> Claim {
     match block {
         RecordingNotesBlock::Claim {
@@ -889,6 +1119,13 @@ fn block_claim(block: RecordingNotesBlock) -> Claim {
             detail: None,
             meeting: meeting_citations,
             external: external_citations,
+            provenance: NotesBlockProvenance::Generated,
+            checked: false,
+            orphaned: false,
+            target: None,
+            action: false,
+            owner: None,
+            due_date: None,
         },
         RecordingNotesBlock::Action {
             text,
@@ -918,6 +1155,13 @@ fn block_claim(block: RecordingNotesBlock) -> Claim {
                 detail: due_date.map(|date| format!("due {date}")),
                 meeting,
                 external,
+                provenance: NotesBlockProvenance::Generated,
+                checked: false,
+                orphaned: false,
+                target: None,
+                action: true,
+                owner: None,
+                due_date: None,
             }
         }
     }
@@ -967,14 +1211,15 @@ impl SummaryView {
                 view
             }
             NotesState::Ready {
-                notes,
+                document,
                 bundle,
                 source_status,
                 cached,
                 model,
                 normalizations,
+                ..
             } => Self::ready(
-                *notes,
+                *document,
                 bundle,
                 source_status,
                 ready_origin(cached),
@@ -982,13 +1227,14 @@ impl SummaryView {
                 normalization_line(&normalizations),
             ),
             NotesState::Stale {
-                notes,
+                document,
                 bundle,
                 source_status,
                 model,
                 normalizations,
+                ..
             } => Self::ready(
-                *notes,
+                *document,
                 bundle,
                 source_status,
                 "Saved summary",
@@ -1018,14 +1264,14 @@ impl SummaryView {
     }
 
     fn ready(
-        notes: RecordingNotes,
+        document: PresentedNotesDocument,
         bundle: mcp::ContextBundle,
         source_status: SourceStatus,
         origin: &str,
         model: String,
         caution: Option<String>,
     ) -> Self {
-        let sections = summary_sections(notes);
+        let sections = document_sections(document);
         // A summary with no section at all is not a summary; say so rather than drawing a heading
         // count of zero over an empty column.
         if sections.is_empty() {
@@ -1315,6 +1561,11 @@ fn render_claim(
     context: &ClaimContext<'_>,
 ) -> gpui::AnyElement {
     let tokens = context.tokens;
+    let raw_text = claim.text.clone();
+    let owner = claim.owner.clone();
+    let due_date = claim.due_date.clone();
+    let checked = claim.checked;
+    let target = claim.target.clone();
     let mut text = claim.text;
     if let Some(lead) = claim.lead {
         text = format!("{lead} — {text}");
@@ -1322,7 +1573,17 @@ fn render_claim(
     if let Some(detail) = claim.detail {
         text = format!("{text} ({detail})");
     }
+    if claim.checked {
+        text = format!("✓ {text}");
+    }
+    let provenance = match claim.provenance {
+        NotesBlockProvenance::Generated => "Generated",
+        NotesBlockProvenance::EditedFromDraft => "Edited from draft",
+        NotesBlockProvenance::UserAuthored => "Your words",
+    };
+    let hover_group = format!("notes-block-{ordinal}");
     div()
+        .group(hover_group.clone())
         .mb_2()
         .min_w_0()
         .when(!prose, |item| {
@@ -1336,6 +1597,84 @@ fn render_claim(
                     id: ("summary-claim", ordinal).into(),
                     text,
                     color: tokens.ink_2,
+                }),
+        )
+        .children(target.map(|target| {
+            let check_target = target.clone();
+            let edit_target = target.clone();
+            let hide_target = target;
+            let edit_text = raw_text.clone();
+            let edit_owner = owner.clone();
+            let edit_due_date = due_date.clone();
+            let check_workspace = context.workspace.clone();
+            let edit_workspace = context.workspace.clone();
+            let hide_workspace = context.workspace.clone();
+            ControlRow::new()
+                .child(ControlRole::Ellipsizing, div())
+                .child_when(claim.action, ControlRole::Essential, || {
+                    let label = if checked { "Uncheck" } else { "Check" };
+                    Button::new(("notes-check", ordinal))
+                        .label(label)
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_, _, cx| {
+                            let operation = NotesOverlayOperation::SetChecked {
+                                target: check_target.clone(),
+                                checked: !checked,
+                            };
+                            let _ = check_workspace.update(cx, |this, cx| {
+                                this.apply_notes_operation(operation, cx);
+                            });
+                        })
+                        .into_any_element()
+                })
+                .child(
+                    ControlRole::Essential,
+                    Button::new(("notes-edit", ordinal))
+                        .label("Edit")
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_, window, cx| {
+                            let _ = edit_workspace.update(cx, |this, cx| {
+                                this.begin_notes_block_edit(
+                                    edit_target.clone(),
+                                    edit_text.clone(),
+                                    edit_owner.clone(),
+                                    edit_due_date.clone(),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }),
+                )
+                .child(
+                    ControlRole::Essential,
+                    Button::new(("notes-hide", ordinal))
+                        .label("Hide")
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_, _, cx| {
+                            let operation = NotesOverlayOperation::Hide {
+                                target: hide_target.clone(),
+                            };
+                            let _ = hide_workspace.update(cx, |this, cx| {
+                                this.apply_notes_operation(operation, cx);
+                            });
+                        }),
+                )
+                .finish()
+                .gap_1()
+                .opacity(0.0)
+                .group_hover(hover_group, |style| style.opacity(1.0))
+        }))
+        .child(
+            div()
+                .text_xs()
+                .text_color(if claim.orphaned { tokens.warn } else { tokens.faint })
+                .child(if claim.orphaned {
+                    format!("{provenance} · the regenerated summary no longer contains the block you edited")
+                } else {
+                    provenance.to_owned()
                 }),
         )
         .child(render_evidence(
@@ -1510,6 +1849,12 @@ mod tests {
             "meeting_citations": [citation],
             "external_citations": [],
         })
+    }
+
+    fn document(
+        notes: RecordingNotes,
+    ) -> Result<insight::PresentedNotesDocument, insight::NotesOverlayError> {
+        insight::compose_notes_document(&notes, &[])
     }
 
     fn action(text: &str, citation: u64) -> serde_json::Value {
@@ -1855,13 +2200,18 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_summary_says_what_is_wrong_with_it_and_still_renders() {
+    fn a_stale_summary_says_what_is_wrong_with_it_and_still_renders()
+    -> Result<(), Box<dyn std::error::Error>> {
         let view = SummaryView::resolve(
             NotesState::Stale {
                 notes: Box::new(recording_notes(vec![section(
                     "decisions",
                     vec![note("Ship on Friday.", 1)],
                 )])),
+                document: Box::new(document(recording_notes(vec![section(
+                    "decisions",
+                    vec![note("Ship on Friday.", 1)],
+                )]))?),
                 bundle: mcp::ContextBundle::empty(),
                 source_status: insight::SourceStatus::NotSelected,
                 model: "gpt-5.4-codex".to_owned(),
@@ -1882,16 +2232,22 @@ mod tests {
             "the model that produced the summary is named: {:?}",
             view.provenance
         );
+        Ok(())
     }
 
     #[test]
-    fn a_fresh_summary_names_its_model_and_its_source_footing() {
+    fn a_fresh_summary_names_its_model_and_its_source_footing()
+    -> Result<(), Box<dyn std::error::Error>> {
         let view = SummaryView::resolve(
             NotesState::Ready {
                 notes: Box::new(recording_notes(vec![section(
                     "overview",
                     vec![note("Planning.", 1)],
                 )])),
+                document: Box::new(document(recording_notes(vec![section(
+                    "overview",
+                    vec![note("Planning.", 1)],
+                )]))?),
                 bundle: mcp::ContextBundle::empty(),
                 source_status: insight::SourceStatus::Unavailable,
                 cached: false,
@@ -1909,6 +2265,7 @@ mod tests {
             ],
             "the column states who wrote the summary and on what footing"
         );
+        Ok(())
     }
 
     #[test]
@@ -1928,6 +2285,10 @@ mod tests {
                     "overview",
                     vec![note("Planning.", 1)],
                 )])),
+                document: Box::new(document(recording_notes(vec![section(
+                    "overview",
+                    vec![note("Planning.", 1)],
+                )]))?),
                 bundle: mcp::ContextBundle::empty(),
                 source_status: insight::SourceStatus::NotSelected,
                 cached: false,
@@ -1950,10 +2311,12 @@ mod tests {
     }
 
     #[test]
-    fn a_summary_with_no_supported_section_says_so_instead_of_counting_zero() {
+    fn a_summary_with_no_supported_section_says_so_instead_of_counting_zero()
+    -> Result<(), Box<dyn std::error::Error>> {
         let view = SummaryView::resolve(
             NotesState::Ready {
                 notes: Box::new(RecordingNotes::default()),
+                document: Box::new(document(RecordingNotes::default())?),
                 bundle: mcp::ContextBundle::empty(),
                 source_status: insight::SourceStatus::NotSelected,
                 cached: false,
@@ -1973,6 +2336,7 @@ mod tests {
                 .any(|line| line.contains("gpt-5.4-codex")),
             "an empty result still names the model that produced it"
         );
+        Ok(())
     }
 
     #[test]
@@ -2458,7 +2822,6 @@ mod tests {
                 &[
                     "notes-head-row",
                     "summarize-control",
-                    "your-notes-block",
                     "summary-area",
                     "notes-composer",
                     "append-note-control",
@@ -2470,6 +2833,10 @@ mod tests {
                     "source-context-quiet",
                 ],
             )?;
+            assert!(
+                visual.debug_bounds("your-notes-block").is_none(),
+                "the retired post-close composer block must not sit above the notes document"
+            );
             assert!(
                 visual.debug_bounds("summary-pending").is_none(),
                 "a summarized recording must not also render the pending state"

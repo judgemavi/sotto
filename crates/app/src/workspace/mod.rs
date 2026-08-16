@@ -428,6 +428,7 @@ pub struct MeetingWorkspace {
     library_filter: Entity<InputState>,
     annotation_input: Entity<InputState>,
     editing_annotation: Option<notes::AnnotationView>,
+    editing_notes_block: Option<notes::EditingNotesBlock>,
     library_index: BTreeMap<SessionId, String>,
     library_footprint: library::LibraryFootprint,
     /// Whether the library rail is hidden. Persisted, the way `ask_open` is.
@@ -590,6 +591,7 @@ impl MeetingWorkspace {
             library_filter,
             annotation_input,
             editing_annotation: None,
+            editing_notes_block: None,
             library_index: BTreeMap::new(),
             library_footprint: library::LibraryFootprint::default(),
             library_collapsed: persisted.library_collapsed,

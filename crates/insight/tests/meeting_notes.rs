@@ -14,7 +14,10 @@ mod tests {
     };
 
     use futures_util::stream;
-    use insight::MeetingNotesGenerator;
+    use insight::{
+        MeetingNotesGenerator, NotesOverlayOperation, RecordingNotesSectionKind,
+        append_notes_overlay_operation,
+    };
     use providers::{AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendId};
     use sotto_core::{
         BoxFuture, BoxStream, CancellationToken, CaptureTarget, CompletionProvider,
@@ -159,6 +162,52 @@ mod tests {
         assert!(
             !inputs[2].contains("\"id\""),
             "reduce receives provider draft blocks, not finalized Sotto identities"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serialized_reasoning_request_never_contains_overlay_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (store, session_id) = store_with_utterances(&[1]).await?;
+        let output = r#"{"sections":[{"kind":"overview","blocks":[{"type":"claim","text":"Launch planning began","meeting_citations":[1]}]}]}"#;
+        let first_provider = Arc::new(QueueProvider::new([output]));
+        let first = MeetingNotesGenerator::new(&store, first_provider)
+            .with_backend_fingerprint(fingerprint("test.notes.before-overlay")?)
+            .generate_grounded_with_cancellation(session_id, None, CancellationToken::new())
+            .await?;
+        let entry_id = store.entry_for_session(session_id).await?;
+        let secret = "USER-OVERLAY-MUST-NOT-REACH-THE-MODEL";
+        append_notes_overlay_operation(
+            &store,
+            entry_id,
+            &first.artifact,
+            &NotesOverlayOperation::Add {
+                user_block_id: "private-user-block".to_owned(),
+                section: RecordingNotesSectionKind::Overview,
+                text: secret.to_owned(),
+                action: false,
+                owner: None,
+                due_date: None,
+            },
+            10,
+        )
+        .await?;
+
+        let second_provider = Arc::new(QueueProvider::new([output]));
+        MeetingNotesGenerator::new(&store, second_provider.clone())
+            .with_backend_fingerprint(fingerprint("test.notes.after-overlay")?)
+            .generate_grounded_with_cancellation(session_id, None, CancellationToken::new())
+            .await?;
+        let inputs = second_provider
+            .inputs
+            .lock()
+            .map_err(|_| "inputs poisoned")?;
+        assert!(!inputs.iter().any(|input| input.contains(secret)));
+        assert!(
+            !inputs
+                .iter()
+                .any(|input| input.contains("private-user-block"))
         );
         Ok(())
     }

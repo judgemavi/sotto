@@ -2,7 +2,7 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use sea_orm_migration::{MigrationName, MigrationTrait, MigratorTrait, SchemaManager};
 use sotto_core::{RagError, SQLITE_SCHEMA};
 
-pub(crate) const SCHEMA_VERSION: u32 = 16;
+pub(crate) const SCHEMA_VERSION: u32 = 17;
 
 const RAG_SCHEMA: &str = r#"
 CREATE TABLE documents (
@@ -118,9 +118,23 @@ CREATE TABLE entry_sessions (
 CREATE INDEX entry_sessions_entry_idx ON entry_sessions(entry_id,session_id);
 "#;
 
+const NOTES_OVERLAY_SCHEMA: &str = r#"
+CREATE TABLE entry_note_overlay_ops (
+ sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+ entry_id TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+ artifact_version TEXT NOT NULL,
+ operation TEXT NOT NULL,
+ created_at_unix_ms INTEGER NOT NULL
+);
+CREATE INDEX entry_note_overlay_entry_idx
+ ON entry_note_overlay_ops(entry_id,sequence);
+"#;
+
 struct BaselineMigration;
 
 struct GroundedNormalizationsMigration;
+
+struct NotesOverlayMigration;
 
 impl MigrationName for BaselineMigration {
     fn name(&self) -> &str {
@@ -162,6 +176,33 @@ impl MigrationName for GroundedNormalizationsMigration {
     }
 }
 
+impl MigrationName for NotesOverlayMigration {
+    fn name(&self) -> &str {
+        "m0003_entry_note_overlay"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for NotesOverlayMigration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), sea_orm::DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(NOTES_OVERLAY_SCHEMA)
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(&format!("PRAGMA user_version={SCHEMA_VERSION};"))
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), sea_orm::DbErr> {
+        Err(sea_orm::DbErr::Migration(
+            "the user-authored notes overlay is intentionally append-only".to_owned(),
+        ))
+    }
+}
+
 #[async_trait::async_trait]
 impl MigrationTrait for GroundedNormalizationsMigration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), sea_orm::DbErr> {
@@ -193,6 +234,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(BaselineMigration),
             Box::new(GroundedNormalizationsMigration),
+            Box::new(NotesOverlayMigration),
         ]
     }
 }

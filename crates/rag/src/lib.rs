@@ -8,9 +8,11 @@
 #[cfg(test)]
 mod annotation_tests;
 mod entities;
+mod notes_overlay;
 mod schema;
 mod store_async;
 
+pub use notes_overlay::NotesOverlayRow;
 pub use store_async::{
     DEFAULT_RECORDING_BUDGET_BYTES, DerivedTranscript, DocumentKind, GroundedDerivedArtifact,
     GroundedDerivedView, IngestMetadata, LocalEvidenceReceipt, LocalProvenance, QuarantineRecovery,

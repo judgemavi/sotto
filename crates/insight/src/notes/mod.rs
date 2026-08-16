@@ -1,6 +1,14 @@
 //! General, cited recording summaries derived from a persisted session timeline.
 
+mod overlay;
 mod schema;
+
+pub use overlay::{
+    AppliedNotesOverlayOperation, NotesBlockProvenance, NotesOverlayError, NotesOverlayOperation,
+    OverlayTarget, PresentedNotesBlock, PresentedNotesBlockId, PresentedNotesDocument,
+    RecordingNotesVersion, append_notes_overlay_operation, compose_notes_document,
+    load_notes_overlay, load_presented_notes_document, recording_notes_version,
+};
 
 use schema::RecordingNotesDraft;
 pub use schema::{

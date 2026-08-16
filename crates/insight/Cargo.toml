@@ -23,4 +23,5 @@ tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [dev-dependencies]
 png = "0.18.0"
+tempfile = "3.27.0"
 tokio = { workspace = true, features = ["macros", "rt"] }

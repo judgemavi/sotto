@@ -20,10 +20,14 @@ pub use clustering::{
 };
 
 pub use notes::{
-    CachedGroundedMeetingNotes, GroundedMeetingNotesReport, GroundingInput, MeetingNotesError,
-    MeetingNotesGenerator, RecordingNotes, RecordingNotesBlock, RecordingNotesBlockId,
-    RecordingNotesSection, RecordingNotesSectionKind, SourceStatus, load_latest_grounded_notes,
-    load_latest_grounded_notes_status,
+    AppliedNotesOverlayOperation, CachedGroundedMeetingNotes, GroundedMeetingNotesReport,
+    GroundingInput, MeetingNotesError, MeetingNotesGenerator, NotesBlockProvenance,
+    NotesOverlayError, NotesOverlayOperation, OverlayTarget, PresentedNotesBlock,
+    PresentedNotesBlockId, PresentedNotesDocument, RecordingNotes, RecordingNotesBlock,
+    RecordingNotesBlockId, RecordingNotesSection, RecordingNotesSectionKind, RecordingNotesVersion,
+    SourceStatus, append_notes_overlay_operation, compose_notes_document,
+    load_latest_grounded_notes, load_latest_grounded_notes_status, load_notes_overlay,
+    load_presented_notes_document, recording_notes_version,
 };
 
 pub use summarizer::{
