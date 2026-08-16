@@ -1617,7 +1617,7 @@ mod tests {
         // Stand inside the running recording, exactly as the shell does once capture identifies.
         visual.update(|_, cx| {
             workspace.update(cx, |this, cx| {
-                this.show_live_transcript(session_id);
+                this.show_live_transcript(session_id, cx);
                 cx.notify();
             });
         });

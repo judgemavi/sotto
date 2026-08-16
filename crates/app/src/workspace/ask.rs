@@ -25,13 +25,13 @@ use gpui::{
 };
 use gpui_component::{
     Disableable, Selectable as _, Sizable as _,
-    button::Button,
+    button::{Button, ButtonVariants as _},
     dock::{Panel, PanelEvent},
     input::{Input, InputEvent, InputState},
 };
 use insight::{AskCitation, AskEngine, AskEvidence, AskReply, AskResult, AskTurn};
 use rag::{DocumentKind, SearchFilter};
-use sotto_core::{CancellationToken, SessionId};
+use sotto_core::{CancellationToken, EventId, SessionId};
 
 use super::{
     MeetingWorkspace,
@@ -51,6 +51,17 @@ pub(super) enum AskScope {
     AllRecordings,
     /// Only the recording currently open — including one that is still running.
     OpenRecording,
+    /// Exactly the finalized transcript rows the person selected.
+    Selection,
+}
+
+/// One explicit, contiguous transcript selection offered to Ask.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AskSelection {
+    pub(super) session_id: SessionId,
+    pub(super) event_ids: Vec<EventId>,
+    /// Timecodes and sources, formatted from the same rows the copy gesture uses.
+    pub(super) label: String,
 }
 
 pub(super) struct AskPanel {
@@ -60,6 +71,8 @@ pub(super) struct AskPanel {
     scope: Option<(SessionId, String)>,
     backend_ready: bool,
     chosen: AskScope,
+    previous_non_selection: AskScope,
+    selection: Option<AskSelection>,
     /// Whether the open recording is still capturing, which the scope line has to say.
     live: bool,
     running: bool,
@@ -74,10 +87,12 @@ pub(super) enum AskPanelEvent {
     Cancel,
     Citation(AskCitation),
     SelectScope(AskScope),
+    ClearSelection,
 }
 
 pub(super) struct PendingAsk {
     pub session_id: SessionId,
+    pub selection_event_ids: Option<Vec<EventId>>,
     pub cancellation: CancellationToken,
     pub progress: mpsc::Receiver<String>,
     pub result: mpsc::Receiver<Result<AskResult, String>>,
@@ -103,6 +118,8 @@ impl AskPanel {
             scope: None,
             backend_ready: false,
             chosen: AskScope::default(),
+            previous_non_selection: AskScope::default(),
+            selection: None,
             live: false,
             running: false,
             progress: None,
@@ -126,7 +143,18 @@ impl AskPanel {
     pub(super) fn effective(&self) -> AskScope {
         match self.chosen {
             AskScope::OpenRecording if self.scope.is_some() => AskScope::OpenRecording,
-            _ => AskScope::AllRecordings,
+            AskScope::Selection if self.selection.is_some() => AskScope::Selection,
+            AskScope::Selection => self.effective_non_selection(self.previous_non_selection),
+            AskScope::AllRecordings | AskScope::OpenRecording => AskScope::AllRecordings,
+        }
+    }
+
+    fn effective_non_selection(&self, scope: AskScope) -> AskScope {
+        match scope {
+            AskScope::OpenRecording if self.scope.is_some() => AskScope::OpenRecording,
+            AskScope::AllRecordings | AskScope::OpenRecording | AskScope::Selection => {
+                AskScope::AllRecordings
+            }
         }
     }
 
@@ -148,10 +176,30 @@ impl AskPanel {
         self.live = live;
     }
 
+    pub(super) fn set_selection(&mut self, selection: Option<AskSelection>) {
+        if self.selection == selection {
+            return;
+        }
+        self.selection = selection;
+        self.turns.clear();
+        self.message = None;
+        self.progress = None;
+        if self.selection.is_none() && self.chosen == AskScope::Selection {
+            self.chosen = self.previous_non_selection;
+        }
+    }
+
     /// The open recording's id, when that is what a question would be answered from.
     pub(super) fn open_recording(&self) -> Option<SessionId> {
         (self.chosen == AskScope::OpenRecording)
             .then_some(self.scope.as_ref().map(|value| value.0))
+            .flatten()
+    }
+
+    /// The explicit selection, only when it is the scope the person chose.
+    pub(super) fn selected_range(&self) -> Option<AskSelection> {
+        (self.effective() == AskScope::Selection)
+            .then(|| self.selection.clone())
             .flatten()
     }
 
@@ -195,8 +243,16 @@ impl AskPanel {
     }
 
     pub(super) fn select_scope(&mut self, scope: AskScope) {
+        if scope == AskScope::Selection && self.selection.is_none() {
+            return;
+        }
         if self.chosen == scope {
             return;
+        }
+        if scope == AskScope::Selection {
+            self.previous_non_selection = self.effective_non_selection(self.chosen);
+        } else {
+            self.previous_non_selection = scope;
         }
         self.chosen = scope;
         // A thread answered from one recording does not carry over to a question about the whole
@@ -213,6 +269,7 @@ impl Render for AskPanel {
         let effective = self.effective();
         let scope = scope_line(
             self.scope.as_ref().map(|(_, name)| name.as_str()),
+            self.selection.as_ref(),
             effective,
             self.live,
         );
@@ -286,6 +343,42 @@ impl Render for AskPanel {
                     .gap(Space::SM)
                     .debug_selector(|| "ask-scope-row".into()),
             )
+            .children(self.selection.as_ref().map(|selection| {
+                ControlRow::new()
+                    .child(
+                        ControlRole::Essential,
+                        Button::new("ask-scope-selection")
+                            .label("This selection")
+                            .small()
+                            .selected(effective == AskScope::Selection)
+                            .disabled(self.running)
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(AskPanelEvent::SelectScope(AskScope::Selection));
+                            })),
+                    )
+                    .child(
+                        ControlRole::Ellipsizing,
+                        div()
+                            .text_sm()
+                            .text_color(tokens.muted)
+                            .child(selection.label.clone()),
+                    )
+                    .child(
+                        ControlRole::Essential,
+                        Button::new("ask-clear-selection")
+                            .label("Clear")
+                            .ghost()
+                            .small()
+                            .disabled(self.running)
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(AskPanelEvent::ClearSelection);
+                            })),
+                    )
+                    .finish()
+                    .mt_1()
+                    .gap(Space::SM)
+                    .debug_selector(|| "ask-selection-row".into())
+            }))
             .child(div().mt_1().text_sm().text_color(tokens.muted).child(scope))
             .when_some(disabled_reason, |view, reason| {
                 view.child(div().mt_3().text_color(tokens.muted).child(reason))
@@ -321,8 +414,26 @@ impl Render for AskPanel {
 ///
 /// A live scope says so. An answer drawn from a call still in progress is answered from the part
 /// that has been transcribed so far, and the person deciding whether to trust it needs that.
-fn scope_line(session: Option<&str>, scope: AskScope, live: bool) -> String {
+fn scope_line(
+    session: Option<&str>,
+    selection: Option<&AskSelection>,
+    scope: AskScope,
+    live: bool,
+) -> String {
     match (scope, session) {
+        (AskScope::Selection, _) => selection.map_or_else(
+            || "Every recording in your library".to_owned(),
+            |selection| {
+                if live {
+                    format!(
+                        "This selection, so far · {} · finalized rows only; provisional words excluded",
+                        selection.label
+                    )
+                } else {
+                    format!("This selection · {}", selection.label)
+                }
+            },
+        ),
         (AskScope::OpenRecording, Some(name)) if live => {
             format!("This recording, so far · {name}")
         }
@@ -409,7 +520,11 @@ impl MeetingWorkspace {
         if self.pending_ask.is_some() {
             return;
         }
-        let scope = self.ask_panel.read(cx).open_recording();
+        let selection = self.ask_panel.read(cx).selected_range();
+        let scope = selection
+            .as_ref()
+            .map(|selection| selection.session_id)
+            .or_else(|| self.ask_panel.read(cx).open_recording());
         let backend = match self.reasoning_backend(cx) {
             Ok(Some(value)) => value,
             Ok(None) => return,
@@ -441,7 +556,7 @@ impl MeetingWorkspace {
                     };
                 // A running recording's log lives in `TimelineState`, not the store: the actor is
                 // still checkpointing into it, so the persisted copy trails what is on screen.
-                let events = if self.transcript_live {
+                let mut events = if self.transcript_live {
                     transcript::scope_to_session(self.timeline.read(cx).events(), Some(id))
                         .into_owned()
                 } else {
@@ -453,15 +568,31 @@ impl MeetingWorkspace {
                         }
                     }
                 };
+                if let Some(selection) = &selection {
+                    let selected = selection
+                        .event_ids
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>();
+                    events.retain(|event| selected.contains(&event.id()));
+                }
                 if events.is_empty() {
-                    self.message = Some(
+                    self.message = Some(if selection.is_some() {
+                        "This selection has no finalized transcript rows. Select finalized words and try again."
+                            .to_owned()
+                    } else {
                         "This recording has nothing transcribed yet. Ask again once it has words, or ask across all recordings."
-                            .to_owned(),
-                    );
+                            .to_owned()
+                    });
                     cx.notify();
                     return;
                 }
-                Some((id, record.capture_target().clone(), events))
+                Some((
+                    id,
+                    record.capture_target().clone(),
+                    events,
+                    selection.is_some(),
+                ))
             }
         };
         let history = self.ask_panel.read(cx).history();
@@ -478,7 +609,19 @@ impl MeetingWorkspace {
                 let result = crate::persistence_runtime::block_on(async {
                     let engine = AskEngine::new(provider);
                     match single {
-                        Some((id, target, events)) => engine
+                        Some((id, target, events, true)) => engine
+                            .ask_selection(
+                                id,
+                                &target,
+                                &events,
+                                &history,
+                                &worker_question,
+                                worker_cancel,
+                                Some(progress_sender),
+                            )
+                            .await
+                            .map_err(|error| error.to_string()),
+                        Some((id, target, events, false)) => engine
                             .ask(
                                 id,
                                 &target,
@@ -515,6 +658,7 @@ impl MeetingWorkspace {
         self.pending_ask = Some((
             PendingAsk {
                 session_id,
+                selection_event_ids: selection.map(|selection| selection.event_ids),
                 cancellation,
                 progress,
                 result,
@@ -546,6 +690,16 @@ impl MeetingWorkspace {
         // transcript the workspace is no longer showing. A *live* recording moving on is fine; the
         // answer is honestly labelled "so far", and stopping it mid-call would be the surprise.
         if pending.session_id != LIBRARY_ASK && self.transcript_session != Some(pending.session_id)
+        {
+            pending.cancellation.cancel();
+            return true;
+        }
+        if let Some(expected) = &pending.selection_event_ids
+            && self
+                .ask_selection
+                .as_ref()
+                .map(|selection| &selection.event_ids)
+                != Some(expected)
         {
             pending.cancellation.cancel();
             return true;
@@ -654,11 +808,21 @@ async fn retained_evidence(
 #[cfg(test)]
 mod layout_tests {
     use gpui::{TestAppContext, px, size};
+    use sotto_core::{EventId, SessionId};
 
-    use super::{AskPanel, AskScope, MIN_ASK_PANEL_WIDTH, scope_line};
+    use super::{AskPanel, AskScope, AskSelection, MIN_ASK_PANEL_WIDTH, scope_line};
 
     const ALL: AskScope = AskScope::AllRecordings;
     const OPEN: AskScope = AskScope::OpenRecording;
+    const SELECTION: AskScope = AskScope::Selection;
+
+    fn selection() -> AskSelection {
+        AskSelection {
+            session_id: SessionId::new(7),
+            event_ids: vec![EventId::new(2), EventId::new(3)],
+            label: "[02:10] captured audio → [02:42] your microphone · 2 finalized rows".into(),
+        }
+    }
 
     /// ADR-0019: a session is a recording of something. The panel's scope line is the sentence a
     /// person reads before deciding whether to trust an answer, so it must not tell someone who
@@ -666,10 +830,11 @@ mod layout_tests {
     #[test]
     fn the_scope_line_speaks_about_recordings() {
         for line in [
-            scope_line(None, ALL, false),
-            scope_line(Some("CS231n lecture"), OPEN, false),
-            scope_line(Some("CS231n lecture"), ALL, false),
-            scope_line(Some("CS231n lecture"), OPEN, true),
+            scope_line(None, None, ALL, false),
+            scope_line(Some("CS231n lecture"), None, OPEN, false),
+            scope_line(Some("CS231n lecture"), None, ALL, false),
+            scope_line(Some("CS231n lecture"), None, OPEN, true),
+            scope_line(Some("CS231n lecture"), Some(&selection()), SELECTION, true),
         ] {
             assert!(
                 !line.to_lowercase().contains("meeting"),
@@ -677,12 +842,12 @@ mod layout_tests {
             );
         }
         assert_eq!(
-            scope_line(Some("CS231n lecture"), OPEN, false),
+            scope_line(Some("CS231n lecture"), None, OPEN, false),
             "This recording · CS231n lecture",
             "a single scope names the recording it would answer from"
         );
         assert_eq!(
-            scope_line(Some("CS231n lecture"), ALL, false),
+            scope_line(Some("CS231n lecture"), None, ALL, false),
             "Every recording in your library",
             "the library scope says plainly that it is not one recording"
         );
@@ -695,11 +860,11 @@ mod layout_tests {
     #[test]
     fn with_no_recording_open_the_scope_is_the_whole_library() {
         assert_eq!(
-            scope_line(None, ALL, false),
+            scope_line(None, None, ALL, false),
             "Every recording in your library"
         );
         assert_eq!(
-            scope_line(None, OPEN, false),
+            scope_line(None, None, OPEN, false),
             "Every recording in your library",
             "a single-recording choice with nothing open resolves back to the library"
         );
@@ -710,9 +875,42 @@ mod layout_tests {
     #[test]
     fn a_live_scope_says_it_is_still_running() {
         assert_eq!(
-            scope_line(Some("Standup"), OPEN, true),
+            scope_line(Some("Standup"), None, OPEN, true),
             "This recording, so far · Standup"
         );
+    }
+
+    #[test]
+    fn a_live_selection_names_its_span_and_excludes_provisional_words() {
+        let selection = selection();
+        assert_eq!(
+            scope_line(Some("Standup"), Some(&selection), SELECTION, true),
+            "This selection, so far · [02:10] captured audio → [02:42] your microphone · 2 \
+             finalized rows · finalized rows only; provisional words excluded"
+        );
+    }
+
+    #[test]
+    fn selection_is_never_default_and_clearing_it_restores_the_previous_scope() {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let (panel, visual) = cx.add_window_view(AskPanel::new);
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, _| {
+                panel.set_scope(Some((SessionId::new(7), "Standup".into())), true, false);
+                panel.set_selection(Some(selection()));
+                assert_eq!(panel.effective(), ALL, "a selection never chooses itself");
+                panel.select_scope(OPEN);
+                panel.select_scope(SELECTION);
+                assert_eq!(panel.effective(), SELECTION);
+                panel.set_selection(None);
+                assert_eq!(
+                    panel.effective(),
+                    OPEN,
+                    "clearing the selection restores the explicit prior scope"
+                );
+            });
+        });
     }
 
     /// Both scope choices and the question form stay inside the narrowest Ask panel.
@@ -724,13 +922,16 @@ mod layout_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_component::init);
-        let (_panel, visual) = cx.add_window_view(AskPanel::new);
+        let (panel, visual) = cx.add_window_view(AskPanel::new);
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, _| panel.set_selection(Some(selection())));
+        });
 
         visual.simulate_resize(size(MIN_ASK_PANEL_WIDTH, px(620.0)));
         visual.refresh()?;
         visual.run_until_parked();
 
-        let selectors = ["ask-scope-row", "ask-form-row"];
+        let selectors = ["ask-scope-row", "ask-selection-row", "ask-form-row"];
         let bounds = selectors
             .map(|selector| {
                 visual.debug_bounds(selector).ok_or_else(|| {
@@ -746,7 +947,7 @@ mod layout_tests {
             );
         }
         assert!(
-            bounds[1].top() >= bounds[0].bottom(),
+            bounds[1].top() >= bounds[0].bottom() && bounds[2].top() >= bounds[1].bottom(),
             "the Ask form must remain below the scope controls"
         );
         Ok(())

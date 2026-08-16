@@ -46,6 +46,7 @@ use crate::reasoning::inspection::ScreenConsultation;
 
 use super::{
     MeetingWorkspace, StageTab,
+    ask::AskSelection,
     control_row::{ControlRole, ControlRow},
     notes,
     notes::AnnotationView,
@@ -585,6 +586,44 @@ fn copy_report(lines: usize) -> String {
     } else {
         format!("Copied {lines} transcript rows, with timecodes and sources, to the clipboard.")
     }
+}
+
+/// Builds the Ask scope represented by the same committed rows a range-copy gesture addresses.
+///
+/// A stopped recording can retain one explicitly unfinalized tail row. It remains visible and
+/// copyable, but selection Ask excludes it because the reasoning contract accepts final utterances
+/// only. A live provisional row never enters `TranscriptPacer`, so it is excluded by construction.
+fn ask_selection(
+    session_id: sotto_core::SessionId,
+    rows: &[TranscriptRow],
+) -> Option<AskSelection> {
+    let finals = rows
+        .iter()
+        .filter(|row| !row.unfinalized)
+        .collect::<Vec<_>>();
+    let first = finals.first()?;
+    let last = finals.last()?;
+    let count = finals.len();
+    let label = if count == 1 {
+        format!(
+            "[{}] {} · 1 finalized row",
+            format_time(first.start),
+            source_label(first.source)
+        )
+    } else {
+        format!(
+            "[{}] {} → [{}] {} · {count} finalized rows",
+            format_time(first.start),
+            source_label(first.source),
+            format_time(last.start),
+            source_label(last.source),
+        )
+    };
+    Some(AskSelection {
+        session_id,
+        event_ids: finals.into_iter().map(|row| row.event_id).collect(),
+        label,
+    })
 }
 
 /// Keeps measured variable-height rows intact when finals are appended.
@@ -1214,6 +1253,14 @@ impl MeetingWorkspace {
         }
         self.follow_transcript = false;
         self.focused_event = Some(target);
+        let selection = self.transcript_session.and_then(|session_id| {
+            self.transcript_pacer
+                .rows()
+                .iter()
+                .find(|row| row.event_id == target)
+                .and_then(|row| ask_selection(session_id, std::slice::from_ref(row)))
+        });
+        self.set_ask_selection(selection, cx);
         self.message = None;
         start_citation_flash(target, cx);
         cx.notify();
@@ -1257,9 +1304,13 @@ impl MeetingWorkspace {
             .unwrap_or(target);
         let (first, last) = (anchor.min(target), anchor.max(target));
         let (text, lines) = copy_text(&rows[first..=last]);
+        let selection = self
+            .transcript_session
+            .and_then(|session_id| ask_selection(session_id, &rows[first..=last]));
         if lines > 0 {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+        self.set_ask_selection(selection, cx);
         self.message = Some(copy_report(lines));
         cx.notify();
     }
@@ -1268,6 +1319,14 @@ impl MeetingWorkspace {
         self.focused_event = Some(event_id);
         self.follow_transcript = false;
         self.editing_annotation = None;
+        let selection = self.transcript_session.and_then(|session_id| {
+            self.transcript_pacer
+                .rows()
+                .iter()
+                .find(|row| row.event_id == event_id)
+                .and_then(|row| ask_selection(session_id, std::slice::from_ref(row)))
+        });
+        self.set_ask_selection(selection, cx);
         // Selecting a row is where the record answers questions about itself, so it is also where
         // the app admits that a reasoning run looked at the screen behind this recording.
         let disclosure = screen_consultation_disclosure(self.notes.read(cx).screen_consultations());
@@ -1276,6 +1335,11 @@ impl MeetingWorkspace {
              the range.",
             event_id.get()
         );
+        if self.ask_selection.is_none() {
+            message.push_str(
+                " Ask about this selection excludes provisional words until they finalize.",
+            );
+        }
         if let Some(disclosure) = disclosure {
             message.push(' ');
             message.push_str(&disclosure);
@@ -2345,6 +2409,17 @@ mod mounted_tests {
             Some(first),
             "clicking selectable row text must still set the note anchor"
         );
+        assert_eq!(
+            visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .ask_selection
+                    .as_ref()
+                    .map(|selection| selection.event_ids.clone())
+            }),
+            Some(vec![first]),
+            "anchoring one finalized row offers exactly that row to Ask without changing scope"
+        );
 
         // Shift-click a later row: the range from the anchor lands on the clipboard.
         let later = visual
@@ -2369,6 +2444,17 @@ mod mounted_tests {
             visual.update(|_, cx| workspace.read(cx).focused_event),
             Some(first),
             "extending the copy range must not move the note anchor"
+        );
+        assert_eq!(
+            visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .ask_selection
+                    .as_ref()
+                    .map(|selection| selection.event_ids.clone())
+            }),
+            Some(ids[..=2].to_vec()),
+            "the Ask selection must be the exact anchor-through-row range"
         );
 
         // The head control takes the whole column, and speech punctuation survives the round trip
@@ -2491,7 +2577,7 @@ mod mounted_tests {
         let live = SessionId::new(1_786_625_999_000_000_001);
         visual.update(|_, cx| {
             workspace.update(cx, |workspace, cx| {
-                workspace.show_live_transcript(live);
+                workspace.show_live_transcript(live, cx);
                 workspace.transcript_pacer.replace(vec![TranscriptRow {
                     event_id: EventId::new(91),
                     source: Source::Mic,
@@ -2751,7 +2837,7 @@ mod mounted_tests {
         );
         visual.update(|_, cx| {
             workspace.update(cx, |workspace, cx| {
-                workspace.show_live_transcript(live);
+                workspace.show_live_transcript(live, cx);
                 workspace.select_stage_tab(StageTab::Transcript, cx);
             });
         });
@@ -2772,6 +2858,18 @@ mod mounted_tests {
         assert!(
             provisional_line("we key the retry on the ord").starts_with(PROVISIONAL_MARKER),
             "and what it renders is the warning followed by the words, so a copy carries both"
+        );
+        visual.simulate_click(line.center(), Modifiers::none());
+        visual.run_until_parked();
+        assert!(
+            visual.update(|_, cx| workspace.read(cx).ask_selection.is_none()),
+            "a live provisional row remains selectable text but is never offered as finalized Ask evidence"
+        );
+        assert!(
+            visual
+                .update(|_, cx| workspace.read(cx).message.clone())
+                .is_some_and(|message| message.contains("excludes provisional words")),
+            "the provisional-tail exclusion must be stated where the selection is made"
         );
         visual.update(|_, cx| {
             workspace.update(cx, |workspace, cx| workspace.copy_transcript(cx));

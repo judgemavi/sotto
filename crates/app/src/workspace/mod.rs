@@ -425,6 +425,8 @@ pub struct MeetingWorkspace {
     transcript_pacer: pacing::TranscriptPacer,
     follow_transcript: bool,
     focused_event: Option<EventId>,
+    /// The contiguous finalized transcript rows explicitly offered as an Ask scope.
+    ask_selection: Option<ask::AskSelection>,
     library_filter: Entity<InputState>,
     annotation_input: Entity<InputState>,
     editing_annotation: Option<notes::AnnotationView>,
@@ -566,6 +568,7 @@ impl MeetingWorkspace {
                             .update(cx, |panel, _| panel.select_scope(choice));
                         cx.notify();
                     }
+                    ask::AskPanelEvent::ClearSelection => this.clear_ask_selection(cx),
                 },
             ),
         ];
@@ -588,6 +591,7 @@ impl MeetingWorkspace {
             transcript_pacer: pacing::TranscriptPacer::default(),
             follow_transcript: true,
             focused_event: None,
+            ask_selection: None,
             library_filter,
             annotation_input,
             editing_annotation: None,
@@ -661,7 +665,7 @@ impl MeetingWorkspace {
             }
             if newly_active {
                 self.live_started_at = Some(Instant::now());
-                self.show_live_transcript(id);
+                self.show_live_transcript(id, cx);
             }
             return;
         }
@@ -733,7 +737,7 @@ impl MeetingWorkspace {
     pub(crate) fn select_meeting(&mut self, id: SessionId, cx: &mut Context<Self>) {
         self.cancel_pending_ask();
         if self.session.read(cx).active_session_id() == Some(id) {
-            self.show_live_transcript(id);
+            self.show_live_transcript(id, cx);
             cx.notify();
             return;
         }
@@ -742,6 +746,7 @@ impl MeetingWorkspace {
             .is_ok_and(|backend| backend.is_some());
         if self.notes.update(cx, |notes, _| notes.select(id, enabled)) {
             self.message = None;
+            self.clear_ask_selection(cx);
             self.load_transcript(id);
             self.mcp
                 .update(cx, |controller, cx| controller.select_session(id, cx));
@@ -818,8 +823,9 @@ impl MeetingWorkspace {
         }
     }
 
-    fn show_live_transcript(&mut self, id: SessionId) {
+    fn show_live_transcript(&mut self, id: SessionId, cx: &mut Context<Self>) {
         self.cancel_pending_ask();
+        self.clear_ask_selection(cx);
         self.transcript_session = Some(id);
         self.transcript_events.clear();
         self.transcript_live = true;
@@ -839,6 +845,7 @@ impl MeetingWorkspace {
     /// the lifecycle rather than the stage, keeps Stop one visible action away.
     pub(crate) fn show_home(&mut self, cx: &mut Context<Self>) {
         self.cancel_pending_ask();
+        self.clear_ask_selection(cx);
         self.transcript_session = None;
         self.transcript_events.clear();
         self.transcript_live = false;
@@ -858,7 +865,7 @@ impl MeetingWorkspace {
     /// Returns to the running recording from a stopped session opened out of the rail.
     pub(crate) fn return_to_live(&mut self, cx: &mut Context<Self>) {
         if let Some(id) = self.session.read(cx).active_session_id() {
-            self.show_live_transcript(id);
+            self.show_live_transcript(id, cx);
             cx.notify();
         }
     }
@@ -945,6 +952,7 @@ impl MeetingWorkspace {
             self.transcript_list.reset(0);
             self.open_recording = None;
             self.focused_event = None;
+            self.clear_ask_selection(cx);
         }
         self.observed_completed_session = None;
         self.message = self
@@ -1026,8 +1034,30 @@ impl MeetingWorkspace {
             (id, name)
         });
         let live = self.transcript_live;
+        let selection = self.ask_selection.clone();
+        self.ask_panel.update(cx, |panel, _| {
+            panel.set_scope(scope, ready, live);
+            panel.set_selection(selection);
+        });
+    }
+
+    fn set_ask_selection(&mut self, selection: Option<ask::AskSelection>, cx: &mut Context<Self>) {
+        if self.ask_selection == selection {
+            return;
+        }
+        if self.ask_panel.read(cx).effective() == ask::AskScope::Selection
+            && self.pending_ask.is_some()
+        {
+            self.cancel_ask(cx);
+        }
+        self.ask_selection = selection.clone();
         self.ask_panel
-            .update(cx, |panel, _| panel.set_scope(scope, ready, live));
+            .update(cx, |panel, _| panel.set_selection(selection));
+        cx.notify();
+    }
+
+    fn clear_ask_selection(&mut self, cx: &mut Context<Self>) {
+        self.set_ask_selection(None, cx);
     }
 
     /// Lands a citation on the transcript row that carries its evidence.
@@ -1044,6 +1074,7 @@ impl MeetingWorkspace {
     pub(crate) fn follow_live(&mut self, cx: &mut Context<Self>) {
         self.follow_transcript = true;
         self.focused_event = None;
+        self.clear_ask_selection(cx);
         self.transcript_list.scroll_to(gpui::ListOffset {
             item_ix: self.transcript_pacer.rows().len(),
             offset_in_item: px(0.0),

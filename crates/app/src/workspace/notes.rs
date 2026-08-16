@@ -1581,6 +1581,35 @@ fn render_claim(
         NotesBlockProvenance::EditedFromDraft => "Edited from draft",
         NotesBlockProvenance::UserAuthored => "Your words",
     };
+    let provenance_line = div()
+        .text_xs()
+        .text_color(if claim.orphaned {
+            tokens.warn
+        } else {
+            tokens.faint
+        })
+        .child(if claim.orphaned {
+            format!(
+                "{provenance} · the regenerated summary no longer contains the block you edited"
+            )
+        } else {
+            provenance.to_owned()
+        });
+    #[cfg(test)]
+    let provenance_line = provenance_line.debug_selector(move || {
+        if claim.orphaned {
+            format!("summary-provenance-orphaned-{ordinal}")
+        } else {
+            format!(
+                "summary-provenance-{}-{ordinal}",
+                match claim.provenance {
+                    NotesBlockProvenance::Generated => "generated",
+                    NotesBlockProvenance::EditedFromDraft => "edited",
+                    NotesBlockProvenance::UserAuthored => "user",
+                }
+            )
+        }
+    });
     let hover_group = format!("notes-block-{ordinal}");
     div()
         .group(hover_group.clone())
@@ -1613,7 +1642,7 @@ fn render_claim(
                 .child(ControlRole::Ellipsizing, div())
                 .child_when(claim.action, ControlRole::Essential, || {
                     let label = if checked { "Uncheck" } else { "Check" };
-                    Button::new(("notes-check", ordinal))
+                    let button = Button::new(("notes-check", ordinal))
                         .label(label)
                         .ghost()
                         .xsmall()
@@ -1625,12 +1654,13 @@ fn render_claim(
                             let _ = check_workspace.update(cx, |this, cx| {
                                 this.apply_notes_operation(operation, cx);
                             });
-                        })
-                        .into_any_element()
+                        });
+                    #[cfg(test)]
+                    let button = button.debug_selector(move || format!("notes-check-{ordinal}"));
+                    button.into_any_element()
                 })
-                .child(
-                    ControlRole::Essential,
-                    Button::new(("notes-edit", ordinal))
+                .child(ControlRole::Essential, {
+                    let button = Button::new(("notes-edit", ordinal))
                         .label("Edit")
                         .ghost()
                         .xsmall()
@@ -1645,11 +1675,13 @@ fn render_claim(
                                     cx,
                                 );
                             });
-                        }),
-                )
-                .child(
-                    ControlRole::Essential,
-                    Button::new(("notes-hide", ordinal))
+                        });
+                    #[cfg(test)]
+                    let button = button.debug_selector(move || format!("notes-edit-{ordinal}"));
+                    button
+                })
+                .child(ControlRole::Essential, {
+                    let button = Button::new(("notes-hide", ordinal))
                         .label("Hide")
                         .ghost()
                         .xsmall()
@@ -1660,23 +1692,17 @@ fn render_claim(
                             let _ = hide_workspace.update(cx, |this, cx| {
                                 this.apply_notes_operation(operation, cx);
                             });
-                        }),
-                )
+                        });
+                    #[cfg(test)]
+                    let button = button.debug_selector(move || format!("notes-hide-{ordinal}"));
+                    button
+                })
                 .finish()
                 .gap_1()
                 .opacity(0.0)
                 .group_hover(hover_group, |style| style.opacity(1.0))
         }))
-        .child(
-            div()
-                .text_xs()
-                .text_color(if claim.orphaned { tokens.warn } else { tokens.faint })
-                .child(if claim.orphaned {
-                    format!("{provenance} · the regenerated summary no longer contains the block you edited")
-                } else {
-                    provenance.to_owned()
-                }),
-        )
+        .child(provenance_line)
         .child(render_evidence(
             claim.meeting,
             claim.external,
@@ -2553,7 +2579,10 @@ mod tests {
 
         use futures_util::stream;
         use gpui::{AppContext as _, Entity, Modifiers, TestAppContext, px, size};
-        use insight::MeetingNotesGenerator;
+        use insight::{
+            MeetingNotesGenerator, NotesBlockProvenance, NotesOverlayOperation, OverlayTarget,
+            RecordingNotesSectionKind, append_notes_overlay_operation, load_latest_grounded_notes,
+        };
         use providers::{
             AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendFingerprint,
             BackendId,
@@ -2566,7 +2595,7 @@ mod tests {
             Source, StopReason, TargetKind, TimelineBuilder, Usage, Utterance,
         };
 
-        use crate::{mcp, reasoning, session};
+        use crate::{mcp, notes::NotesState, reasoning, session};
 
         /// The width the shipped window refuses to go below.
         const MIN_WORKSPACE_WIDTH: gpui::Pixels = px(680.0);
@@ -2788,6 +2817,59 @@ mod tests {
             Ok(())
         }
 
+        fn click_control(
+            visual: &mut gpui::VisualTestContext,
+            selector: &'static str,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let bounds = visual.debug_bounds(selector).ok_or_else(|| {
+                std::io::Error::other(format!("{selector} must be reachable in the mounted tree"))
+            })?;
+            visual.simulate_click(bounds.center(), Modifiers::none());
+            visual.run_until_parked();
+            visual.refresh()?;
+            visual.run_until_parked();
+            Ok(())
+        }
+
+        fn replace_composer_text(
+            visual: &mut gpui::VisualTestContext,
+            workspace: &Entity<crate::workspace::MeetingWorkspace>,
+            value: &str,
+        ) {
+            let value = value.to_owned();
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.annotation_input
+                        .update(cx, |input, cx| input.set_value(value.clone(), window, cx));
+                });
+            });
+        }
+
+        fn copy_claim(
+            visual: &mut gpui::VisualTestContext,
+            selector: &'static str,
+        ) -> Result<String, Box<dyn std::error::Error>> {
+            visual.executor().advance_clock(Duration::from_millis(500));
+            visual.run_until_parked();
+            visual.refresh()?;
+            visual.run_until_parked();
+            let claim = visual.debug_bounds(selector).ok_or_else(|| {
+                std::io::Error::other(format!("{selector} must render before it can be copied"))
+            })?;
+            let start = gpui::point(claim.left() + px(2.0), claim.top() + px(4.0));
+            let end = gpui::point(claim.right() - px(2.0), claim.bottom() - px(4.0));
+            visual.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
+            visual.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
+            visual.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+            visual.run_until_parked();
+            visual.simulate_keystrokes("cmd-c");
+            visual.run_until_parked();
+            Ok(visual
+                .update(|_, cx| cx.read_from_clipboard())
+                .and_then(|item| item.text())
+                .unwrap_or_default())
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn the_summary_reads_as_prose_and_gives_up_its_evidence_only_when_asked()
         -> Result<(), Box<dyn std::error::Error>> {
@@ -2887,6 +2969,224 @@ mod tests {
                 Some(cited),
                 "following a citation must land on the transcript row it cites"
             );
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_mounted_document_distinguishes_authors_and_its_reader_belief_controls_work()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let dir = tempfile::tempdir()?;
+            let database = dir.path().join("sotto.sqlite3");
+            let _ = recording_with_summary(&database).await?;
+
+            let mut cx = TestAppContext::single();
+            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
+            visual.simulate_resize(size(px(900.0), px(820.0)));
+            visual.update(|_, cx| {
+                workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
+            });
+            visual.refresh()?;
+            visual.run_until_parked();
+
+            let original_artifact = visual.update(|_, cx| {
+                let notes = workspace.read(cx).notes.clone();
+                let NotesState::Ready { notes, .. } = notes.read(cx).snapshot().state else {
+                    return Err::<Vec<u8>, Box<dyn std::error::Error>>(
+                        std::io::Error::other("the persisted summary must open ready").into(),
+                    );
+                };
+                Ok(serde_json::to_vec(&notes)?)
+            })?;
+
+            // Reword a generated claim through Edit -> composer -> Save.
+            let claim = visual
+                .debug_bounds("summary-claim-0")
+                .ok_or_else(|| std::io::Error::other("the generated overview must render"))?;
+            visual.simulate_mouse_move(claim.center(), None, Modifiers::none());
+            visual.run_until_parked();
+            click_control(visual, "notes-edit-0")?;
+            assert!(
+                visual.update(|_, cx| workspace.read(cx).editing_notes_block.is_some()),
+                "Edit must put the mounted composer into block-edit mode"
+            );
+            replace_composer_text(visual, &workspace, "User's exact overview wording.");
+            click_control(visual, "append-note-control")?;
+
+            let composed_reword = visual.update(|_, cx| {
+                let notes = workspace.read(cx).notes.clone();
+                let NotesState::Ready { document, .. } = notes.read(cx).snapshot().state else {
+                    return Err::<String, Box<dyn std::error::Error>>(
+                        std::io::Error::other("reworded notes must remain ready").into(),
+                    );
+                };
+                Ok(document.blocks[0].text.clone())
+            })?;
+            assert_eq!(
+                composed_reword, "User's exact overview wording.",
+                "Save must apply the edit to the composed document before it renders"
+            );
+            // Do not turn this into a claim that the reword reached the selectable text: copying
+            // summary-claim-0 after the refresh still returns the old generated sentence. That is
+            // a production finding from this task, not something test-only coverage may repair.
+
+            // Check is its own mounted control and changes the presented action, not the artifact.
+            click_control(visual, "notes-check-2")?;
+
+            // With no edit active the same composer adds a user-authored overview block.
+            replace_composer_text(visual, &workspace, "A note written entirely by the user.");
+            click_control(visual, "append-note-control")?;
+
+            assert_in_column(
+                visual,
+                &[
+                    "summary-provenance-edited-0",
+                    "summary-provenance-generated-1",
+                    "summary-provenance-user-3",
+                    "summary-claim-3",
+                ],
+            )?;
+            let copied = copy_claim(visual, "summary-claim-3")?;
+            assert!(
+                copied.contains("A note written entirely by the user."),
+                "the newly added user's words must reach the screen, got {copied:?}"
+            );
+            click_control(visual, "summary-evidence-toggle")?;
+            assert!(
+                visual.debug_bounds("summary-citation-3-0").is_none(),
+                "the user block must never draw a citation chip or imply model evidence"
+            );
+
+            let state = visual.update(|_, cx| {
+                let notes = workspace.read(cx).notes.clone();
+                notes.read(cx).snapshot().state
+            });
+            let NotesState::Ready {
+                notes, document, ..
+            } = state
+            else {
+                return Err(std::io::Error::other("edited notes must remain ready").into());
+            };
+            assert_eq!(
+                serde_json::to_vec(&notes)?,
+                original_artifact,
+                "overlay controls must leave the stored generated artifact byte-unchanged"
+            );
+            let edited = document
+                .blocks
+                .iter()
+                .find(|block| block.text == "User's exact overview wording.")
+                .ok_or_else(|| std::io::Error::other("the reworded claim must remain composed"))?;
+            assert_eq!(edited.provenance, NotesBlockProvenance::EditedFromDraft);
+            let action = document
+                .blocks
+                .iter()
+                .find(|block| block.text == "Retry rollout checklist, reviewed by Thursday.")
+                .ok_or_else(|| std::io::Error::other("the checked action must remain composed"))?;
+            assert!(action.checked, "Check must check the mounted action");
+            let added = document
+                .blocks
+                .iter()
+                .find(|block| block.text == "A note written entirely by the user.")
+                .ok_or_else(|| std::io::Error::other("the added block must remain composed"))?;
+            assert_eq!(added.provenance, NotesBlockProvenance::UserAuthored);
+            assert!(added.meeting_citations.is_empty());
+            assert!(added.external_citations.is_empty());
+
+            // Bounds persist across frames in this harness, so hiding is asserted against the
+            // freshly composed state rather than through a misleading disappearance assertion.
+            let decision = visual
+                .debug_bounds("summary-claim-1")
+                .ok_or_else(|| std::io::Error::other("the generated decision must render"))?;
+            visual.simulate_mouse_move(decision.center(), None, Modifiers::none());
+            visual.run_until_parked();
+            click_control(visual, "notes-hide-1")?;
+            let state = visual.update(|_, cx| {
+                let notes = workspace.read(cx).notes.clone();
+                notes.read(cx).snapshot().state
+            });
+            let NotesState::Ready { document, .. } = state else {
+                return Err(std::io::Error::other("hidden notes must remain ready").into());
+            };
+            assert!(
+                document
+                    .blocks
+                    .iter()
+                    .all(|block| block.text != "The search rewrite is deferred to sprint 42."),
+                "Hide must remove the selected generated decision from the composed document"
+            );
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_orphaned_reword_reaches_the_mounted_document_with_an_explicit_warning()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let dir = tempfile::tempdir()?;
+            let database = dir.path().join("sotto.sqlite3");
+            let _ = recording_with_summary(&database).await?;
+            let store = Store::open(&database).await?;
+            let artifact = load_latest_grounded_notes(&store, SessionId::new(41))
+                .await?
+                .ok_or_else(|| std::io::Error::other("the summary artifact must persist"))?;
+            let entry_id = store.entry_for_session(SessionId::new(41)).await?;
+            append_notes_overlay_operation(
+                &store,
+                entry_id,
+                &artifact.artifact,
+                &NotesOverlayOperation::Reword {
+                    target: OverlayTarget {
+                        block_id: "a-generated-block-that-no-longer-exists".to_owned(),
+                        section: RecordingNotesSectionKind::Overview,
+                        action: false,
+                        meeting_citations: vec![EventId::new(9_999)],
+                        external_citations: Vec::new(),
+                    },
+                    text: "The user's preserved orphaned wording.".to_owned(),
+                    owner: None,
+                    due_date: None,
+                },
+                7,
+            )
+            .await?;
+            drop(store);
+
+            let mut cx = TestAppContext::single();
+            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
+            visual.simulate_resize(size(px(900.0), px(820.0)));
+            visual.update(|_, cx| {
+                workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
+            });
+            visual.refresh()?;
+            visual.run_until_parked();
+
+            assert_in_column(
+                visual,
+                &["summary-claim-3", "summary-provenance-orphaned-3"],
+            )?;
+            let copied = copy_claim(visual, "summary-claim-3")?;
+            assert!(
+                copied.contains("The user's preserved orphaned wording."),
+                "the orphaned user wording must remain readable, got {copied:?}"
+            );
+            click_control(visual, "summary-evidence-toggle")?;
+            assert!(
+                visual.debug_bounds("summary-citation-3-0").is_none(),
+                "an orphaned edit is user-authored and must not retain its old citation affordance"
+            );
+            let state = visual.update(|_, cx| {
+                let notes = workspace.read(cx).notes.clone();
+                notes.read(cx).snapshot().state
+            });
+            let NotesState::Ready { document, .. } = state else {
+                return Err(std::io::Error::other("orphaned notes must remain ready").into());
+            };
+            let orphan = document
+                .blocks
+                .iter()
+                .find(|block| block.orphaned)
+                .ok_or_else(|| std::io::Error::other("the orphan flag must survive mounting"))?;
+            assert_eq!(orphan.provenance, NotesBlockProvenance::UserAuthored);
+            assert!(orphan.meeting_citations.is_empty());
+            assert!(orphan.external_citations.is_empty());
             Ok(())
         }
 

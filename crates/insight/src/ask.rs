@@ -18,6 +18,13 @@ exactly as the number after "event:" on the line you are citing. When the transc
 one recording, also give that line's session_id. Prior assistant turns are conversational context,
 never evidence. Do not use outside knowledge. Do not request or infer audio or screen content."#;
 
+/// The largest explicit transcript selection Ask will send to a reasoning backend.
+///
+/// Selection scope is deliberately user-bounded, but a range gesture can still span an entire
+/// long recording. Refusing locally keeps that gesture from becoming an accidental unbounded
+/// request and, critically, never widens it to recording or library retrieval.
+pub const MAX_SELECTION_FINALS: usize = 200;
+
 /// `session_id` defaults because a single-recording transcript never renders one — the model is
 /// told to give it only when more than one recording is in scope, which is the only case it can
 /// know the value. An absent id is resolved to the recording being asked about during validation.
@@ -146,6 +153,53 @@ impl AskEngine {
         })
     }
 
+    /// Answers from exactly the final utterances in one explicit transcript selection.
+    ///
+    /// Partials and every other timeline event are excluded before request serialization. An empty
+    /// or excessive selection refuses locally; neither case calls the backend or falls through to
+    /// the recording/library paths.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the grounded selection boundary keeps every authority explicit"
+    )]
+    pub async fn ask_selection(
+        &self,
+        session_id: SessionId,
+        target: &CaptureTarget,
+        events: &[TimelineEvent],
+        history: &[AskTurn],
+        question: &str,
+        cancellation: CancellationToken,
+        updates: Option<std::sync::mpsc::Sender<String>>,
+    ) -> Result<AskResult, AskError> {
+        let finals = events
+            .iter()
+            .filter(|event| matches!(event.payload(), EventPayload::UtteranceFinal(_)))
+            .cloned()
+            .collect::<Vec<_>>();
+        if finals.is_empty() {
+            return Ok(local_selection_refusal(
+                "The selection contains no finalized transcript rows.",
+            ));
+        }
+        if finals.len() > MAX_SELECTION_FINALS {
+            return Ok(local_selection_refusal(format!(
+                "The selection contains {} finalized rows; select at most {MAX_SELECTION_FINALS}.",
+                finals.len()
+            )));
+        }
+        self.ask(
+            session_id,
+            target,
+            &finals,
+            history,
+            question,
+            cancellation,
+            updates,
+        )
+        .await
+    }
+
     pub async fn ask_across(
         &self,
         evidence: &[AskEvidence],
@@ -219,6 +273,16 @@ impl AskEngine {
             reply,
             normalizations: self.provider.take_request_normalizations(),
         })
+    }
+}
+
+fn local_selection_refusal(reason: impl Into<String>) -> AskResult {
+    AskResult {
+        reply: AskReply::Refusal {
+            reason: reason.into(),
+            covered: Vec::new(),
+        },
+        normalizations: Vec::new(),
     }
 }
 
@@ -368,7 +432,10 @@ fn strip_fence(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use futures_util::stream;
     use providers::{
@@ -376,12 +443,14 @@ mod tests {
         Registry, Role,
     };
     use sotto_core::{
-        BoxFuture, BoxStream, CancellationToken, CaptureTarget, CompletionProvider,
-        CompletionRequest, Delta, EventId, ProviderError, SessionId, StopReason, TargetKind, Usage,
+        Annotation, BoxFuture, BoxStream, CancellationToken, CaptureTarget, CompletionProvider,
+        CompletionRequest, Delta, EventId, EventPayload, ProviderError, Session, SessionId, Source,
+        StopReason, TargetKind, TimelineBuilder, TimelineEvent, Usage, Utterance,
     };
 
     use super::{
-        AskEngine, AskError, AskReply, WireClaim, WireReply, build_request, validate_reply,
+        AskEngine, AskError, AskReply, MAX_SELECTION_FINALS, WireClaim, WireReply, build_request,
+        validate_reply,
     };
 
     struct RefusalProvider;
@@ -410,6 +479,45 @@ mod tests {
 
     impl ReasoningProvider for RefusalProvider {}
 
+    struct BoundaryProvider {
+        requests: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl CompletionProvider for BoundaryProvider {
+        fn stream(
+            &self,
+            request: CompletionRequest,
+            _cancellation: CancellationToken,
+        ) -> BoxFuture<'_, Result<BoxStream<'static, Result<Delta, ProviderError>>, ProviderError>>
+        {
+            let has_outside_fact = request.messages[0].content.contains("outside-only owner");
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request);
+            let text = if has_outside_fact {
+                r#"{"kind":"answer","claims":[{"text":"Morgan owns it","citations":[{"event_id":2}]}]}"#
+            } else {
+                r#"{"kind":"refusal","reason":"the selected rows do not name the owner","covered":["the deadline"]}"#
+            };
+            Box::pin(async move {
+                Ok(Box::pin(stream::iter([Ok(Delta {
+                    text: text.to_owned(),
+                    is_final: true,
+                    usage: Some(Usage::default()),
+                    stop_reason: Some(StopReason::EndTurn),
+                })]))
+                    as BoxStream<'static, Result<Delta, ProviderError>>)
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "selection-boundary"
+        }
+    }
+
+    impl ReasoningProvider for BoundaryProvider {}
+
     fn target() -> CaptureTarget {
         CaptureTarget {
             bundle_id: Some("com.example.meet".into()),
@@ -418,6 +526,44 @@ mod tests {
             kind: TargetKind::Window,
             audio_scoped: true,
         }
+    }
+
+    fn boundary_events() -> Vec<TimelineEvent> {
+        let mut timeline = TimelineBuilder::new(Session::new(SessionId::new(7), target(), 1));
+        timeline.append(
+            Duration::from_secs(10),
+            EventPayload::UtteranceFinal(Utterance {
+                source: Source::System,
+                start: Duration::from_secs(10),
+                end: Duration::from_secs(12),
+                text: "the deadline is Friday".into(),
+                avg_logprob: -0.1,
+                annotations: vec![Annotation::Hesitant],
+            }),
+        );
+        timeline.append(
+            Duration::from_secs(20),
+            EventPayload::UtteranceFinal(Utterance {
+                source: Source::Mic,
+                start: Duration::from_secs(20),
+                end: Duration::from_secs(22),
+                text: "outside-only owner is Morgan".into(),
+                avg_logprob: -0.1,
+                annotations: Vec::new(),
+            }),
+        );
+        timeline.append(
+            Duration::from_secs(30),
+            EventPayload::UtterancePartial(Utterance {
+                source: Source::System,
+                start: Duration::from_secs(30),
+                end: Duration::from_secs(31),
+                text: "provisional secret tail".into(),
+                avg_logprob: -0.1,
+                annotations: Vec::new(),
+            }),
+        );
+        timeline.events().to_vec()
     }
 
     #[test]
@@ -504,6 +650,110 @@ mod tests {
         assert!(!context.contains("audio_bytes"));
         let serialized = serde_json::to_string(&request)?;
         assert!(!serialized.contains("annotation.user"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selection_serializes_only_its_final_rows_and_never_the_provisional_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let events = boundary_events();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let engine = AskEngine::new(Arc::new(BoundaryProvider {
+            requests: Arc::clone(&requests),
+        }));
+        let result = engine
+            .ask_selection(
+                SessionId::new(7),
+                &target(),
+                &[events[0].clone(), events[2].clone()],
+                &[],
+                "Who owns it?",
+                CancellationToken::new(),
+                None,
+            )
+            .await?;
+        assert!(matches!(result.reply, AskReply::Refusal { .. }));
+
+        let requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(requests.len(), 1);
+        let serialized = serde_json::to_string(&requests[0])?;
+        assert!(serialized.contains("the deadline is Friday"));
+        assert!(serialized.contains("meeting audio"));
+        assert!(serialized.contains("hesitant"));
+        assert!(!serialized.contains("outside-only owner"));
+        assert!(!serialized.contains("provisional secret tail"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outside_the_selection_refuses_without_widening_but_recording_scope_answers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let events = boundary_events();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let engine = AskEngine::new(Arc::new(BoundaryProvider {
+            requests: Arc::clone(&requests),
+        }));
+
+        let selected = engine
+            .ask_selection(
+                SessionId::new(7),
+                &target(),
+                &events[..1],
+                &[],
+                "Who owns it?",
+                CancellationToken::new(),
+                None,
+            )
+            .await?;
+        assert!(matches!(selected.reply, AskReply::Refusal { .. }));
+
+        let recording = engine
+            .ask(
+                SessionId::new(7),
+                &target(),
+                &events,
+                &[],
+                "Who owns it?",
+                CancellationToken::new(),
+                None,
+            )
+            .await?;
+        let AskReply::Answer { claims } = recording.reply else {
+            return Err("recording scope must answer from the outside row".into());
+        };
+        assert_eq!(claims[0].citations[0].event_id, EventId::new(2));
+        assert_eq!(requests.lock().map_err(|_| "requests poisoned")?.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn excessive_selection_refuses_before_provider_dispatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let engine = AskEngine::new(Arc::new(BoundaryProvider {
+            requests: Arc::clone(&requests),
+        }));
+        let seed = boundary_events()[0].clone();
+        let events =
+            std::iter::repeat_n(seed, MAX_SELECTION_FINALS.saturating_add(1)).collect::<Vec<_>>();
+        let result = engine
+            .ask_selection(
+                SessionId::new(7),
+                &target(),
+                &events,
+                &[],
+                "What happened?",
+                CancellationToken::new(),
+                None,
+            )
+            .await?;
+        let AskReply::Refusal { reason, .. } = result.reply else {
+            return Err("an oversized selection must refuse locally".into());
+        };
+        assert!(reason.contains("select at most 200"));
+        assert!(requests.lock().map_err(|_| "requests poisoned")?.is_empty());
         Ok(())
     }
 
