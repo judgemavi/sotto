@@ -8,8 +8,6 @@
     <string>sotto</string>
     <key>CFBundleIdentifier</key>
     <string>com.sotto.app</string>
-        </dict>
-    </array>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
