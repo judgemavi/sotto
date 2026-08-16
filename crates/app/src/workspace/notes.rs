@@ -1106,59 +1106,37 @@ struct EvidenceDisclosure {
     summary: u64,
     /// Whether the whole-summary toggle currently shows every claim's chips.
     all: bool,
-    /// Claims opened individually while the whole-summary toggle is off.
-    claims: BTreeSet<usize>,
 }
 
 impl EvidenceDisclosure {
     /// The choices that apply to `summary`. A different summary reads quiet again.
     fn revealed(&self, summary: u64) -> Revealed {
         if self.summary == summary {
-            Revealed {
-                all: self.all,
-                claims: self.claims.clone(),
-            }
+            Revealed { all: self.all }
         } else {
             Revealed::default()
         }
     }
 
-    /// Re-points at `summary`, discarding choices about a different one: claim ordinals do not
-    /// survive a re-summarize.
+    /// Re-points at `summary`, discarding the choice made about a different one: a re-summarize
+    /// reads quiet again rather than inheriting the last summary's revealed state.
     fn rebind(&mut self, summary: u64) {
         if self.summary != summary {
             self.summary = summary;
             self.all = false;
-            self.claims.clear();
         }
     }
 
     fn toggle_all(&mut self, summary: u64) {
         self.rebind(summary);
         self.all = !self.all;
-        self.claims.clear();
-    }
-
-    fn toggle_claim(&mut self, summary: u64, ordinal: usize) {
-        self.rebind(summary);
-        self.all = false;
-        if !self.claims.insert(ordinal) {
-            self.claims.remove(&ordinal);
-        }
     }
 }
 
-/// The disclosure choices in force for the summary being drawn.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// The disclosure choice in force for the summary being drawn.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct Revealed {
     all: bool,
-    claims: BTreeSet<usize>,
-}
-
-impl Revealed {
-    fn claim(&self, ordinal: usize) -> bool {
-        self.all || self.claims.contains(&ordinal)
-    }
 }
 
 /// Identifies a rendered summary, so evidence choices never carry over to a different one.
@@ -1369,66 +1347,28 @@ fn render_claim(
         .into_any_element()
 }
 
-/// A claim's evidence: its chips when revealed, otherwise the control that reveals them.
+/// A claim's evidence chips, drawn only while the whole summary is showing its timecodes.
 ///
-/// The chips are the promise; this is only when they are spent. Whichever branch renders, it is a
-/// real focusable button with a spoken label, so keyboard and screen-reader readers reach the
-/// evidence exactly as a pointer does.
+/// There is deliberately no per-claim control. One existed briefly, and it worked against the
+/// task it belonged to: a compact affordance under every claim is a line of chrome under every
+/// claim, and a summary meant to read as prose was reading as a form. Evidence is now one choice
+/// for the whole summary — the chips are the promise, and `Show timecodes` is when they are spent.
 fn render_evidence(
     meeting: Vec<EventId>,
     external: Vec<mcp::EvidenceId>,
     ordinal: usize,
     context: &ClaimContext<'_>,
 ) -> gpui::AnyElement {
-    let revealed = context.revealed.claim(ordinal);
-    let summary = context.summary;
-    let disclosure = context.disclosure.clone();
-    let meeting_count = meeting.len();
-    let external_count = external.len();
     div()
         .mt_1()
         .min_w_0()
-        .children(revealed.then(|| render_citations(meeting, external, ordinal, context)))
-        .children((!context.revealed.all).then(|| {
-            evidence_control(
-                ("summary-evidence", ordinal).into(),
-                format!("summary-evidence-{ordinal}"),
-                if revealed {
-                    "Hide evidence".to_owned()
-                } else {
-                    evidence_count_label(meeting_count, external_count)
-                },
-                "Show or hide the evidence behind this claim",
-                move |cx| {
-                    disclosure.update(cx, |state, cx| {
-                        state.toggle_claim(summary, ordinal);
-                        cx.notify();
-                    });
-                },
-            )
-        }))
+        .children(
+            context
+                .revealed
+                .all
+                .then(|| render_citations(meeting, external, ordinal, context)),
+        )
         .into_any_element()
-}
-
-fn evidence_count_label(meeting: usize, external: usize) -> String {
-    let mut parts = Vec::with_capacity(2);
-    if meeting > 0 {
-        parts.push(format!(
-            "{meeting} {}",
-            if meeting == 1 {
-                "timecode"
-            } else {
-                "timecodes"
-            }
-        ));
-    }
-    if external > 0 {
-        parts.push(format!(
-            "{external} {}",
-            if external == 1 { "source" } else { "sources" }
-        ));
-    }
-    parts.join(" · ")
 }
 
 /// One evidence control: a focusable button that answers the pointer and the keyboard alike.
@@ -1554,8 +1494,8 @@ mod tests {
     use super::{
         CitationTimes, EvidenceDisclosure, SectionShape, SourceContext, SummaryView,
         active_annotations, annotations_by_anchor, as_literal_markdown, composer_anchor_label,
-        evidence_count_label, last_final_anchor, latest_anchor, moment_label,
-        resolve_transcript_anchor, sections_meta, summary_fingerprint, summary_sections, timecode,
+        last_final_anchor, latest_anchor, moment_label, resolve_transcript_anchor, sections_meta,
+        summary_fingerprint, summary_sections, timecode,
     };
     use crate::notes::NotesState;
 
@@ -1752,7 +1692,7 @@ mod tests {
     }
 
     #[test]
-    fn evidence_is_hidden_until_a_reader_asks_for_one_claim_or_for_all_of_them() {
+    fn evidence_is_hidden_until_a_reader_asks_for_all_of_it() {
         let sections = summary_sections(recording_notes(vec![
             section("overview", vec![note("Sprint 41 planning.", 1)]),
             section("decisions", vec![note("Search rewrite deferred.", 2)]),
@@ -1763,26 +1703,6 @@ mod tests {
         assert!(
             !disclosure.revealed(summary).all,
             "a summary reads as prose before a reader asks for anything"
-        );
-        assert!(
-            !disclosure.revealed(summary).claim(0),
-            "each claim starts quiet"
-        );
-
-        disclosure.toggle_claim(summary, 0);
-        assert!(
-            disclosure.revealed(summary).claim(0),
-            "a reader can reveal one claim without opening the whole summary"
-        );
-        assert!(
-            !disclosure.revealed(summary).claim(1),
-            "opening one claim must leave its neighbour quiet"
-        );
-
-        disclosure.toggle_claim(summary, 0);
-        assert!(
-            !disclosure.revealed(summary).claim(0),
-            "the same compact affordance hides that claim again"
         );
 
         disclosure.toggle_all(summary);
@@ -1796,14 +1716,6 @@ mod tests {
             !disclosure.revealed(summary).all,
             "toggling back returns the whole summary to prose"
         );
-    }
-
-    #[test]
-    fn a_claims_quiet_affordance_says_what_it_is_holding() {
-        assert_eq!(evidence_count_label(1, 0), "1 timecode");
-        assert_eq!(evidence_count_label(10, 0), "10 timecodes");
-        assert_eq!(evidence_count_label(2, 1), "2 timecodes · 1 source");
-        assert_eq!(evidence_count_label(0, 3), "3 sources");
     }
 
     #[test]
@@ -1829,7 +1741,7 @@ mod tests {
         );
         assert!(
             !disclosure.revealed(second).all,
-            "a re-summarize starts quiet; claim ordinals do not survive it"
+            "a re-summarize starts quiet rather than inheriting the last summary's choice"
         );
     }
 
@@ -2567,30 +2479,21 @@ mod tests {
                 "with nothing configured the sources policy must not be drawn over an empty list"
             );
 
-            // Each claim has a compact path to just its own evidence.
-            assert_in_column(
-                visual,
-                &[
-                    "summary-evidence-0",
-                    "summary-evidence-1",
-                    "summary-evidence-2",
-                ],
-            )?;
-
-            let first_claim = visual
-                .debug_bounds("summary-evidence-0")
-                .ok_or_else(|| std::io::Error::other("the first claim needs an evidence path"))?;
-            visual.simulate_click(first_claim.center(), Modifiers::none());
-            visual.run_until_parked();
-            assert_in_column(visual, &["summary-citation-0-0", "summary-citation-0-1"])?;
-            for still_hidden in ["summary-citation-1-0", "summary-citation-2-0"] {
+            // There is deliberately no per-claim control. One existed briefly and was removed:
+            // a compact affordance under every claim is a line of chrome under every claim, and a
+            // summary meant to read as prose was reading as a form.
+            for absent in [
+                "summary-evidence-0",
+                "summary-evidence-1",
+                "summary-evidence-2",
+            ] {
                 assert!(
-                    visual.debug_bounds(still_hidden).is_none(),
-                    "{still_hidden} must remain quiet when only the first claim was opened"
+                    visual.debug_bounds(absent).is_none(),
+                    "{absent} must not render: evidence is one choice for the whole summary"
                 );
             }
 
-            // The summary toggle is the second path and reveals every claim's evidence at once.
+            // The one control reveals every claim's evidence at once.
             let toggle = visual
                 .debug_bounds("summary-evidence-toggle")
                 .ok_or_else(|| std::io::Error::other("the summary evidence toggle must render"))?;
