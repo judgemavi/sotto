@@ -1,6 +1,6 @@
 # T098 — Prove the notes document reaches the screen
 
-**Status:** todo
+**Status:** done
 
 **Wave:** N8 — entry workspace
 

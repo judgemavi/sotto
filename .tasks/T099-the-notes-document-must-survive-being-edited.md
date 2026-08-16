@@ -1,6 +1,6 @@
 # T099 — The notes document must survive being edited
 
-**Status:** todo
+**Status:** done
 
 **Wave:** N8 — entry workspace
 
@@ -90,3 +90,52 @@ proven correct and the presentation was not, and every one of these defects live
 between. T098's own value was refusing to write a test that passed against broken behaviour — the
 reword gap is documented in a code comment at the assertion that would otherwise have papered over
 it. T087 and T098 both close when this closes.
+
+## Implementation notes — 2026-08-16
+
+The shared composer is now a bounded auto-growing multi-line input. Ordinary Return retains its
+existing submit behaviour during a live recording. In the stopped-recording document editor it
+inserts a newline so verbatim block text and the action's Owner/Due payload remain editable; the
+visible Save block control or secondary Return commits the edit. A mounted regression clicks the
+generated action's Edit control, observes all three lines, replaces text, owner, and due date,
+saves, and asserts the composed action fields.
+
+Selectable notes text now keys GPUI's markdown state by both the logical text element and its
+content. Rewording therefore creates a fresh parsed selectable view instead of reusing the old
+generated sentence. T098's recorded gap comment is replaced by a mounted clipboard assertion over
+`summary-claim-0`.
+
+Reorder remains a proven overlay-model and persistence operation but has no product control. T087's
+design and handoff now state that limit explicitly and withdraw any implied rendered-reorder claim.
+The overlay model, persistence, and composition were not changed.
+
+### Verification
+
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test -p app notes:: --locked` — 43 passed.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test --workspace --locked` — passed outside the sandbox;
+  the sandboxed attempt could not bind the loopback sockets used by `mcp --test rmcp_http` and all
+  four of those cases passed when the full command was rerun with loopback access.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo clippy --workspace --all-targets --locked -- -D warnings`
+  — passed.
+- `cargo fmt --all -- --check` and `git diff --check` — passed.
+
+## Review — 2026-08-16
+
+Accepted. Both fixes were confirmed load-bearing by reverting them rather than by reading the
+handoff. Removing `.auto_grow(1, 4)` makes the new action-edit test fail with
+`gpui/src/text_system.rs:372: text argument should not contain newlines`, so the crash was real and
+the test would have caught it. Reverting the selectable-text keying makes the reword assertion fail
+holding the original generated sentence, so T098's finding was correct and the new clipboard
+assertion is not vacuous. Root cause of that one is worth recording: `TextView` caches parse state
+by element id, and the id was `("summary-claim", ordinal)` — ordinal-keyed, so it survived a reword
+and would also have survived a hide or reorder shifting ordinals underneath it.
+
+One regression was found in review and fixed here. Gating plain Return on `transcript_live` also
+caught a path that is not block editing: on a **stopped** recording with no summary,
+`submit_annotation` appends a typed note, and Return had always done that. The gate is now
+`composer_edits_notes_document`, a predicate shared with `submit_annotation` so the key and the
+button cannot drift apart, and `return_still_appends_a_typed_note_when_no_summary_owns_the_composer`
+pins it — it fails against the shipped gate with the note absent from the reopened store.
+
+Closing T087 and T098 with this. T098's file still read `todo` although its work was committed in
+`2b6e10f`.

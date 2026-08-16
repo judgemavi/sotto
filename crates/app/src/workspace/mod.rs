@@ -471,8 +471,11 @@ impl MeetingWorkspace {
         // reachable when the rail it filters is collapsed.
         let library_filter =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search recordings and notes"));
-        let annotation_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Add a note to this recording"));
+        let annotation_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(1, 4)
+                .placeholder("Add a note to this recording")
+        });
         let persisted = layout::load_workspace_state(&database);
         let ask_open = persisted.ask_open;
         // A recorded theme choice is applied before the first frame, so the shell never paints one
@@ -545,7 +548,10 @@ impl MeetingWorkspace {
                 &annotation_input,
                 window,
                 |this, _, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
+                    if matches!(event, InputEvent::PressEnter { secondary: true })
+                        || (matches!(event, InputEvent::PressEnter { secondary: false })
+                            && !this.composer_edits_notes_document(cx))
+                    {
                         this.submit_annotation(window, cx);
                     }
                 },

@@ -1,6 +1,6 @@
 # T087 — The notes document: a summary you can edit without losing either author
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** D1 — living notes
 
@@ -26,7 +26,8 @@ deterministically.**
 - Layer 1: the generated artifact. Immutable, versioned, cited, recomputable. T070's schema gives
   every claim and action item a stable block id derived from its citation anchors.
 - Layer 2: an append-only log of user operations against block ids: add, reword, check/uncheck,
-  hide, reorder. User text is never sent through a model and never altered.
+  hide, reorder. User text is never sent through a model and never altered. Reorder is a model and
+  persistence capability only in this task; no reorder control is exposed in the product UI.
 - Render = layer 1 ⊕ layer 2. Provenance (generated / edited-from-draft / user-authored) is
   which layer the content lives in, displayed quietly on every block.
 - Regeneration merge is deterministic, by citation-anchor overlap. Matched edits carry over
@@ -109,6 +110,10 @@ unchanged.
 The reasoning generator never loads the overlay. An integration test persists a sentinel user edit,
 forces a fresh provider dispatch under a different backend fingerprint, and asserts the serialized
 requests contain neither the sentinel text nor its user block id.
+
+Reorder remains implemented and replayable in the overlay model, but it is not reachable from the
+notes UI. The implementation handoff does not claim a rendered reorder affordance; exposing and
+testing one requires a separate presentation contract.
 
 ### Verification
 

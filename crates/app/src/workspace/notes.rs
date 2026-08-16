@@ -546,7 +546,8 @@ fn timecode(time: Duration) -> String {
 /// focus handle as a tab stop, so the text is reachable without a mouse.
 #[derive(IntoElement)]
 struct SelectableText {
-    /// Unique within the window: `TextView` keys its parse state off this.
+    /// Identifies the text's place in the document; hashed with the text itself to key
+    /// `TextView`'s parse state, because a stable id alone would show a stale sentence.
     id: ElementId,
     text: String,
     color: Rgba,
@@ -554,9 +555,17 @@ struct SelectableText {
 
 impl RenderOnce for SelectableText {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        TextView::markdown(self.id, as_literal_markdown(&self.text), window, cx)
-            .selectable(true)
-            .text_color(self.color)
+        let mut identity = std::collections::hash_map::DefaultHasher::new();
+        self.id.hash(&mut identity);
+        self.text.hash(&mut identity);
+        TextView::markdown(
+            ("selectable-text", identity.finish()),
+            as_literal_markdown(&self.text),
+            window,
+            cx,
+        )
+        .selectable(true)
+        .text_color(self.color)
     }
 }
 
@@ -593,13 +602,23 @@ impl MeetingWorkspace {
         cx.notify();
     }
 
-    pub(crate) fn submit_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.transcript_live
+    /// Whether the shared composer is editing the notes document rather than typing a note.
+    ///
+    /// One composer serves both, and Return has to mean different things in each: a block's
+    /// verbatim text and an action's Owner and Due lines are multi-line, so Return must insert a
+    /// newline there, while a typed note is a single line that Return has always submitted. The
+    /// predicate is shared with [`Self::submit_annotation`] so the key and the button cannot drift
+    /// into disagreeing about which of the two the composer is holding.
+    pub(crate) fn composer_edits_notes_document(&self, cx: &App) -> bool {
+        !self.transcript_live
             && matches!(
                 self.notes.read(cx).snapshot().state,
                 NotesState::Ready { .. } | NotesState::Stale { .. }
             )
-        {
+    }
+
+    pub(crate) fn submit_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_edits_notes_document(cx) {
             self.submit_notes_block(window, cx);
             return;
         }
@@ -2579,6 +2598,7 @@ mod tests {
 
         use futures_util::stream;
         use gpui::{AppContext as _, Entity, Modifiers, TestAppContext, px, size};
+        use gpui_component::input::InputEvent;
         use insight::{
             MeetingNotesGenerator, NotesBlockProvenance, NotesOverlayOperation, OverlayTarget,
             RecordingNotesSectionKind, append_notes_overlay_operation, load_latest_grounded_notes,
@@ -3025,9 +3045,11 @@ mod tests {
                 composed_reword, "User's exact overview wording.",
                 "Save must apply the edit to the composed document before it renders"
             );
-            // Do not turn this into a claim that the reword reached the selectable text: copying
-            // summary-claim-0 after the refresh still returns the old generated sentence. That is
-            // a production finding from this task, not something test-only coverage may repair.
+            let copied = copy_claim(visual, "summary-claim-0")?;
+            assert!(
+                copied.contains("User's exact overview wording."),
+                "the reworded user's text must replace the generated text on screen, got {copied:?}"
+            );
 
             // Check is its own mounted control and changes the presented action, not the artifact.
             click_control(visual, "notes-check-2")?;
@@ -3114,6 +3136,125 @@ mod tests {
                     .all(|block| block.text != "The search rewrite is deferred to sprint 42."),
                 "Hide must remove the selected generated decision from the composed document"
             );
+            Ok(())
+        }
+
+        /// Return still submits a typed note where the composer is not editing the document.
+        ///
+        /// Making the composer multi-line gave Return a second meaning, and a newline is the wrong
+        /// one on a stopped recording that has no summary: there is no block to edit, so the only
+        /// thing the composer can be holding is a note. Pinned because nothing else would notice
+        /// Return quietly turning into a line break on that surface.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn return_still_appends_a_typed_note_when_no_summary_owns_the_composer()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let dir = tempfile::tempdir()?;
+            let database = dir.path().join("sotto.sqlite3");
+            persist_recording(&database).await?;
+
+            let mut cx = TestAppContext::single();
+            let (workspace, visual) =
+                open_summarized_workspace(&mut cx, dir.path(), database.clone());
+            visual.simulate_resize(size(px(900.0), px(820.0)));
+            visual.update(|_, cx| {
+                workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
+            });
+            visual.refresh()?;
+            visual.run_until_parked();
+
+            assert!(
+                !visual.update(|_, cx| workspace.read(cx).composer_edits_notes_document(cx)),
+                "a recording with no summary has no document for the composer to edit"
+            );
+            replace_composer_text(visual, &workspace, "Chase the staging outage postmortem.");
+            // The composer's own key handling belongs to `gpui-component` and is unchanged; what
+            // this pins is the subscription that decides what plain Return means here. Focusing the
+            // input instead would not reach it: a focused `TextElement` paints through
+            // `Root::read`, and this window's first layer is the workspace rather than a `Root`.
+            visual.update(|_, cx| {
+                let input = workspace.read(cx).annotation_input.clone();
+                input.update(cx, |_, cx| {
+                    cx.emit(InputEvent::PressEnter { secondary: false });
+                });
+            });
+            visual.run_until_parked();
+
+            // Reopening the store is the proof: an in-memory message would say the same thing
+            // whether or not the note reached disk.
+            let reopened = Store::open(&database).await?;
+            let typed = reopened
+                .load_session(SessionId::new(41))
+                .await?
+                .into_iter()
+                .filter_map(|event| match event.payload() {
+                    EventPayload::UserAnnotation(annotation) => Some(annotation.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                typed,
+                vec!["Chase the staging outage postmortem.".to_owned()],
+                "Return must append the typed note, not insert a line break into it"
+            );
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn editing_an_action_preserves_its_text_owner_and_due_date_without_panicking()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let dir = tempfile::tempdir()?;
+            let database = dir.path().join("sotto.sqlite3");
+            let _ = recording_with_summary(&database).await?;
+
+            let mut cx = TestAppContext::single();
+            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
+            visual.simulate_resize(size(px(900.0), px(820.0)));
+            visual.update(|_, cx| {
+                workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
+            });
+            visual.refresh()?;
+            visual.run_until_parked();
+
+            let action = visual
+                .debug_bounds("summary-claim-2")
+                .ok_or_else(|| std::io::Error::other("the generated action must render"))?;
+            visual.simulate_mouse_move(action.center(), None, Modifiers::none());
+            visual.run_until_parked();
+            click_control(visual, "notes-edit-2")?;
+            let editable = visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .annotation_input
+                    .read(cx)
+                    .value()
+                    .to_string()
+            });
+            assert!(
+                editable.contains("\nOwner:") && editable.contains("\nDue:"),
+                "an action edit must reach a newline-safe composer with owner and due fields"
+            );
+
+            replace_composer_text(
+                visual,
+                &workspace,
+                "Ship the revised rollout checklist.\nOwner: Priya\nDue: Friday",
+            );
+            click_control(visual, "append-note-control")?;
+
+            let state = visual.update(|_, cx| {
+                let notes = workspace.read(cx).notes.clone();
+                notes.read(cx).snapshot().state
+            });
+            let NotesState::Ready { document, .. } = state else {
+                return Err(std::io::Error::other("edited notes must remain ready").into());
+            };
+            let action = document
+                .blocks
+                .iter()
+                .find(|block| block.text == "Ship the revised rollout checklist.")
+                .ok_or_else(|| std::io::Error::other("the edited action must remain composed"))?;
+            assert_eq!(action.owner.as_deref(), Some("Priya"));
+            assert_eq!(action.due_date.as_deref(), Some("Friday"));
             Ok(())
         }
 
