@@ -1,12 +1,16 @@
 # T088 — The vault: entries as markdown files
 
-**Status:** blocked
+**Status:** todo
 
 **Wave:** V1 — vault
 
 **Depends on:** T086 (entries), T087 (the composed notes document is what gets projected).
-Blocked until both close. The two-way half additionally needs T087's overlay as its ingestion
-target.
+Both closed on 2026-08-16, so this is startable. The two-way half additionally needs T087's
+overlay as its ingestion target, which now exists.
+
+**Planner scoping (2026-08-16):** build the projection and the `sotto://` handler; **leave the vault
+settings row out**. That row is a declared sequential handoff from T069/T080/T081, and T069 and T080
+are still `in-review`. It will be filed separately once they close.
 
 **Owns:** the vault projection as its own module in `crates/rag/**`, the `sotto://` URL-scheme
 registration and handler in `crates/app/**` (sequential handoff — coordinate with whoever holds
