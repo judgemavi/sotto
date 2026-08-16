@@ -133,6 +133,33 @@ Nor has anyone measured the per-row `TextView` cost on a long live transcript �
 synchronous on a row's first layout and re-parses only when its text changes, but that is reasoning,
 not a measurement. Both belong to T035's manual gate.
 
+### Maintainer review — 2026-08-16
+
+Manual pass in the built app confirmed the four behaviours that carry this task: clicking a row
+anchors it, dragging selects and copies its text, `Copy` in the head takes the whole transcript,
+and a drag stops at the row it started in. The last is the documented limit, met without surprise.
+
+One gap found, and fixed here rather than filed: **a shift-clicked range had no visual extent.**
+The gesture has three effects — the clipboard, the Ask scope T091 added, and the status line — and
+two of them were invisible. Only the anchor was washed, so a reader could not see how far back the
+range they had just copied and scoped a question to actually reached. `AskSelection.event_ids`
+already held exactly that range; nothing drew it.
+
+Every row of the range now carries the wash, and the anchor keeps a left rule so the range's origin
+— the row a typed note attaches to — stays distinguishable from the rows it reached. `row_mark`
+decides between plain, in-range, anchor and flashed, and is unit-tested; a flashed row outranks a
+standing mark, because it answers a question the reader asked a moment ago.
+
+**The rule takes its two pixels out of the row's own padding**, and that is load-bearing rather than
+tidiness. A left border that widens the box reflows the row's text under the reader mid-gesture: a
+drag that ends by anchoring its row moved the words 2px right on mouse-up and lost the selection the
+drag had just made. `a_reader_can_select_a_row_anchor_it_and_copy_a_range_of_it` caught it, and
+fails without the compensation. The same reflow existed on the citation flash and is fixed with it.
+
+Residual, recorded rather than claimed: the wash and the rule are asserted through `row_mark`, not
+through a rendered pixel. `debug_bounds` cannot report a background colour, so *"the range is
+marked"* is proven as a decision and the token application is a one-line binding either side of it.
+
 ### Review follow-up — 2026-08-14
 
 Review found that the column-level `Copy` action read only committed pacer rows even while the

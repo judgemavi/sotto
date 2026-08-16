@@ -690,6 +690,7 @@ pub(crate) fn render(
     meeting_selected: bool,
     following: bool,
     focused_event: Option<EventId>,
+    selected: &[EventId],
     list_state: &ListState,
     available_width: Pixels,
     cx: &mut Context<MeetingWorkspace>,
@@ -713,6 +714,8 @@ pub(crate) fn render(
     let committed_annotations = Arc::clone(&annotations);
     let workspace = cx.entity().downgrade();
     let unstable_workspace = workspace.clone();
+    let selected = Arc::<[EventId]>::from(selected);
+    let rendered_selected = Arc::clone(&selected);
     let transcript_list = list(list_state.clone(), move |index, _, _| {
         let row = &rendered_rows[index];
         let pinned = committed_annotations
@@ -724,8 +727,11 @@ pub(crate) fn render(
                 row,
                 index == 0 || rendered_rows[index - 1].source != row.source,
                 pinned,
-                focused_event,
-                flashing,
+                RowMarks {
+                    anchor: focused_event,
+                    range: &rendered_selected,
+                    flashing,
+                },
                 tokens,
                 workspace.clone(),
             ),
@@ -734,8 +740,11 @@ pub(crate) fn render(
                 moments,
                 through,
                 pinned,
-                focused_event,
-                flashing,
+                RowMarks {
+                    anchor: focused_event,
+                    range: &rendered_selected,
+                    flashing,
+                },
                 tokens,
                 workspace.clone(),
             ),
@@ -954,13 +963,12 @@ fn render_committed_row(
     row: &TranscriptRow,
     names_source: bool,
     annotations: Vec<AnnotationView>,
-    focused_event: Option<EventId>,
-    flashing: Option<EventId>,
+    marks: RowMarks<'_>,
     tokens: WorkspaceTokens,
     workspace: WeakEntity<MeetingWorkspace>,
 ) -> AnyElement {
     let body_selector = format!("transcript-row-body-{}", row.event_id.get());
-    row_shell(row, focused_event, flashing, tokens, workspace)
+    row_shell(row, marks, tokens, workspace)
         .child(
             div()
                 .debug_selector(move || body_selector)
@@ -1035,21 +1043,16 @@ fn render_committed_row(
 }
 
 /// One quiet line standing for a stretch of non-speech annotations on one source.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the aside carries the same explicit row state as a spoken row"
-)]
 fn render_non_speech_aside(
     row: &TranscriptRow,
     moments: usize,
     through: Duration,
     annotations: Vec<AnnotationView>,
-    focused_event: Option<EventId>,
-    flashing: Option<EventId>,
+    marks: RowMarks<'_>,
     tokens: WorkspaceTokens,
     workspace: WeakEntity<MeetingWorkspace>,
 ) -> AnyElement {
-    row_shell(row, focused_event, flashing, tokens, workspace)
+    row_shell(row, marks, tokens, workspace)
         .child(
             div()
                 .w_full()
@@ -1096,16 +1099,76 @@ fn non_speech_summary(row: &TranscriptRow, moments: usize, through: Duration) ->
     }
 }
 
+/// What the reader has marked on the transcript, as a row needs it to draw itself.
+#[derive(Clone, Copy)]
+struct RowMarks<'a> {
+    /// The note anchor, and the origin of any range.
+    anchor: Option<EventId>,
+    /// The rows a shift-click covered, which is also what Ask is scoped to.
+    range: &'a [EventId],
+    /// The row a citation is transiently revealing.
+    flashing: Option<EventId>,
+}
+
+impl RowMarks<'_> {
+    fn of(self, event_id: EventId) -> RowMark {
+        row_mark(
+            self.anchor == Some(event_id),
+            self.range.contains(&event_id),
+            self.flashing == Some(event_id),
+        )
+    }
+}
+
+/// What a row shows about the reader's own marks on the transcript.
+///
+/// Shift-click has three effects — the clipboard, the Ask scope, and a status line — and until the
+/// range was drawn, two of them were invisible: the reader could not see how far back the range
+/// they had just copied and scoped a question to actually reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowMark {
+    Plain,
+    /// Inside the marked range: what a shift-click copied and what Ask is scoped to.
+    InRange,
+    /// The range's origin, and the row a typed note attaches to.
+    Anchor,
+    /// Transiently revealed by following a citation; outranks the others because it is the answer
+    /// to a question the reader asked a moment ago.
+    Flashed,
+}
+
+impl RowMark {
+    /// The left rule this mark draws, if any. A range shows as a wash alone: ruling every row of
+    /// it would compete with the anchor for the same edge.
+    const fn rule(self, tokens: WorkspaceTokens) -> Option<Rgba> {
+        match self {
+            Self::Flashed => Some(tokens.accent),
+            Self::Anchor => Some(tokens.accent_line),
+            Self::InRange | Self::Plain => None,
+        }
+    }
+}
+
+const fn row_mark(focused: bool, in_range: bool, flashed: bool) -> RowMark {
+    if flashed {
+        RowMark::Flashed
+    } else if focused {
+        RowMark::Anchor
+    } else if in_range {
+        RowMark::InRange
+    } else {
+        RowMark::Plain
+    }
+}
+
 fn row_shell(
     row: &TranscriptRow,
-    focused_event: Option<EventId>,
-    flashing: Option<EventId>,
+    marks: RowMarks<'_>,
     tokens: WorkspaceTokens,
     workspace: WeakEntity<MeetingWorkspace>,
 ) -> Stateful<Div> {
     let event_id = row.event_id;
-    let focused = focused_event == Some(event_id);
-    let flashed = flashing == Some(event_id);
+    let mark = marks.of(event_id);
     div()
         // The id has to name *this* row. GPUI keys per-element click state by the element id path,
         // and `gpui::list` does not scope its items, so one shared id gave every row one shared
@@ -1118,9 +1181,17 @@ fn row_shell(
         .py(Space::XS)
         .border_t_1()
         .border_color(tokens.line_soft)
-        .when(focused || flashed, |line| line.bg(tokens.accent_wash))
-        .when(flashed, |line| {
-            line.border_l_2().border_color(tokens.accent)
+        .when(mark != RowMark::Plain, |line| line.bg(tokens.accent_wash))
+        // The rule takes its two pixels back out of the row's own padding. A left border that
+        // widens the box reflows the text under the reader mid-gesture: a drag that ends by
+        // anchoring its row moved the words 2px right on mouse-up and dropped the selection the
+        // drag had just made. `a_reader_can_select_a_row_anchor_it_and_copy_a_range_of_it` fails
+        // without this compensation.
+        .when(mark.rule(tokens).is_some(), |line| {
+            line.pl(Space::MD - px(2.0))
+        })
+        .when_some(mark.rule(tokens), |line, rule| {
+            line.border_l_2().border_color(rule)
         })
         // Selecting a row is the note anchor gesture; it appends nothing and rewrites nothing. A
         // drag that selected text inside this row still lands here, and still anchors: the two
@@ -1396,11 +1467,11 @@ mod tests {
     };
 
     use super::{
-        PROVISIONAL_MARKER, RowRole, TranscriptRow, citation_index, classify_rows, copy_report,
-        copy_text, empty_message, escape_html, is_non_speech_annotation, non_speech_summary,
-        presented_event, project_completed_derived_transcript, project_completed_transcript,
-        project_frame, project_transcript, provisional_line, screen_consultation_disclosure,
-        source_label,
+        PROVISIONAL_MARKER, RowMark, RowRole, TranscriptRow, citation_index, classify_rows,
+        copy_report, copy_text, empty_message, escape_html, is_non_speech_annotation,
+        non_speech_summary, presented_event, project_completed_derived_transcript,
+        project_completed_transcript, project_frame, project_transcript, provisional_line,
+        row_mark, screen_consultation_disclosure, source_label,
     };
 
     fn timeline() -> TimelineBuilder {
@@ -1672,6 +1743,39 @@ mod tests {
         assert!(
             project_transcript(timeline.events()).unstable.is_empty(),
             "silence must close the provisional strip"
+        );
+    }
+
+    /// Every row of a shift-clicked range is marked, not only the two the reader clicked.
+    ///
+    /// The gesture's extent was invisible: the anchor was washed and the rows it reached were not,
+    /// so a reader had no way to see what they had copied or what Ask had been scoped to.
+    #[test]
+    fn a_marked_range_shows_on_every_row_it_covers_and_still_names_its_anchor() {
+        assert_eq!(
+            row_mark(true, true, false),
+            RowMark::Anchor,
+            "the range's origin stays distinguishable from the rows it reached"
+        );
+        assert_eq!(
+            row_mark(false, true, false),
+            RowMark::InRange,
+            "a row inside the range must show that it is inside the range"
+        );
+        assert_eq!(
+            row_mark(false, false, false),
+            RowMark::Plain,
+            "an unmarked row claims nothing"
+        );
+        assert_eq!(
+            row_mark(true, true, true),
+            RowMark::Flashed,
+            "a citation the reader just followed outranks a standing mark"
+        );
+        assert_eq!(
+            row_mark(true, false, false),
+            RowMark::Anchor,
+            "an anchor with no range behind it is still the anchor"
         );
     }
 

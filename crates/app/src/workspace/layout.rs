@@ -171,6 +171,9 @@ impl Render for MeetingWorkspace {
             self.transcript_session.is_some(),
             self.follow_transcript,
             self.focused_event,
+            self.ask_selection
+                .as_ref()
+                .map_or(&[][..], |selection| &selection.event_ids),
             &self.transcript_list,
             transcript_width,
             cx,
