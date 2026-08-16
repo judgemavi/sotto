@@ -8,9 +8,16 @@
 Both closed on 2026-08-16, so this is startable. The two-way half additionally needs T087's
 overlay as its ingestion target, which now exists.
 
-**Planner scoping (2026-08-16):** build the projection and the `sotto://` handler; **leave the vault
-settings row out**. That row is a declared sequential handoff from T069/T080/T081, and T069 and T080
-are still `in-review`. It will be filed separately once they close.
+**Planner scoping (2026-08-16), amended:** the projection and the `sotto://` handler landed in
+`85991be`. T069 and T080 have since closed, so **the vault settings row is now in scope** — the
+folder chooser, the on/off, and the live change trigger. That is what stands between the engine and
+a feature a person can use.
+
+**Concurrency (planner, 2026-08-16): T089 runs alongside this and owns `crates/app/src/workspace/**`
+and `crates/app/src/session/**`.** Do not edit either. Your remaining work belongs in
+`crates/app/src/settings/**`, `crates/rag/**`, `crates/app/src/vault.rs` and
+`crates/app/src/notes/controller.rs`. If the live trigger cannot be hung anywhere except a workspace
+file, **stop and report** — do not reach into a directory being rewritten underneath you.
 
 **Owns:** the vault projection as its own module in `crates/rag/**`, the `sotto://` URL-scheme
 registration and handler in `crates/app/**` (sequential handoff — coordinate with whoever holds

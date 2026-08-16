@@ -10,6 +10,22 @@ workspace file set is released and this is startable. `docs/design/workspace-v3-
 normative reference for this task; where it and prose disagree, the mock wins unless an ADR
 overrides both.
 
+**Concurrency (planner, 2026-08-16): T088 runs alongside this.** It holds `crates/rag/**`,
+`crates/app/src/vault.rs`, `crates/app/src/settings/**` and `crates/app/src/notes/controller.rs`.
+Do not edit any of them; if this rewrite needs one, stop and report.
+
+**Two pieces of existing behaviour in your own files must survive the rewrite**, because their
+tests live elsewhere and a silent drop would not go red where you are looking:
+
+1. `MeetingWorkspace::open_sotto_link` in `workspace/mod.rs` — T088's vault citations enter the app
+   through it, reusing `select_meeting` and the citation-reveal path. Keep the method and its
+   honest states for a link naming a recording that no longer belongs to its entry.
+2. The `KeyboardRoot` unwrapping in `in_workspace` (`workspace/mod.rs:315`). The window is mounted
+   `Root ▸ KeyboardRoot ▸ MeetingWorkspace`, and T100 proved the keyboard is unreachable without
+   that middle layer. A downcast that expects the workspace directly under `Root` will compile and
+   silently stop finding the window, which is exactly the failure `Sotto ▸ Settings…` had before
+   T082.
+
 **Owns:** `crates/app/src/workspace/**` (library, layout, mod — full set, since N7 has closed by
 this task's start), the entry creation/attachment flows in `crates/app/src/session/**` where the
 capture start path chooses an entry, and this task
