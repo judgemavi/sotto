@@ -8,15 +8,6 @@
     <string>sotto</string>
     <key>CFBundleIdentifier</key>
     <string>com.sotto.app</string>
-    <key>CFBundleURLTypes</key>
-    <array>
-        <dict>
-            <key>CFBundleURLName</key>
-            <string>Sotto meeting evidence</string>
-            <key>CFBundleURLSchemes</key>
-            <array>
-                <string>sotto</string>
-            </array>
         </dict>
     </array>
     <key>CFBundleInfoDictionaryVersion</key>

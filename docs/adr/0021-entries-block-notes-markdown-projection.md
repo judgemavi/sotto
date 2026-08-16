@@ -75,29 +75,26 @@ The entry's notes document is rendered as `generated artifact ⊕ user edit over
   document as user-layer blocks; the notes document is the one post-call writing surface. The
   separate "your notes" block in the summary column retires when this ships.
 
-### 3. Notes project to a local markdown vault; the record projects read-only
+### 3. ~~Notes project to a local markdown vault; the record projects read-only~~ — withdrawn 2026-08-16
 
-Sotto continuously mirrors the notes layer to a local folder of plain markdown files — one `.md`
-per entry — designed to be opened as (or inside) an Obsidian vault.
+**Withdrawn by the maintainer.** Everything Sotto stores stays in SQLite and notes are edited in the
+app. There is no markdown mirror, no user-chosen vault folder, no `sotto://` scheme, and no series
+page.
 
-- **Format:** YAML frontmatter (date, participants, capture targets, series), wiki-links
-  (`[[entry]]`, `[[series]]`, entity links as they arrive), action items as markdown tasks
-  (`- [ ]`), and per-block anchors using Obsidian block-reference syntax (`^blockid`) carrying the
-  same block ids as layer 1/2. Citations render as links with a `sotto://` deep-link target that
-  opens the app at the cited session and transcript row.
-- **Direction of truth:** the **notes document is two-way** — an external edit to a note's blocks
-  is ingested as overlay operations (same append-only overlay, same provenance rules; unparseable
-  edits are surfaced, not guessed at). The **record is one-way**: transcripts may render into the
-  vault read-only, and an external edit to a transcript projection is never ingested. The product
-  claim "a record you can check" survives only if the record cannot be edited from a text editor.
-- **The canonical store remains SQLite.** The vault is a projection, rebuildable at any time from
-  the store. Deleting an entry removes its projection. The vault path is user-chosen, local, and
-  the mirror is off until the person turns it on.
-- **Series pages** are generated read-only markdown: occurrences, open items across occurrences,
-  standing links. They are derived views in file form.
-- Graph, backlinks, search, sync, and mobile access over this vault are **Obsidian's job** (or any
-  markdown tool's). Sotto ships no graph view, no vault browser, no canvas — ADR-0015 stands in
-  full.
+What was actually wanted from this section is decision 2 above: **editable summaries** — the
+block-identity overlay, delivered by T087, which lets a generated claim be reworded, hidden, checked
+or answered with a block of your own, with provenance, surviving regeneration. That shipped. This
+section extrapolated a file format, a URL-scheme registration and a bidirectional sync engine from
+it, on the strength of one line in this ADR's own context: *"the maintainer's direction is
+Obsidian-shaped."* A direction was carrying the weight of a decision.
+
+Recorded struck through rather than deleted, because a withdrawn decision is more useful to the next
+reader than a missing one. The cost was roughly 1,500 lines and a wave of the task board, and it was
+reversible only because the projection turned out to be a leaf that nothing depended on.
+
+**Kept from this section:** the entry-series relation on `Entry` and the schema migration that
+persists it. Recurring meetings as linked entries is decision 1's business, not the vault's, and both
+T090's brief and T093's carried-forward commitments read the series relation.
 
 ## Consequences
 

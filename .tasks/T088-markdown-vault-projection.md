@@ -1,6 +1,6 @@
 # T088 — The vault: entries as markdown files
 
-**Status:** in-review
+**Status:** withdrawn
 
 **Wave:** V1 — vault
 
@@ -142,3 +142,25 @@ Automated evidence, 2026-08-16:
 
 Manual Obsidian acceptance is **NOT RUN**; it remains the owner gate and must record the exact
 Obsidian version here. The task is therefore in review, not done.
+
+## Withdrawn — 2026-08-16
+
+The maintainer, asked to run the Obsidian acceptance gate: *"why are we integrating with obsidian?"*
+and then *"all I wanted was summaries to be editable, I didnt want markdown files ... we store
+everything in sqlite, we dont need user to interact with md content outside our app."*
+
+Decisive and correct. Editable summaries are T087 — the block-identity overlay — and it shipped.
+This task built a file format, a URL scheme and a bidirectional sync engine on top of a want that
+was already satisfied.
+
+Everything it added is removed: `crates/rag/src/vault.rs`, `crates/app/src/vault.rs`, the Storage &
+privacy vault card and its controls, the `sotto://` registration and handler,
+`MeetingWorkspace::open_sotto_link`, and the `CFBundleURLTypes` entry in `scripts/Info.plist`. The
+work is recoverable from git history if the decision is ever revisited; nothing depended on it,
+which is the only reason a removal this size was clean.
+
+**Kept:** `Entry::series` and its migration, which belong to ADR-0021 decision 1 and are read by
+T090 and T093.
+
+ADR-0021 decision 3 is struck through with the same reasoning rather than deleted, so the next
+reader can see what was decided, what it cost, and why it was withdrawn.

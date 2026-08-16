@@ -40,7 +40,6 @@ use crate::{
     reasoning::ReasoningController,
     session::{RecordingLibrary, SessionController, SessionLifecycle},
     settings::{SettingsEvent, SettingsView},
-    vault::VaultMirrorController,
 };
 
 // The actions macOS invokes on Sotto's behalf. They are declared here rather than in `main.rs`
@@ -461,7 +460,6 @@ pub struct MeetingWorkspace {
     pending_ask: Option<(ask::PendingAsk, String)>,
     ask_dock: Entity<DockArea>,
     ask_open: bool,
-    vault: Entity<VaultMirrorController>,
     /// The settings sheet, built the first time it is asked for and kept afterwards. Building it
     /// probes the Codex CLI and starts the MCP poll, so cold launch must not build it and each
     /// re-open must not build another.
@@ -517,7 +515,6 @@ impl MeetingWorkspace {
             persisted.theme,
         )));
         let ask_panel = cx.new(|cx| ask::AskPanel::new(window, cx));
-        let vault = cx.new(|cx| VaultMirrorController::new(database.clone(), cx));
         let ask_dock = cx.new(|cx| {
             let mut area = DockArea::new("sotto-ask-dock", Some(1), window, cx);
             let item = DockItem::tab(ask_panel.clone(), &cx.entity().downgrade(), window, cx);
@@ -650,7 +647,6 @@ impl MeetingWorkspace {
             pending_ask: None,
             ask_dock,
             ask_open,
-            vault,
             settings: None,
             settings_open: false,
             theme: persisted.theme,
@@ -951,35 +947,6 @@ impl MeetingWorkspace {
             )
         })
         .unwrap_or_default();
-    }
-
-    /// Opens one vault citation through the same recording-selection and citation-reveal paths as
-    /// an in-app evidence chip.
-    pub fn open_sotto_link(&mut self, link: rag::SottoLink, cx: &mut Context<Self>) {
-        let relation = crate::persistence_runtime::block_on(async {
-            let store = rag::Store::open(&self.database).await?;
-            store.entry_for_session(link.session_id).await
-        });
-        match relation {
-            Ok(entry_id) if entry_id == link.entry_id => {
-                self.select_meeting(link.session_id, cx);
-                // `reveal_citation` supplies the honest missing/pruned-row state itself.
-                let _ = self.reveal_citation(link.event_id, cx);
-            }
-            Ok(_) => {
-                self.message = Some(
-                    "That vault link names a recording which no longer belongs to this entry."
-                        .to_owned(),
-                );
-                cx.notify();
-            }
-            Err(_) => {
-                self.show_home(cx);
-                self.message =
-                    Some("The entry or recording behind that vault link was deleted.".to_owned());
-                cx.notify();
-            }
-        }
     }
 
     fn load_transcript(&mut self, id: SessionId) {
@@ -1631,9 +1598,7 @@ impl MeetingWorkspace {
                 let reasoning = self.reasoning.clone();
                 let mcp = self.mcp.clone();
                 let database = self.database.clone();
-                let vault = self.vault.clone();
-                let view =
-                    cx.new(|cx| SettingsView::new(window, reasoning, mcp, vault, database, cx));
+                let view = cx.new(|cx| SettingsView::new(window, reasoning, mcp, database, cx));
                 self._subscriptions.push(cx.subscribe_in(
                     &view,
                     window,

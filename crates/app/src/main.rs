@@ -15,12 +15,7 @@ fn main() {
     // Sotto's own markers and `gpui_component`'s built-in `IconName` variants alike. Before T082
     // the app registered no asset source at all, so an icon was never a possibility and every
     // control had to be a Unicode codepoint whose picture the font, not Sotto, chose.
-    let (opened_link_sender, mut opened_link_receiver) = tokio::sync::mpsc::unbounded_channel();
-    let application = Application::new().with_assets(Assets);
-    application.on_open_urls(move |urls| {
-        let _ = opened_link_sender.send(urls);
-    });
-    application.run(move |cx: &mut App| {
+    Application::new().with_assets(Assets).run(|cx: &mut App| {
         gpui_component::init(cx);
         let (timeline_ingress, timeline) = devwindow::attach_ingress(cx, 1_024);
 
@@ -106,47 +101,6 @@ fn main() {
         // while a recording runs. The menus themselves are published by the workspace, whose state
         // decides which appearance the menu marks.
         workspace::register_menu_actions(workspace_window, cx);
-
-        // Register the citation scheme at runtime as well as in the signed bundle. The platform
-        // callback is outside GPUI's app context, so it only queues URLs; the local receiver hands
-        // them to the already-mounted workspace without network or process indirection.
-        cx.register_url_scheme("sotto").detach();
-        let workspace_view = workspace_window
-            .update(cx, |root, _, root_cx| {
-                root.view()
-                    .clone()
-                    .downcast::<KeyboardRoot>()
-                    .and_then(|keyboard_root| {
-                        keyboard_root
-                            .read(root_cx)
-                            .view()
-                            .clone()
-                            .downcast::<MeetingWorkspace>()
-                    })
-            })
-            .ok()
-            .and_then(Result::ok);
-        if let Some(workspace_view) = workspace_view {
-            cx.spawn(async move |cx| {
-                while let Some(urls) = opened_link_receiver.recv().await {
-                    if cx
-                        .update(|cx| {
-                            for url in urls {
-                                if let Ok(link) = rag::SottoLink::parse(&url) {
-                                    workspace_view.update(cx, |workspace, cx| {
-                                        workspace.open_sotto_link(link, cx)
-                                    });
-                                }
-                            }
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-            })
-            .detach();
-        }
 
         cx.bind_keys(workspace::key_bindings());
 
