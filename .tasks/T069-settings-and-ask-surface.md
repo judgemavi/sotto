@@ -1,6 +1,6 @@
 # T069 — Settings and Ask look like debug panels
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N6 — UI primitives
 
@@ -99,3 +99,30 @@ finalization defect itself (T068).
   `reasoning::tests::codex_requires_persisted_consent_then_resolves_without_api_key` assertion
   currently fails in isolation against the concurrent providers tree. Browser/owner visual
   acceptance remains **NOT RUN**.
+
+## Closed — 2026-08-16
+
+The three Ask defects this task was filed for are settled, each by the strongest evidence available
+for its kind.
+
+**Clipping** was already covered: `narrow_ask_panel_keeps_both_scopes_and_submit_inside_bounds`
+proves the scope row, the selection row and the form all stay inside the minimum panel width.
+
+**Overlap** was not, and is now. The narrow test stacks the three *control rows*, but the line the
+controls overlapped — the sentence qualifying the scope — was not one of them and carried no
+selector, and the defect was reported at an ordinary width rather than at the minimum. It now has a
+selector, and `the_scope_controls_never_sit_on_the_line_that_qualifies_them` asserts the stack and
+the horizontal bounds at both 420px and the minimum. Forcing a 20px negative offset makes it fail
+with `the scope controls must stack rather than overlap at 420px`, so it is not vacuous.
+
+**Three stacked headings** is fixed by construction and is deliberately *not* asserted by test. The
+panel body renders no heading element at all — the dock's `Panel::title` is the only one — and the
+only other occurrences of the word are the toolbar toggle and the submit button, both controls. A
+bounds assertion that "no heading renders" would be exactly the vacuous kind T076 and T098 record:
+`debug_bounds` never clears, so `is_none()` only ever proves a selector was never drawn in that
+window, and it would pass whether or not the fix held. Proven by reading the render rather than by
+a test that cannot fail.
+
+Settings hierarchy and state legibility remain the maintainer's judgment and were not held for;
+T080–T084 have since overtaken much of that surface. This closes T091, whose ownership override
+waited on this task and T077.

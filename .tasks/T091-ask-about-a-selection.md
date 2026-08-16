@@ -1,6 +1,6 @@
 # T091 — Ask about exactly this
 
-**Status:** blocked
+**Status:** done
 
 **Wave:** A2 — ask surface
 
@@ -58,3 +58,10 @@ one more scope.
 
 New answer shapes, proposals, screen evidence in selection scope (T092 owns inspection reach),
 multi-span selection, and any change to T077's selection mechanics.
+
+## Closed — 2026-08-16
+
+Implemented and committed in `2b6e10f`; the ownership override it waited on is resolved now that
+T077 and T069 have both closed. Its selection scope is also what made T077's invisible-range defect
+visible enough to fix: Ask was being scoped to a span of transcript the reader could not see, which
+is recorded in T077 and fixed in `175efc7`.

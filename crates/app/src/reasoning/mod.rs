@@ -1868,12 +1868,17 @@ mod tests {
         controller.openai_readiness = OpenAiReadiness::Validating;
         assert!(controller.invalidate_validation());
         done_receiver.recv_timeout(std::time::Duration::from_secs(1))?;
-        for _ in 0..1_000 {
+        // Wait on a deadline, not on a spin count. The worker sends `done` from *inside* its
+        // closure, so it is still running when this thread wakes, and reaping tests whether the
+        // thread has finished. A bounded 1_000-yield loop was enough on an idle machine and not
+        // enough under a full `--workspace` run, where this failed roughly one run in two.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
             controller.reap_finished_validation_workers();
             if controller.retired_validation_workers.is_empty() {
                 break;
             }
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(
             controller.retired_validation_workers.is_empty(),

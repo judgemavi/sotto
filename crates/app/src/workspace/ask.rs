@@ -379,7 +379,17 @@ impl Render for AskPanel {
                     .gap(Space::SM)
                     .debug_selector(|| "ask-selection-row".into())
             }))
-            .child(div().mt_1().text_sm().text_color(tokens.muted).child(scope))
+            // Selectable because this is the line the scope controls used to sit on top of: the
+            // defect that filed T069 was "Use every retained meeting" overlapping the retention
+            // sentence beneath it, and an overlap is only assertable if both sides have bounds.
+            .child(
+                div()
+                    .mt_1()
+                    .text_sm()
+                    .text_color(tokens.muted)
+                    .debug_selector(|| "ask-scope-line".into())
+                    .child(scope),
+            )
             .when_some(disabled_reason, |view, reason| {
                 view.child(div().mt_3().text_color(tokens.muted).child(reason))
             })
@@ -950,6 +960,53 @@ mod layout_tests {
             bounds[1].top() >= bounds[0].bottom() && bounds[2].top() >= bounds[1].bottom(),
             "the Ask form must remain below the scope controls"
         );
+        Ok(())
+    }
+
+    /// The scope controls must not sit on top of the sentence that qualifies them.
+    ///
+    /// T069's second defect: "Use every retained meeting" overlapped the retention line beneath it.
+    /// The narrow test above proves the three control rows stack, but the line those controls
+    /// overlapped is not one of them, and the defect was seen at an ordinary width rather than at
+    /// the minimum — so neither half of it was covered.
+    #[test]
+    fn the_scope_controls_never_sit_on_the_line_that_qualifies_them()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_component::init);
+        let (panel, visual) = cx.add_window_view(AskPanel::new);
+        visual.update(|_, cx| {
+            panel.update(cx, |panel, _| panel.set_selection(Some(selection())));
+        });
+
+        // Both an ordinary width and the minimum: the overlap was reported at the former, and a
+        // row that stacks when wide can still collide once its children have to wrap.
+        for width in [px(420.0), MIN_ASK_PANEL_WIDTH] {
+            visual.simulate_resize(size(width, px(620.0)));
+            visual.refresh()?;
+            visual.run_until_parked();
+
+            let stacked = ["ask-scope-row", "ask-selection-row", "ask-scope-line"]
+                .map(|selector| {
+                    visual.debug_bounds(selector).ok_or_else(|| {
+                        std::io::Error::other(format!("{selector} must render at {width:?}"))
+                    })
+                })
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for pair in stacked.windows(2) {
+                assert!(
+                    pair[1].top() >= pair[0].bottom(),
+                    "the scope controls must stack rather than overlap at {width:?}"
+                );
+            }
+            let line = stacked[2];
+            assert!(
+                line.left() >= px(0.0) && line.right() <= width,
+                "the qualifying line must stay inside the panel at {width:?}"
+            );
+        }
         Ok(())
     }
 }
