@@ -1,6 +1,6 @@
 # T080 — Settings as a sheet with four panes
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N7 — v2 workspace
 
@@ -204,3 +204,20 @@ the nav and every pane at 420px, not just the default one.
 - **Storage & privacy's budget card and recording rows still render only when the library snapshot
   succeeds.** Unchanged behaviour, but it means a failed snapshot leaves that pane with claims and
   a notice and no controls.
+
+## Maintainer review — 2026-08-16
+
+Closed. The visual pass was run in the built app: the sheet's colour, spacing and dark-mode balance
+read correctly, the four panes switch with only the selected one shown and the current one marked,
+every control survived the restructure into cards, and dismissal by Escape and by the sheet's own
+control returns to a sensible focus. Those were the four things layout assertions could not reach —
+in particular that **Storage & privacy** disappears after navigating away, which no test can prove
+because `debug_bounds` never clears and the pane renders on open by definition.
+
+Two of the recorded residuals were void rather than outstanding. This task noted there was no
+in-window settings entry point and that `Sotto ▸ Settings…` dispatch was unproven; T081 added the
+gear and T082 pinned the menu action with three regressions that mount the shell exactly as
+`main.rs` does.
+
+The failed-library-snapshot case stands as recorded: Storage & privacy then renders its claims and
+a notice with no controls. Unchanged behaviour, not a regression introduced here.

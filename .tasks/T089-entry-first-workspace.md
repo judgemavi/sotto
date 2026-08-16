@@ -1,11 +1,12 @@
 # T089 — The workspace speaks in entries
 
-**Status:** blocked
+**Status:** todo
 
 **Wave:** N8 — entry workspace
 
-**Depends on:** T086 (the entry model), and the close of the N7 wave (T072–T085) — this task
-edits the same workspace files those tasks hold. `docs/design/workspace-v3-mock.html` is the
+**Depends on:** T086 (the entry model), and the close of the N7 wave (T072-T085) — this task
+edits the same workspace files those tasks hold. **The wave closed on 2026-08-16**, so the full
+workspace file set is released and this is startable. `docs/design/workspace-v3-mock.html` is the
 normative reference for this task; where it and prose disagree, the mock wins unless an ADR
 overrides both.
 
