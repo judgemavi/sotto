@@ -1,6 +1,6 @@
 # T078 — Somewhere to stand that is not a recording
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N7 — v2 workspace
 

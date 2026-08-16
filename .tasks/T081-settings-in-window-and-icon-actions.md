@@ -1,6 +1,6 @@
 # T081 — Settings belongs in the window, and delete is a trash can
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N7 — v2 workspace
 
@@ -144,6 +144,17 @@ Finder` as its tooltip; no abbreviation was invented.
   `cargo fmt --all --check` clean; scoped `git diff --check` clean.
 - Launch-and-render: `cargo run -p app` launched and stayed alive with a rendered window, twice.
 
+### Maintainer review — 2026-08-16
+
+Two of the residuals below are void rather than outstanding, because T082 overtook them: the
+in-window `◐` appearance toggle no longer exists — appearance moved to the OS menu — and the trash
+action now uses a real vendored icon rather than the `🗑` emoji whose CoreText fallback this task
+could not pin. Neither needs to be seen because neither is shipped.
+
+Menu-item dispatch is covered after all: T082's three regressions mount the shell exactly as
+`main.rs` does — under `gpui_component::Root`, with `register_menu_actions`, window activated — and
+drive `App::dispatch_action`, the same entry point GPUI's menu callback uses.
+
 ### NOT RUN
 
 - **Visual acceptance of the built app.** No screenshot was taken — `screencapture` is denied to this
@@ -156,5 +167,6 @@ Finder` as its tooltip; no abbreviation was invented.
 - **Menu-item dispatch through the real macOS menu bar.** The test drives `toggle_settings` and the
   gear; the `Sotto ▸ Settings…` path through `cx.set_menus` → `App::dispatch_action` →
   `WindowHandle::update` was not exercised by an automated test.
-- **Theme choice surviving a real relaunch.** The round trip through `workspace-state.json` is
-  tested; quitting and relaunching the signed app to confirm the palette is restored was not.
+- ~~**Theme choice surviving a real relaunch.**~~ Verified by the maintainer on 2026-08-16: the app
+  was quit and relaunched and the recorded palette was restored. This was the task's last open
+  item.

@@ -1,6 +1,6 @@
 # T084 — Destructive confirmations belong in a dialog
 
-**Status:** in-review
+**Status:** done
 
 **Planner note (2026-08-14):** status normalized from "done — awaiting the maintainer's hand
 check" — the Status field takes exactly one vocabulary value, and awaiting the maintainer's check

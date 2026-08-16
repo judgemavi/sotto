@@ -1,6 +1,6 @@
 # T082 — Real icons, and chrome where macOS puts it
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N7 — v2 workspace
 

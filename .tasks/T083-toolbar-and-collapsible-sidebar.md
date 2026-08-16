@@ -1,6 +1,6 @@
 # T083 — A real toolbar, and a sidebar that gets out of the way
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N7 — v2 workspace
 

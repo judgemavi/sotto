@@ -1,6 +1,6 @@
 # T066 — Let the reasoning layer pull a screenshot when it needs one
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** M4 — recording
 
@@ -205,3 +205,16 @@ serialized text contains no PNG magic, no `data:image`, no base64 payload, and n
 `RecordingFrameUnavailableReason`, which is not enough to construct an inspector or implement the
 trait. The alternative was widening the re-export in `crates/providers`, which this task does not
 own. No other file outside the owned set was touched.
+
+## Closed with a recorded gap — 2026-08-16
+
+Closed on evidence: the runtime-assembly frame pull, the missing/pruned/deleted transcript-only
+path, the refusal of image evidence before any decode, and the no-visual-context no-decode path all
+have named passing tests.
+
+**One acceptance line is not met and is deliberately handed on.** "When a frame was consulted, the
+user can see that it was, and at which moment" holds for a fresh run and fails on a cached reopen,
+because consultations live for the run rather than for the artifact. That is the same defect shape
+T096 fixed for backend downgrades, and it belongs to T092, whose charter is this task's open gaps.
+T092 is blocked on this task closing, so holding it would be circular — the gap is recorded here so
+it cannot be mistaken for passed, and closing is what lets it be fixed.

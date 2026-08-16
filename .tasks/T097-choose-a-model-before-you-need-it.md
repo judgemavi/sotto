@@ -1,6 +1,6 @@
 # T097 — Choose a transcription model before you need it
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** M4 — recording
 

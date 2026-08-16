@@ -1,6 +1,6 @@
 # T073 — The library rail and the three ways a session begins
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N7 — v2 workspace
 
@@ -145,3 +145,12 @@ match an unrelated summary. Search now appends only rendered claim/action text p
 and due-date values. `summary_search_indexes_written_content_not_schema_field_names` covers the
 false-positive and content-match paths. The focused test passes; the task remains in review for its
 integrated visual/owner gate.
+
+## Maintainer review — 2026-08-16
+
+**Waived, not met:** the acceptance asks that titles "truncate with a visible ellipsis at the
+stated minimum width." They preserve their beginning and truncate inside the rail — which is the
+part that matters, since the start is what identifies a recording — but no ellipsis glyph is
+rendered. `text_ellipsis()` is applied at `library.rs:490` and `:501`, so the intent is expressed
+and GPUI is not drawing the character. The maintainer accepted the behaviour as it stands rather
+than hold the task; recorded as a waiver so the acceptance line is not silently treated as passed.
