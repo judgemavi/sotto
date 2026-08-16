@@ -1,12 +1,14 @@
 # T092 — Screen consultation, finished: a budget, Ask's reach, and a disclosure that survives
 
-**Status:** blocked
+**Status:** todo
 
 **Wave:** D1 — living notes
 
 **Depends on:** T066 (`in-review`) whose `## Open gaps` section is this task's charter, T070
 (`todo`) for the notes surface and artifact schema this task extends, and T075/T076's close for
-`workspace/notes.rs`. Blocked until they close. The one-inspection rule this amends is
+`workspace/notes.rs`. All four closed on 2026-08-16, so this is startable. T066's own open gap — a consulted frame is
+disclosed on a fresh run and not on a cached reopen, because consultations live for the run rather
+than for the artifact — is recorded there and is this task's to fix. The one-inspection rule this amends is
 ADR-0009/T028's; the amendment is recorded here and needs a short ADR entry on acceptance.
 
 **Owns:** the inspection budget in `crates/insight/**`, the Ask inspection seam in the

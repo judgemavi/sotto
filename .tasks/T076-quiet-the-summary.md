@@ -1,6 +1,6 @@
 # T076 — Let the summary be read, not audited
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N7 — v2 workspace
 
@@ -171,3 +171,14 @@ nothing else here is outstanding.
   mitigation is that every control carries a readable text label rather than an icon.
 - **Visual acceptance of the quiet summary on a real recording.** Verified in the render tree at
   680 px and 900 px, not by eye on a real summary.
+
+## Closed — 2026-08-16
+
+Keyboard activation of the evidence control is proven: T100's Root-mounted test drives the
+production `evidence_control` and asserts Enter reaches its ancestor listener from the focused
+child button. The harness gap that made this untestable is gone.
+
+The remaining residuals are settled rather than outstanding: the visual pass was met in use, and
+screen-reader announcement is unassertable because GPUI exposes no accessibility tree — the
+standing mitigation is that every control carries a readable text label rather than an icon. How
+*visible* the focus indicator is belongs to T101.

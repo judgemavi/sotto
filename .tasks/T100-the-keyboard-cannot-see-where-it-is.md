@@ -1,6 +1,6 @@
 # T100 — The keyboard cannot see where it is
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N8 — entry workspace
 
@@ -127,3 +127,19 @@ binary and then the full suite passed outside that socket restriction. **Real bu
 confirmation remains NOT RUN**: review must confirm the black-at-20%-alpha light ring and
 white-at-20%-alpha dark ring are visibly distinct on the actual controls before changing this task
 to `done` and releasing T076.
+
+## Closed with its second half handed on — 2026-08-16
+
+Closed on what it set out to fix. Focus could not move at all, and the Enter listener on
+`evidence_control` could never fire; both now work and are pinned by a test that fails when the
+non-tab-stop origin is reverted, with the message `Tab must leave the non-stop focus origin`.
+
+**The "visibly distinguishable" acceptance line is not met, and cannot be met through this seam.**
+`gpui-component` draws its ring at a hardcoded `.alpha(0.2)` (`styled.rs:614`), so the pure black
+and pure white tokens installed here are already the maximum contrast obtainable. Maintainer
+screenshots confirmed the result: legible on a solid button, close to invisible on a ghost button
+where only the ring's corner arcs read against a dark surface. T101 owns the indicator and is free
+to draw one rather than configure one.
+
+T076 closes with this: its outstanding residual was keyboard *activation* of the evidence control,
+which is now proven against the production control rather than a copy.
