@@ -763,8 +763,11 @@ mod tests {
         let (_sender, receiver) = std::sync::mpsc::sync_channel(1);
         let cancellation = sotto_core::CancellationToken::new();
         let cancellation_observer = cancellation.clone();
+        // Two seconds, against a 500 ms budget below. The property is "does not join", and the
+        // margin has to survive a loaded `--workspace` run: at 200 ms against 50 ms this failed
+        // roughly one full run in three while the non-blocking path itself was merely slow.
         let worker = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(std::time::Duration::from_secs(2));
         });
         controller.pending = Some(PendingGeneration {
             generation: 1,
@@ -778,7 +781,7 @@ mod tests {
         drop(controller);
 
         assert!(cancellation_observer.is_cancelled());
-        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
         Ok(())
     }
 
@@ -789,8 +792,10 @@ mod tests {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let cancellation = sotto_core::CancellationToken::new();
         let cancellation_observer = cancellation.clone();
+        // Two seconds, against the 500 ms budget below — see the sibling test for why the margin
+        // is this wide on both sides.
         let worker = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(std::time::Duration::from_secs(2));
             let _ = sender.send(GenerationResult {
                 generation: 1,
                 session_id: SessionId::new(2),
@@ -811,7 +816,7 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(controller.select(SessionId::new(1), false));
 
-        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
         assert!(cancellation_observer.is_cancelled());
         assert!(!controller.poll());
         assert_eq!(controller.snapshot().state, NotesState::Disabled);

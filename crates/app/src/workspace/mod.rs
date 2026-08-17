@@ -2,6 +2,7 @@
 
 mod ask;
 mod control_row;
+pub(crate) mod focus;
 pub(crate) mod icons;
 mod layout;
 mod library;
@@ -24,11 +25,13 @@ use gpui::{
 };
 use gpui_component::{
     IconName, Root, Sizable as _, Size, Theme, ThemeMode, WindowExt as _,
-    button::{Button, ButtonVariant, ButtonVariants as _},
+    button::{Button as ComponentButton, ButtonVariant, ButtonVariants as _},
     dialog::{Dialog, DialogButtonProps},
     dock::{DockArea, DockItem, DockPlacement},
     input::{InputEvent, InputState},
 };
+
+use focus::Button;
 use providers::Role;
 use serde::{Deserialize, Serialize};
 use sotto_core::{Entry, EntryId, EventId, SessionId, TimelineEvent};
@@ -91,8 +94,9 @@ pub(crate) fn icon_button(
     id: impl Into<ElementId>,
     icon: IconName,
     label: impl Into<SharedString>,
-) -> Button {
-    Button::new(id)
+    tokens: tokens::WorkspaceTokens,
+) -> ComponentButton {
+    Button::new(id, tokens)
         .icon(icon)
         .tooltip(label)
         .ghost()
@@ -103,8 +107,12 @@ pub(crate) fn icon_button(
 ///
 /// The trailing ellipsis is the platform's own promise that this control asks before it acts;
 /// `target` names what is at risk — "this recording", "the recording for “Sprint 41 planning”".
-pub(crate) fn delete_icon_button(id: impl Into<ElementId>, target: &str) -> Button {
-    Button::new(id)
+pub(crate) fn delete_icon_button(
+    id: impl Into<ElementId>,
+    target: &str,
+    tokens: tokens::WorkspaceTokens,
+) -> ComponentButton {
+    Button::new(id, tokens)
         .icon(IconName::Delete)
         .tooltip(format!("Delete {target}…"))
         .danger()

@@ -36,10 +36,11 @@ use gpui::{
 };
 use gpui_component::{
     Disableable, IconName, WindowExt as _,
-    button::Button,
     input::{Input, InputState},
     scroll::ScrollableElement,
 };
+
+use crate::workspace::focus::Button;
 use providers::{CODEX_CLI_BACKEND_ID, OPENAI_RESPONSES_BACKEND_ID, Role};
 use secrecy::SecretString;
 use sotto_core::SessionId;
@@ -830,6 +831,7 @@ impl Render for SettingsView {
                                             "close-settings",
                                             IconName::Close,
                                             "Close settings (Escape)",
+                                            tokens,
                                         )
                                         .on_click(cx.listener(|this, _, _, cx| this.dismiss(cx))),
                                     ),
@@ -894,7 +896,7 @@ impl SettingsView {
                     .child(Input::new(&self.recording_budget_input))
                     .child(
                         action_row().child(
-                            Button::new("save-recording-budget")
+                            Button::new("save-recording-budget", tokens)
                                 .label("Save budget")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.save_recording_budget(cx);
@@ -924,6 +926,7 @@ impl SettingsView {
                                             delete_icon_button(
                                                 ("delete-recording", index),
                                                 &format!("the recording for “{label}”"),
+                                                tokens,
                                             )
                                             .on_click(
                                                 cx.listener(move |this, _, window, cx| {
@@ -976,6 +979,7 @@ impl SettingsView {
                                             delete_icon_button(
                                                 ("delete-growing-recording", index),
                                                 &format!("the recording for “{label}”"),
+                                                tokens,
                                             )
                                             .on_click(
                                                 cx.listener(move |this, _, window, cx| {
@@ -1048,14 +1052,14 @@ impl SettingsView {
                 .child(
                     action_row()
                         .child(
-                            Button::new("all-no-reasoning")
+                            Button::new("all-no-reasoning", tokens)
                                 .label("Use no reasoning")
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.apply_to_all(None, cx)),
                                 ),
                         )
                         .child(
-                            Button::new("all-openai")
+                            Button::new("all-openai", tokens)
                                 .label("Use OpenAI for all")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.apply_to_all(Some(OPENAI_RESPONSES_BACKEND_ID), cx);
@@ -1074,14 +1078,14 @@ impl SettingsView {
                     .child(
                         action_row()
                             .child(
-                                Button::new("save-codex-model")
+                                Button::new("save-codex-model", tokens)
                                     .label("Save model id")
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.save_codex_model(cx)),
                                     ),
                             )
                             .child(
-                                Button::new("check-codex")
+                                Button::new("check-codex", tokens)
                                     .label("Check login")
                                     .disabled(codex_checking)
                                     .on_click(cx.listener(|this, _, _, cx| this.check_codex(cx))),
@@ -1090,11 +1094,11 @@ impl SettingsView {
                             // backend until this button has been pressed with the disclosure
                             // above it on screen.
                             .child(if codex_enabled {
-                                Button::new("disable-codex")
+                                Button::new("disable-codex", tokens)
                                     .label("Disable Codex")
                                     .on_click(cx.listener(|this, _, _, cx| this.disable_codex(cx)))
                             } else {
-                                Button::new("enable-codex")
+                                Button::new("enable-codex", tokens)
                                     .label("Enable Codex — I understand")
                                     .disabled(!codex_ready)
                                     .on_click(cx.listener(|this, _, _, cx| this.enable_codex(cx)))
@@ -1115,7 +1119,7 @@ impl SettingsView {
                 .child(Input::new(&self.model_input))
                 .child(
                     action_row().child(
-                        Button::new("save-openai-model")
+                        Button::new("save-openai-model", tokens)
                             .label("Save model id")
                             .on_click(cx.listener(|this, _, _, cx| this.save_model(cx))),
                     ),
@@ -1124,15 +1128,17 @@ impl SettingsView {
                 .child(
                     action_row()
                         .child(
-                            Button::new("save-openai-key").label("Save key").on_click(
-                                cx.listener(|this, _, window, cx| this.save_key(window, cx)),
-                            ),
+                            Button::new("save-openai-key", tokens)
+                                .label("Save key")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.save_key(window, cx)),
+                                ),
                         )
                         .child(
                             div()
                                 .debug_selector(|| DELETE_OPENAI_KEY_SELECTOR.into())
                                 .child(
-                                    Button::new("delete-openai-key")
+                                    Button::new("delete-openai-key", tokens)
                                         .label("Delete key…")
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.delete_key(window, cx);
@@ -1140,7 +1146,7 @@ impl SettingsView {
                                 ),
                         )
                         .child(
-                            Button::new("validate-openai-key")
+                            Button::new("validate-openai-key", tokens)
                                 .label("Validate with OpenAI")
                                 .disabled(openai_validating)
                                 .on_click(cx.listener(|this, _, _, cx| this.validate_key(cx))),
@@ -1188,7 +1194,7 @@ impl SettingsView {
                 .child(Input::new(&self.mcp_endpoint_input))
                 .child(
                     action_row().child(
-                        Button::new("configure-mcp-http")
+                        Button::new("configure-mcp-http", tokens)
                             .label("Add HTTPS source")
                             .on_click(cx.listener(|this, _, _, cx| this.configure_mcp(cx))),
                     ),
@@ -1223,7 +1229,7 @@ impl SettingsView {
                 .child(
                     action_row()
                         .child(
-                            Button::new(("mcp-check", index))
+                            Button::new(("mcp-check", index), tokens)
                                 .label("Check and discover resources")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.action_message = this
@@ -1237,14 +1243,14 @@ impl SettingsView {
                                 })),
                         )
                         .child(
-                            Button::new(("mcp-token", index))
+                            Button::new(("mcp-token", index), tokens)
                                 .label("Store pasted token")
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.save_mcp_token(save_id.clone(), window, cx);
                                 })),
                         )
                         .child(
-                            Button::new(("mcp-token-delete", index))
+                            Button::new(("mcp-token-delete", index), tokens)
                                 .label("Delete token")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.action_message = this
@@ -1258,7 +1264,7 @@ impl SettingsView {
                                 })),
                         )
                         .child(
-                            Button::new(("mcp-remove", index))
+                            Button::new(("mcp-remove", index), tokens)
                                 .label("Remove source")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.action_message = this
@@ -1445,19 +1451,19 @@ fn role_controls(
     settings_card(label, &format!("Current state · {current}"), tokens).child(
         action_row()
             .child(
-                Button::new((id, 0_u32))
+                Button::new((id, 0_u32), tokens)
                     .label("No reasoning")
                     .on_click(cx.listener(move |this, _, _, cx| this.select_role(role, None, cx))),
             )
             .child(
-                Button::new((id, 1_u32))
+                Button::new((id, 1_u32), tokens)
                     .label("OpenAI")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_role(role, Some(OPENAI_RESPONSES_BACKEND_ID), cx);
                     })),
             )
             .child(
-                Button::new((id, 2_u32))
+                Button::new((id, 2_u32), tokens)
                     .label("Codex")
                     .disabled(!codex_selectable)
                     .on_click(cx.listener(move |this, _, _, cx| {

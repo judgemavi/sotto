@@ -27,7 +27,7 @@ use std::{
 use gpui::{App, Context, ElementId, Entity, Rgba, WeakEntity, Window, div, prelude::*};
 use gpui_component::{
     Disableable, Sizable as _,
-    button::{Button, ButtonVariants as _},
+    button::ButtonVariants as _,
     input::{Input, InputState},
     scroll::ScrollableElement,
     text::TextView,
@@ -47,7 +47,7 @@ use crate::{
 };
 
 use super::{
-    MeetingWorkspace,
+    Button, MeetingWorkspace,
     control_row::{ControlRole, ControlRow},
     tokens::WorkspaceTokens,
 };
@@ -125,7 +125,7 @@ pub(crate) fn render_with_citation_times(
                         )
                         .child(
                             ControlRole::Essential,
-                            Button::new("append-note")
+                            Button::new("append-note", tokens)
                                 .label(if live { "Add" } else { "Save block" })
                                 .small()
                                 .disabled(
@@ -182,13 +182,16 @@ fn render_completed_annotations(
                     color: tokens.ink_2,
                 })
                 .child(
-                    Button::new(("completed-user-note-anchor", annotation.event_id.get()))
-                        .label(moment_label(anchor, citation_times))
-                        .ghost()
-                        .xsmall()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_citation(anchor, cx);
-                        })),
+                    Button::new(
+                        ("completed-user-note-anchor", annotation.event_id.get()),
+                        tokens,
+                    )
+                    .label(moment_label(anchor, citation_times))
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_citation(anchor, cx);
+                    })),
                 )
                 .child(div().text_xs().text_color(tokens.faint).child("Your words"))
         }))
@@ -222,7 +225,7 @@ fn render_head(
                 )
                 .child(
                     ControlRole::Essential,
-                    Button::new("summarize")
+                    Button::new("summarize", tokens)
                         .label(if summary.sections.is_empty() {
                             "Summarize"
                         } else {
@@ -449,7 +452,7 @@ fn render_your_notes(
                         )
                         .child(
                             ControlRole::Essential,
-                            Button::new(("edit-typed-note", event_id.get()))
+                            Button::new(("edit-typed-note", event_id.get()), tokens)
                                 .label("Edit")
                                 .ghost()
                                 .xsmall()
@@ -459,7 +462,7 @@ fn render_your_notes(
                         )
                         .child(
                             ControlRole::Essential,
-                            Button::new(("typed-note-anchor", event_id.get()))
+                            Button::new(("typed-note-anchor", event_id.get()), tokens)
                                 .label("Show")
                                 .ghost()
                                 .xsmall()
@@ -952,7 +955,7 @@ fn render_source_context(
                         )
                         .child(
                             ControlRole::Essential,
-                            Button::new(("query-disclosure", server_index))
+                            Button::new(("query-disclosure", server_index), tokens)
                                 .label(if disclosed { "Disclosure: on" } else { "Disclosure: off" })
                                 .ghost()
                                 .xsmall()
@@ -981,7 +984,7 @@ fn render_source_context(
                             Button::new((
                                 "source-resource",
                                 server_index.saturating_mul(10_000).saturating_add(resource_index),
-                            ))
+                            ), tokens)
                             .label(if chosen { "Selected" } else { "Use" })
                             .ghost()
                             .xsmall()
@@ -1520,6 +1523,7 @@ fn render_evidence_control(context: &ClaimContext<'_>) -> gpui::AnyElement {
                     "Show timecodes".to_owned()
                 },
                 "Show or hide the transcript timecodes behind every claim in this summary",
+                context.tokens,
                 move |cx| {
                     disclosure.update(cx, |state, cx| {
                         state.toggle_all(summary);
@@ -1661,7 +1665,7 @@ fn render_claim(
                 .child(ControlRole::Ellipsizing, div())
                 .child_when(claim.action, ControlRole::Essential, || {
                     let label = if checked { "Uncheck" } else { "Check" };
-                    let button = Button::new(("notes-check", ordinal))
+                    let button = Button::new(("notes-check", ordinal), tokens)
                         .label(label)
                         .ghost()
                         .xsmall()
@@ -1679,7 +1683,7 @@ fn render_claim(
                     button.into_any_element()
                 })
                 .child(ControlRole::Essential, {
-                    let button = Button::new(("notes-edit", ordinal))
+                    let button = Button::new(("notes-edit", ordinal), tokens)
                         .label("Edit")
                         .ghost()
                         .xsmall()
@@ -1700,7 +1704,7 @@ fn render_claim(
                     button
                 })
                 .child(ControlRole::Essential, {
-                    let button = Button::new(("notes-hide", ordinal))
+                    let button = Button::new(("notes-hide", ordinal), tokens)
                         .label("Hide")
                         .ghost()
                         .xsmall()
@@ -1773,6 +1777,7 @@ pub(super) fn evidence_control(
     selector: String,
     label: String,
     tooltip: &'static str,
+    tokens: WorkspaceTokens,
     activate: impl Fn(&mut App) + 'static,
 ) -> gpui::AnyElement {
     let activate = std::rc::Rc::new(activate);
@@ -1786,7 +1791,7 @@ pub(super) fn evidence_control(
             }
         })
         .child(
-            Button::new(id)
+            Button::new(id, tokens)
                 .label(label)
                 .ghost()
                 .xsmall()
@@ -1820,10 +1825,13 @@ fn render_citations(
         .child(div().flex().flex_wrap().gap_1().min_w_0().children(
             meeting.into_iter().enumerate().map(|(index, event_id)| {
                 let workspace = context.workspace.clone();
-                Button::new((
-                    "summary-citation",
-                    ordinal.saturating_mul(1_000).saturating_add(index),
-                ))
+                Button::new(
+                    (
+                        "summary-citation",
+                        ordinal.saturating_mul(1_000).saturating_add(index),
+                    ),
+                    tokens,
+                )
                 .label(moment_label(event_id, citation_times))
                 .outline()
                 .xsmall()

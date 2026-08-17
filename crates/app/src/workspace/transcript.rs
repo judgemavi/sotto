@@ -36,16 +36,13 @@ use gpui::{
     Pixels, Rgba, SharedString, Stateful, Timer, WeakEntity, Window, div, list, prelude::*, px,
     rems,
 };
-use gpui_component::{
-    button::Button,
-    text::{TextView, TextViewStyle},
-};
+use gpui_component::text::{TextView, TextViewStyle};
 use sotto_core::{EventId, EventPayload, Source, SpeechState, TimelineEvent, replay_lenient};
 
 use crate::reasoning::inspection::ScreenConsultation;
 
 use super::{
-    MeetingWorkspace, StageTab,
+    Button, MeetingWorkspace, StageTab,
     ask::AskSelection,
     control_row::{ControlRole, ControlRow},
     notes,
@@ -865,11 +862,12 @@ fn render_column_head(
 }
 
 fn copy_control(cx: &mut Context<MeetingWorkspace>) -> AnyElement {
+    let tokens = WorkspaceTokens::resolve(cx);
     div()
         .pl(Space::SM)
         .debug_selector(|| "transcript-copy-control".into())
         .child(
-            Button::new("copy-transcript")
+            Button::new("copy-transcript", tokens)
                 .label("Copy")
                 .on_click(cx.listener(|this, _, _, cx| this.copy_transcript(cx))),
         )
@@ -877,11 +875,12 @@ fn copy_control(cx: &mut Context<MeetingWorkspace>) -> AnyElement {
 }
 
 fn follow_control(following: bool, cx: &mut Context<MeetingWorkspace>) -> AnyElement {
+    let tokens = WorkspaceTokens::resolve(cx);
     div()
         .pl(Space::SM)
         .debug_selector(|| "transcript-follow-control".into())
         .child(
-            Button::new("follow-transcript")
+            Button::new("follow-transcript", tokens)
                 .label(if following {
                     "Following live"
                 } else {

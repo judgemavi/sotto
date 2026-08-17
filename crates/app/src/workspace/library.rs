@@ -30,7 +30,7 @@ use gpui::{
 };
 use gpui_component::{
     Disableable as _, Sizable as _,
-    button::{Button, ButtonVariants as _},
+    button::ButtonVariants as _,
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement,
     tooltip::Tooltip,
@@ -43,7 +43,7 @@ use sotto_core::{
 };
 
 use super::{
-    MeetingWorkspace,
+    Button, MeetingWorkspace,
     control_row::{ControlRole, ControlRow},
     icons,
     layout::format_bytes,
@@ -705,10 +705,11 @@ fn entry_rename_control(
     current: String,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
+    let tokens = WorkspaceTokens::resolve(cx);
     div()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(
-            Button::new(("rename-entry", key))
+            Button::new(("rename-entry", key), tokens)
                 .label("Rename")
                 .ghost()
                 .xsmall()
@@ -1060,11 +1061,12 @@ fn rename_control(
     current: String,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
+    let tokens = WorkspaceTokens::resolve(cx);
     div()
         // The row underneath opens the recording. Renaming it must not also re-open it.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(
-            Button::new(("rename-recording", key))
+            Button::new(("rename-recording", key), tokens)
                 .label("Rename")
                 .ghost()
                 .xsmall()
@@ -1470,7 +1472,7 @@ pub(crate) fn render_start_choices(
                         .child(Input::new(entry_title).small())
                         .child(
                             div().mt(Space::SM).child(
-                                Button::new("prepare-entry")
+                                Button::new("prepare-entry", tokens)
                                     .label("Prepare an entry")
                                     .primary()
                                     .with_size(gpui_component::Size::Small)
@@ -1688,7 +1690,7 @@ fn render_model_setup(
                         )),
                 )
                 .child(
-                    Button::new(("choose-transcription-model", index))
+                    Button::new(("choose-transcription-model", index), tokens)
                         .label(if selected == size && provisioning {
                             "Downloading…"
                         } else if selected == size {
@@ -1708,7 +1710,7 @@ fn render_model_setup(
         .when(provisioning, |view| {
             view.child(
                 div().mt(px(8.0)).child(
-                    Button::new("cancel-transcription-model")
+                    Button::new("cancel-transcription-model", tokens)
                         .label("Cancel download")
                         .with_size(gpui_component::Size::Small)
                         .on_click(cx.listener(|this, _, _, cx| {

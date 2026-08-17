@@ -97,6 +97,8 @@ pub(crate) struct WorkspaceTokens {
     pub(crate) ink_2: Rgba,
     pub(crate) muted: Rgba,
     pub(crate) faint: Rgba,
+    /// Opaque inset focus border: maximum contrast for the active appearance.
+    pub(crate) focus: Rgba,
     pub(crate) accent: Rgba,
     pub(crate) accent_ink: Rgba,
     pub(crate) accent_on: Rgba,
@@ -126,6 +128,7 @@ impl WorkspaceTokens {
                 ink_2: rgb(0xc6c6d0),
                 muted: rgb(0x9494a1),
                 faint: rgb(0x62626e),
+                focus: rgb(0xffffff),
                 accent: rgb(0x8a8fff),
                 accent_ink: rgb(0xa5a8ff),
                 accent_on: rgb(0x0f0f1a),
@@ -152,6 +155,7 @@ impl WorkspaceTokens {
                 ink_2: rgb(0x3c3c45),
                 muted: rgb(0x62626d),
                 faint: rgb(0x9a9aa5),
+                focus: rgb(0x000000),
                 accent: rgb(0x5558d9),
                 accent_ink: rgb(0x4649c9),
                 accent_on: rgb(0xffffff),
@@ -211,7 +215,7 @@ mod tests {
     }
 
     impl Render for KeyboardProbe {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let activated = Rc::clone(&self.activated);
             div()
                 .child(crate::workspace::notes::evidence_control(
@@ -219,6 +223,7 @@ mod tests {
                     "keyboard-probe".to_owned(),
                     "Show timecodes".to_owned(),
                     "Show or hide timecodes",
+                    super::WorkspaceTokens::resolve(cx),
                     move |_| activated.set(true),
                 ))
                 .child(Button::new("keyboard-probe-second").label("Edit note"))

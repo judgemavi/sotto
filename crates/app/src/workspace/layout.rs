@@ -31,7 +31,6 @@ use gpui::{
 };
 use gpui_component::{
     Disableable, IconName, Root, Selectable as _, Sizable as _, Size,
-    button::Button,
     button::ButtonVariants as _,
     input::{Input, InputState},
 };
@@ -42,7 +41,7 @@ use crate::notes::NotesState;
 use crate::session::SessionLifecycle;
 
 use super::{
-    MeetingWorkspace, OpenRecording, PersistedWorkspaceState, StageTab,
+    Button, MeetingWorkspace, OpenRecording, PersistedWorkspaceState, StageTab,
     control_row::{ControlRole, ControlRow},
     delete_icon_button, library, notes,
     tokens::{Space, TypeScale, WorkspaceTokens},
@@ -449,6 +448,7 @@ fn render_toolbar(
                         } else {
                             "Hide the Library"
                         },
+                        tokens,
                     )
                     .selected(!library_collapsed)
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_library(cx))),
@@ -470,7 +470,7 @@ fn render_toolbar(
         .child(
             ControlRole::Essential,
             div().debug_selector(|| "toolbar-ask-toggle".into()).child(
-                Button::new("toggle-ask")
+                Button::new("toggle-ask", tokens)
                     .label("Ask")
                     .tooltip(if ask_open {
                         "Hide the Ask panel"
@@ -674,7 +674,7 @@ fn render_capture_bar(
             div()
                 .debug_selector(|| "capture-stop-control".into())
                 .child(
-                    Button::new("stop-recording")
+                    Button::new("stop-recording", tokens)
                         .label(if stopping { "Stopping…" } else { "Stop" })
                         .danger()
                         .with_size(Size::Small)
@@ -749,7 +749,7 @@ fn render_prepared_entry(
                 .flex()
                 .gap(Space::SM)
                 .child(
-                    Button::new("save-prep-note")
+                    Button::new("save-prep-note", tokens)
                         .label("Save prep note")
                         .with_size(Size::Small)
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -758,7 +758,7 @@ fn render_prepared_entry(
                 )
                 .child(
                     div().debug_selector(|| "record-into-entry".into()).child(
-                        Button::new("record-into-entry-button")
+                        Button::new("record-into-entry-button", tokens)
                             .label("Record into this entry")
                             .primary()
                             .with_size(Size::Small)
@@ -831,7 +831,7 @@ fn render_entry_view_bar(
                 .into_any_element()
         })
         .child_when(live_elsewhere, ControlRole::Expendable, || {
-            Button::new("back-to-live")
+            Button::new("back-to-live", tokens)
                 .label("Back to recording")
                 .with_size(Size::Small)
                 .on_click(cx.listener(|this, _, _, cx| this.return_to_live(cx)))
@@ -840,14 +840,14 @@ fn render_entry_view_bar(
         .child(
             ControlRole::Essential,
             div().debug_selector(|| "record-again".into()).child(
-                Button::new("record-again-button")
+                Button::new("record-again-button", tokens)
                     .label(if count == 0 { "Record" } else { "Record again" })
                     .with_size(Size::Small)
                     .on_click(cx.listener(|this, _, _, cx| this.start_scoped_session(cx))),
             ),
         )
         .child_when(session.is_some(), ControlRole::Expendable, || {
-            Button::new("retranscribe-session")
+            Button::new("retranscribe-session", tokens)
                 .label(retranscription_label(
                     retranscribing,
                     retranscription_unavailable,
@@ -861,7 +861,7 @@ fn render_entry_view_bar(
                 .into_any_element()
         })
         .child_when(session.is_some(), ControlRole::Expendable, || {
-            Button::new("reveal-recording")
+            Button::new("reveal-recording", tokens)
                 .label("Reveal")
                 .tooltip("Show this recording in Finder")
                 .with_size(Size::Small)
@@ -872,7 +872,7 @@ fn render_entry_view_bar(
         .child(
             ControlRole::Essential,
             div().debug_selector(|| "view-delete-control".into()).child(
-                delete_icon_button("delete-entry", "this entry").on_click(
+                delete_icon_button("delete-entry", "this entry", tokens).on_click(
                     cx.listener(|this, _, window, cx| this.delete_open_entry(window, cx)),
                 ),
             ),
@@ -911,7 +911,7 @@ fn render_sessions_strip(
         .debug_selector(|| "entry-sessions-strip".into())
         .children(sessions.iter().enumerate().map(|(index, session)| {
             let id = session.id;
-            Button::new(("entry-recording-tab", index))
+            Button::new(("entry-recording-tab", index), tokens)
                 .label(format!(
                     "Recording {} · {}",
                     index + 1,
@@ -926,7 +926,7 @@ fn render_sessions_strip(
             div()
                 .debug_selector(|| "entry-delete-recording-control".into())
                 .child(
-                    Button::new("delete-selected-recording")
+                    Button::new("delete-selected-recording", tokens)
                         .label("Delete recording…")
                         .ghost()
                         .with_size(Size::Small)
@@ -1008,7 +1008,7 @@ fn render_view_bar(
             div()
                 .debug_selector(|| "view-back-to-live".into())
                 .child(
-                    Button::new("back-to-live")
+                    Button::new("back-to-live", tokens)
                         .label("Back to recording")
                         .with_size(Size::Small)
                         .on_click(cx.listener(|this, _, _, cx| this.return_to_live(cx))),
@@ -1018,7 +1018,7 @@ fn render_view_bar(
         .child(
             ControlRole::Expendable,
             div().child(
-                Button::new("retranscribe-session")
+                Button::new("retranscribe-session", tokens)
                     .label(retranscription_label(
                         retranscribing,
                         retranscription_unavailable,
@@ -1036,7 +1036,7 @@ fn render_view_bar(
             div().debug_selector(|| "view-reveal-control".into()).child(
                 // The mock's word, not an abbreviation of ours: the bar already says which
                 // recording is open, so "recording" was repeating its own title.
-                Button::new("reveal-recording")
+                Button::new("reveal-recording", tokens)
                     .label("Reveal")
                     .tooltip("Show this recording in Finder")
                     .with_size(Size::Small)
@@ -1047,7 +1047,7 @@ fn render_view_bar(
         .child(
             ControlRole::Essential,
             div().debug_selector(|| "view-delete-control".into()).child(
-                delete_icon_button("delete-session", "this recording").on_click(
+                delete_icon_button("delete-session", "this recording", tokens).on_click(
                     cx.listener(|this, _, window, cx| this.delete_open_session(window, cx)),
                 ),
             ),

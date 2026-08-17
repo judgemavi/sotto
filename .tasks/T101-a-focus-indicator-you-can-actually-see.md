@@ -1,6 +1,6 @@
 # T101 — A focus indicator you can actually see
 
-**Status:** todo
+**Status:** in-review
 
 **Wave:** N8 — entry workspace
 
@@ -79,3 +79,56 @@ under focus. T100 closes with this filed rather than staying open: what it set o
 that could not move at all, and an Enter listener that could never fire — is fixed and pinned by a
 test that fails when reverted. The visibility of the indicator is a separate problem with a
 separate cause, now understood, and holding T100 open for it would also hold T076 and T092.
+
+## Implementation — 2026-08-16
+
+The shared modifier lives at `crates/app/src/workspace/focus.rs`. That home was named before it was
+written: focus presentation belongs to the shipped workspace shell rather than to one control or
+to the colour-token file. Settings is an overlay inside that shell, so its buttons route through
+the same constructor too. No open lane held the new file or the import-only call sites when work
+started. Historical Board and dev-window controls are not part of the shipped product shell and
+remain untouched.
+
+The first review rejected a two-tone box shadow. GPUI paints a shadow as a filled rounded rectangle
+behind the control. A solid fill hid the interior and made `Record again` look correct, but a ghost
+fill exposed the rectangle and swallowed the labels on Ask and a library row. An
+`overflow_hidden` ancestor clipped the protruding part around `Re-transcribe`, leaving only corner
+brackets. The automated assertion described the two opaque shadows, so it proved the broken
+mechanism rather than a visible indicator. That implementation and its one-outcome
+`focus_indicator(true)` seam have been removed.
+
+The replacement is one opaque 2 px border painted on the button itself. GPUI paints borders after
+the control's content and within its own bounds: there is no filled shape behind a transparent
+ghost label, and no outside halo for a clipping parent to eat. The colour is appearance-resolved at
+construction — pure black in light mode and pure white in dark mode, the maximum contrast in each
+case. Once the ring is opaque, the second contrasting edge is unnecessary and would spend more of
+these compact controls' interior. The shared constructor clips overflow at the button's own bounds,
+which suppresses `gpui-component`'s superseded outside halo without relying on whatever clipping
+an ancestor happens to apply.
+
+Focus does not replace or alter the background. Ask's selected/open state therefore retains its
+selected fill whether focused or not, while focus is expressed only by the inset border. The
+existing `gpui-component` button remains the element that owns focus, the tab stop, activation, and
+selected fill; the shared constructor only attaches the focused style. T100's tab order and key
+behavior do not change, and its tests were not edited.
+
+Why not the other approaches:
+
+- A focused background replacement remains rejected because Ask already uses its fill to say the
+  panel is selected/open. The inset border is a separate channel and leaves that fill untouched.
+- An upstream configurable-alpha patch remains a reasonable follow-up, but it would not put a fix
+  in the shipped app on this task's timescale and would tie acceptance to a dependency release.
+- The reviewed two-tone shadow was rejected because a shadow is a filled shape behind the control,
+  not a ring. A single appearance-resolved border is enough once the alpha ceiling is removed.
+
+The regression asserts the production focused style has all four 2 px border edges, the supplied
+opaque colour, no box shadow, and no background override. It would fail if the reviewed
+paint-behind mechanism returned or if focus started replacing Ask's selected fill. GPUI exposes no
+pixel assertion for this treatment, so this is **not pixel proof** and does not certify appearance.
+Real built-app confirmation of solid and ghost controls in light and dark appearances remains
+maintainer-owned and **NOT RUN** by the implementation lane. This task stays `in-review`.
+
+Corrected automated gates, 2026-08-16: focused inset-border regression passed; T100's unchanged
+Root-mounted focus and Enter activation tests passed; the locked full workspace suite passed
+(including 267 app tests, four ignored real-media tests, and all four MCP HTTP tests); strict
+workspace Clippy over all targets/features, formatting, and diff checks passed.

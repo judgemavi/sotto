@@ -25,7 +25,7 @@ use gpui::{
 };
 use gpui_component::{
     Disableable, Selectable as _, Sizable as _,
-    button::{Button, ButtonVariants as _},
+    button::ButtonVariants as _,
     dock::{Panel, PanelEvent},
     input::{Input, InputEvent, InputState},
 };
@@ -34,7 +34,7 @@ use rag::{DocumentKind, SearchFilter};
 use sotto_core::{CancellationToken, EventId, SessionId};
 
 use super::{
-    MeetingWorkspace,
+    Button, MeetingWorkspace,
     control_row::{ControlRole, ControlRow},
     tokens::{Space, WorkspaceTokens},
     transcript,
@@ -311,7 +311,7 @@ impl Render for AskPanel {
             )
             .child(
                 ControlRole::Essential,
-                Button::new("submit-ask")
+                Button::new("submit-ask", tokens)
                     .label("Ask")
                     .disabled(disabled_reason.is_some() || self.running)
                     .on_click(cx.listener(|this, _, _, cx| this.emit_submit(cx))),
@@ -319,7 +319,7 @@ impl Render for AskPanel {
         if self.running {
             ask_form = ask_form.child(
                 ControlRole::Essential,
-                Button::new("cancel-ask")
+                Button::new("cancel-ask", tokens)
                     .label("Cancel")
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(AskPanelEvent::Cancel))),
             );
@@ -339,7 +339,7 @@ impl Render for AskPanel {
                 ControlRow::new()
                     .child(
                         ControlRole::Essential,
-                        Button::new("ask-scope-all")
+                        Button::new("ask-scope-all", tokens)
                             .label("All recordings")
                             .small()
                             .selected(effective == AskScope::AllRecordings)
@@ -353,7 +353,7 @@ impl Render for AskPanel {
                         div()
                             .debug_selector(|| "ask-scope-entry-control".into())
                             .child(
-                                Button::new("ask-scope-open")
+                                Button::new("ask-scope-open", tokens)
                                     .label(if self.live {
                                         "This entry (live)"
                                     } else {
@@ -377,7 +377,7 @@ impl Render for AskPanel {
                 ControlRow::new()
                     .child(
                         ControlRole::Essential,
-                        Button::new("ask-scope-selection")
+                        Button::new("ask-scope-selection", tokens)
                             .label("This selection")
                             .small()
                             .selected(effective == AskScope::Selection)
@@ -395,7 +395,7 @@ impl Render for AskPanel {
                     )
                     .child(
                         ControlRole::Essential,
-                        Button::new("ask-clear-selection")
+                        Button::new("ask-clear-selection", tokens)
                             .label("Clear")
                             .ghost()
                             .small()
@@ -501,10 +501,13 @@ fn render_turn(index: usize, turn: &AskTurn, cx: &mut Context<AskPanel>) -> gpui
                         .enumerate()
                         .map(|(citation_ix, citation)| {
                             let citation = citation.clone();
-                            Button::new((
-                                "ask-citation",
-                                index * 10_000 + claim_ix * 100 + citation_ix,
-                            ))
+                            Button::new(
+                                (
+                                    "ask-citation",
+                                    index * 10_000 + claim_ix * 100 + citation_ix,
+                                ),
+                                tokens,
+                            )
                             .label("Open transcript evidence")
                             .on_click(cx.listener(
                                 move |_, _, _, cx| {
