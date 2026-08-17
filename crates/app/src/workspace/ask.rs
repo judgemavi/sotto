@@ -17,7 +17,7 @@
 //! interviews and debugging calls, and a panel that insists on asking about "this meeting" is the
 //! same mistake that made a model reply "no meeting content is present" to a correct transcript.
 
-use std::sync::mpsc;
+use std::{collections::BTreeSet, sync::mpsc};
 
 use gpui::{
     Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, Window, div,
@@ -39,6 +39,7 @@ use super::{
     tokens::{Space, WorkspaceTokens},
     transcript,
 };
+use crate::reasoning::inspection::{ScreenInspectorAssembly, product_screen_inspectors};
 
 #[cfg(test)]
 const MIN_ASK_PANEL_WIDTH: gpui::Pixels = gpui::px(300.0);
@@ -79,6 +80,7 @@ pub(super) struct AskPanel {
     progress: Option<String>,
     turns: Vec<AskTurn>,
     message: Option<String>,
+    revealed_receipts: BTreeSet<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +127,7 @@ impl AskPanel {
             progress: None,
             turns: Vec::new(),
             message: None,
+            revealed_receipts: BTreeSet::new(),
         }
     }
 
@@ -182,6 +185,7 @@ impl AskPanel {
             && self.scope.as_ref().map(|value| &value.0) != scope.as_ref().map(|value| &value.0)
         {
             self.turns.clear();
+            self.revealed_receipts.clear();
             self.message = None;
             self.progress = None;
         }
@@ -196,6 +200,7 @@ impl AskPanel {
         }
         self.selection = selection;
         self.turns.clear();
+        self.revealed_receipts.clear();
         self.message = None;
         self.progress = None;
         if self.selection.is_none() && self.chosen == AskScope::Selection {
@@ -247,6 +252,7 @@ impl AskPanel {
                 self.turns.push(AskTurn {
                     question,
                     reply: result.reply,
+                    screen_consultations: result.screen_consultations,
                 });
                 self.message = (!result.normalizations.is_empty()).then(|| {
                     let controls = result
@@ -260,6 +266,13 @@ impl AskPanel {
             }
             Err(error) => self.message = Some(error),
         }
+    }
+
+    fn toggle_receipt(&mut self, index: usize, cx: &mut Context<Self>) {
+        if !self.revealed_receipts.insert(index) {
+            self.revealed_receipts.remove(&index);
+        }
+        cx.notify();
     }
 
     pub(super) fn history(&self) -> Vec<AskTurn> {
@@ -282,6 +295,7 @@ impl AskPanel {
         // A thread answered from one recording does not carry over to a question about the whole
         // library, and vice versa: the citations behind it no longer describe what is being asked.
         self.turns.clear();
+        self.revealed_receipts.clear();
         self.message = None;
         self.progress = None;
     }
@@ -423,12 +437,9 @@ impl Render for AskPanel {
             .when_some(disabled_reason, |view, reason| {
                 view.child(div().mt_3().text_color(tokens.muted).child(reason))
             })
-            .children(
-                self.turns
-                    .iter()
-                    .enumerate()
-                    .map(|(turn_ix, turn)| render_turn(turn_ix, turn, cx)),
-            )
+            .children(self.turns.iter().enumerate().map(|(turn_ix, turn)| {
+                render_turn(turn_ix, turn, self.revealed_receipts.contains(&turn_ix), cx)
+            }))
             .when_some(self.progress.clone(), |view, progress| {
                 view.child(div().mt_3().child(progress))
             })
@@ -484,7 +495,12 @@ fn scope_line(
     }
 }
 
-fn render_turn(index: usize, turn: &AskTurn, cx: &mut Context<AskPanel>) -> gpui::AnyElement {
+fn render_turn(
+    index: usize,
+    turn: &AskTurn,
+    receipt_revealed: bool,
+    cx: &mut Context<AskPanel>,
+) -> gpui::AnyElement {
     let tokens = WorkspaceTokens::resolve(cx);
     let answer = match &turn.reply {
         AskReply::Refusal { reason, covered } => div()
@@ -523,6 +539,34 @@ fn render_turn(index: usize, turn: &AskTurn, cx: &mut Context<AskPanel>) -> gpui
         .mt_4()
         .child(div().text_color(tokens.muted).child(turn.question.clone()))
         .child(answer)
+        .children((!turn.screen_consultations.is_empty()).then(|| {
+            let count = turn.screen_consultations.len();
+            div()
+                .mt_1()
+                .debug_selector(|| "ask-screen-receipt".into())
+                .child(
+                    Button::new(("ask-screen-receipt-toggle", index), tokens)
+                        .label(if receipt_revealed {
+                            "Hide screen consultation receipt".to_owned()
+                        } else {
+                            format!("Screen requests: {count} · Show receipt")
+                        })
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_receipt(index, cx);
+                        })),
+                )
+                .children(receipt_revealed.then(|| {
+                    div().children(turn.screen_consultations.iter().map(|entry| {
+                        div()
+                            .mt_1()
+                            .text_sm()
+                            .text_color(tokens.faint)
+                            .child(entry.describe())
+                    }))
+                }))
+        }))
         .into_any_element()
 }
 
@@ -648,11 +692,19 @@ impl MeetingWorkspace {
         let provider = backend.provider();
         let worker_question = question.clone();
         let entry_scope = entry_sessions;
+        let inspection_session = single.as_ref().map(|(id, _, _, _)| *id);
         let spawn = std::thread::Builder::new()
             .name("sotto-ask".into())
             .spawn(move || {
                 let result = crate::persistence_runtime::block_on(async {
-                    let engine = AskEngine::new(provider);
+                    let engine = inspection_session.map_or_else(
+                        || AskEngine::new(provider.clone()),
+                        |id| {
+                            let assembly = product_screen_inspectors(database.clone());
+                            let (inspector, log) = assembly.assemble(id);
+                            AskEngine::new(provider.clone()).with_screen_inspector(inspector, log)
+                        },
+                    );
                     match single {
                         Some((id, target, events, true)) => engine
                             .ask_selection(

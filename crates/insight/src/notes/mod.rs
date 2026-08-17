@@ -37,7 +37,8 @@ use sotto_core::{
 use thiserror::Error;
 
 use crate::context::{
-    ReasoningContextError, complete_with_optional_inspection_cancellable, render_transcript,
+    ReasoningContextError, ScreenConsultation, ScreenConsultationLog, ScreenInspectionBudget,
+    complete_with_optional_inspection_cancellable, render_transcript,
 };
 
 const WINDOW: Duration = Duration::from_secs(20 * 60);
@@ -82,6 +83,8 @@ pub struct GroundedMeetingNotesReport {
     /// These observations remain attached when the report is loaded from durable cache.
     #[serde(skip)]
     pub normalizations: Vec<ObservedRequestNormalization>,
+    /// Durable receipt of every screen request, including refusals.
+    pub screen_consultations: Vec<ScreenConsultation>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -174,6 +177,7 @@ pub async fn load_latest_grounded_notes_status(
             cached: true,
             calls: 0,
             normalizations: deserialize_normalizations(&stored.view.normalizations)?,
+            screen_consultations: serde_json::from_str(&stored.view.consultations)?,
         },
         stale,
     }))
@@ -232,6 +236,7 @@ pub struct MeetingNotesGenerator {
     provider: Arc<dyn ReasoningProvider>,
     backend_fingerprint: Option<BackendFingerprint>,
     screen_inspector: Option<Arc<dyn ScreenInspectionSource>>,
+    screen_consultation_log: Option<ScreenConsultationLog>,
 }
 
 impl MeetingNotesGenerator {
@@ -242,6 +247,7 @@ impl MeetingNotesGenerator {
             provider: text_reasoning_provider(provider),
             backend_fingerprint: None,
             screen_inspector: None,
+            screen_consultation_log: None,
         }
     }
 
@@ -261,6 +267,12 @@ impl MeetingNotesGenerator {
     #[must_use]
     pub fn with_screen_inspector(mut self, inspector: Arc<dyn ScreenInspectionSource>) -> Self {
         self.screen_inspector = Some(inspector);
+        self
+    }
+
+    #[must_use]
+    pub fn with_screen_consultation_log(mut self, log: ScreenConsultationLog) -> Self {
+        self.screen_consultation_log = Some(log);
         self
     }
 
@@ -391,6 +403,7 @@ impl MeetingNotesGenerator {
                 cached: true,
                 calls: 0,
                 normalizations: deserialize_normalizations(&stored.normalizations)?,
+                screen_consultations: serde_json::from_str(&stored.consultations)?,
             });
         }
 
@@ -398,6 +411,7 @@ impl MeetingNotesGenerator {
         let mut calls = 0_usize;
         let mut normalizations = Vec::new();
         let mut partials = Vec::new();
+        let inspection_budget = ScreenInspectionBudget::default();
         for window in windows(&events) {
             let transcript_window =
                 render_transcript(session.capture_target(), window.iter().copied());
@@ -408,6 +422,8 @@ impl MeetingNotesGenerator {
                 input,
                 &events,
                 self.screen_inspector.as_deref(),
+                self.screen_consultation_log.as_ref(),
+                &inspection_budget,
                 &cancellation,
             )
             .await?;
@@ -436,6 +452,8 @@ impl MeetingNotesGenerator {
                 input,
                 &events,
                 None,
+                self.screen_consultation_log.as_ref(),
+                &inspection_budget,
                 &cancellation,
             )
             .await?;
@@ -461,6 +479,12 @@ impl MeetingNotesGenerator {
                 source_status.as_str(),
                 &serde_json::to_string(&bundle)?,
                 &serialize_normalizations(&normalizations)?,
+                &serde_json::to_string(
+                    &self
+                        .screen_consultation_log
+                        .as_ref()
+                        .map_or_else(Vec::new, ScreenConsultationLog::entries),
+                )?,
             )
             .await?;
         Ok(GroundedMeetingNotesReport {
@@ -474,6 +498,10 @@ impl MeetingNotesGenerator {
             cached: false,
             calls,
             normalizations,
+            screen_consultations: self
+                .screen_consultation_log
+                .as_ref()
+                .map_or_else(Vec::new, ScreenConsultationLog::entries),
         })
     }
 }

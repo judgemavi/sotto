@@ -15,146 +15,20 @@
 //!   than one that did not look, so each request lands in a [`ScreenConsultationLog`] the UI can
 //!   show back to the user.
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc};
 
+pub use insight::{
+    ConsultationOutcome, ConsultedEvidence, ConsultedMoment, ConsultedPrecision,
+    ScreenConsultation, ScreenConsultationLog,
+};
 use screen::{
     Frame, ImageInspectionPolicy, InspectScreenRequest, OcrEngine, PlatformFrameDecoder,
-    RecordingBackedScreenInspector, RecordingFrameDecoder, ScreenError, ScreenEvidence,
-    ScreenInspection, ScreenInspectionSource, ScreenPrecision, ScreenSelector,
-    ScreenUnavailableReason,
+    RecordingBackedScreenInspector, RecordingFrameDecoder, ScreenError, ScreenInspection,
+    ScreenInspectionSource, ScreenUnavailableReason,
 };
-use sotto_core::{EventId, SessionId, TimelineEvent, types::SessionRecording};
-
-/// The meeting moment a reasoning pass asked to see.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConsultedMoment {
-    Timestamp(Duration),
-    Event(EventId),
-}
-
-/// The evidence kind the pass asked for, never widened by the app.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConsultedEvidence {
-    Metadata,
-    LocalOcr,
-    Image,
-}
-
-/// Honest precision of what the pass received. A sampled change frame is never a video frame.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConsultedPrecision {
-    SampledChangeFrame,
-    DecodedVideoFrame,
-}
-
-impl ConsultedPrecision {
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::SampledChangeFrame => "sampled change frame",
-            Self::DecodedVideoFrame => "decoded video frame",
-        }
-    }
-}
-
-/// What the consultation produced.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ConsultationOutcome {
-    Frame {
-        requested_media_time: Duration,
-        decoded_media_time: Duration,
-        precision: ConsultedPrecision,
-        /// Characters returned by local OCR, present only when the pass asked for text.
-        ocr_characters: Option<usize>,
-    },
-    Unavailable {
-        reason: &'static str,
-    },
-}
-
-/// One disclosed screen consultation performed on behalf of a reasoning run.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScreenConsultation {
-    pub session_id: SessionId,
-    pub requested: ConsultedMoment,
-    pub evidence: ConsultedEvidence,
-    pub reason: String,
-    pub outcome: ConsultationOutcome,
-}
-
-impl ScreenConsultation {
-    /// Renders the sentence the user reads. It always names the moment and the decode precision.
-    #[must_use]
-    pub fn describe(&self) -> String {
-        let moment = match self.requested {
-            ConsultedMoment::Timestamp(value) => format!("at {}", format_clock(value)),
-            ConsultedMoment::Event(id) => format!("at transcript row {}", id.get()),
-        };
-        match &self.outcome {
-            ConsultationOutcome::Frame {
-                requested_media_time,
-                decoded_media_time,
-                precision,
-                ocr_characters,
-            } => {
-                let text = match ocr_characters {
-                    Some(count) => {
-                        format!(" · local text recognition returned {count} characters")
-                    }
-                    None => String::new(),
-                };
-                format!(
-                    "Reasoning consulted the screen {moment} · {} at {} (requested {}){text} · no image was sent to the reasoning backend.",
-                    precision.label(),
-                    format_precise(*decoded_media_time),
-                    format_precise(*requested_media_time),
-                )
-            }
-            ConsultationOutcome::Unavailable { reason } => format!(
-                "Reasoning asked for the screen {moment} · unavailable ({reason}) · the run continued from the transcript alone."
-            ),
-        }
-    }
-}
-
-fn format_clock(value: Duration) -> String {
-    let seconds = value.as_secs();
-    format!("{:02}:{:02}", seconds / 60, seconds % 60)
-}
-
-fn format_precise(value: Duration) -> String {
-    let seconds = value.as_secs();
-    format!(
-        "{:02}:{:02}.{:03}",
-        seconds / 60,
-        seconds % 60,
-        value.subsec_millis()
-    )
-}
-
-/// Run-scoped, shared record of every consultation an inspector performed.
-#[derive(Clone, Default)]
-pub struct ScreenConsultationLog(Arc<Mutex<Vec<ScreenConsultation>>>);
-
-impl ScreenConsultationLog {
-    fn locked(&self) -> MutexGuard<'_, Vec<ScreenConsultation>> {
-        // A poisoned log must not hide the fact that the model looked at the screen.
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn record(&self, consultation: ScreenConsultation) {
-        self.locked().push(consultation);
-    }
-
-    #[must_use]
-    pub fn entries(&self) -> Vec<ScreenConsultation> {
-        self.locked().clone()
-    }
-}
+#[cfg(test)]
+use screen::{ScreenEvidence, ScreenSelector};
+use sotto_core::{SessionId, TimelineEvent, types::SessionRecording};
 
 /// Builds the inspector a reasoning run for one session may use, plus its disclosure log.
 pub trait ScreenInspectorAssembly: Send + Sync {
@@ -245,7 +119,7 @@ where
         &self,
         session_id: SessionId,
     ) -> (Arc<dyn ScreenInspectionSource>, ScreenConsultationLog) {
-        let log = ScreenConsultationLog::default();
+        let log = ScreenConsultationLog::new(session_id);
         let inspector = SessionScreenInspector {
             session_id,
             recordings: Arc::clone(&self.recordings),
@@ -307,8 +181,11 @@ where
                 )),
             ),
         };
-        self.log
-            .record(consultation(self.session_id, request, &inspection));
+        self.log.record(insight::context::consultation(
+            self.session_id,
+            request,
+            &inspection,
+        ));
         inspection
     }
 }
@@ -323,98 +200,12 @@ fn unavailable(
     }
 }
 
-fn consultation(
-    session_id: SessionId,
-    request: &InspectScreenRequest,
-    inspection: &ScreenInspection,
-) -> ScreenConsultation {
-    ScreenConsultation {
-        session_id,
-        requested: match &request.selector {
-            ScreenSelector::Timestamp(value) => ConsultedMoment::Timestamp(*value),
-            ScreenSelector::Event(id) => ConsultedMoment::Event(*id),
-        },
-        evidence: match request.evidence {
-            ScreenEvidence::Metadata => ConsultedEvidence::Metadata,
-            ScreenEvidence::LocalOcr => ConsultedEvidence::LocalOcr,
-            ScreenEvidence::Image => ConsultedEvidence::Image,
-        },
-        reason: request.reason.clone(),
-        outcome: outcome(inspection),
-    }
-}
-
-fn outcome(inspection: &ScreenInspection) -> ConsultationOutcome {
-    match inspection {
-        ScreenInspection::RecordingAvailable {
-            provenance,
-            ocr_text,
-        } => ConsultationOutcome::Frame {
-            requested_media_time: provenance.requested_media_time,
-            decoded_media_time: provenance.decoded_media_time,
-            precision: precision(provenance.precision),
-            ocr_characters: ocr_text.as_ref().map(|text| text.chars().count()),
-        },
-        // A retained change frame carries no separate decode time; reporting the sampled capture
-        // time for both keeps the disclosure from implying precision the source does not have.
-        ScreenInspection::Available {
-            provenance,
-            ocr_text,
-            ..
-        } => ConsultationOutcome::Frame {
-            requested_media_time: provenance.captured_at,
-            decoded_media_time: provenance.captured_at,
-            precision: precision(provenance.precision),
-            ocr_characters: ocr_text.as_ref().map(|text| text.chars().count()),
-        },
-        ScreenInspection::Unavailable { reason, .. } => ConsultationOutcome::Unavailable {
-            reason: unavailable_token(reason),
-        },
-    }
-}
-
-const fn precision(value: ScreenPrecision) -> ConsultedPrecision {
-    match value {
-        ScreenPrecision::SampledChangeFrame => ConsultedPrecision::SampledChangeFrame,
-        ScreenPrecision::DecodedVideoFrame => ConsultedPrecision::DecodedVideoFrame,
-    }
-}
-
-/// Mirrors the tokens the reasoning prompt already uses, so the user and the model see one word.
-const fn unavailable_token(reason: &ScreenUnavailableReason) -> &'static str {
-    match reason {
-        ScreenUnavailableReason::NoSnapshots => "no_snapshots",
-        ScreenUnavailableReason::OutOfRange => "out_of_range",
-        ScreenUnavailableReason::NoSnapshotForTimestamp => "no_snapshot_for_timestamp",
-        ScreenUnavailableReason::EventNotFound => "event_not_found",
-        ScreenUnavailableReason::EventIsNotSnapshot => "event_is_not_snapshot",
-        ScreenUnavailableReason::FramePruned => "frame_pruned",
-        ScreenUnavailableReason::FrameOutsideCache => "frame_outside_cache",
-        ScreenUnavailableReason::OcrUnavailable => "ocr_unavailable",
-        ScreenUnavailableReason::OcrFailed(_) => "ocr_failed",
-        ScreenUnavailableReason::ImageOptInRequired => "image_opt_in_required",
-        ScreenUnavailableReason::ImageAuthorizationMismatch => "image_authorization_mismatch",
-        ScreenUnavailableReason::ImageUnreadable => "image_unreadable",
-        ScreenUnavailableReason::ImageTooLarge => "image_too_large",
-        ScreenUnavailableReason::InvalidImageMedia => "invalid_image_media",
-        ScreenUnavailableReason::FrameSubstituted => "frame_substituted",
-        ScreenUnavailableReason::InspectorUnavailable => "inspector_unavailable",
-        ScreenUnavailableReason::RecordingDeleted => "recording_deleted",
-        ScreenUnavailableReason::RecordingPruned => "recording_pruned",
-        ScreenUnavailableReason::RecordingMissing => "recording_missing",
-        ScreenUnavailableReason::InvalidTimeMapping => "invalid_time_mapping",
-        ScreenUnavailableReason::RecordingDecodeFailed(_) => "recording_decode_failed",
-        ScreenUnavailableReason::RecordingImageAuthorizationUnavailable => {
-            "recording_image_authorization_unavailable"
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
         path::Path,
         sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
     };
 
     use sotto_core::types::{
@@ -522,7 +313,7 @@ mod tests {
         assert_eq!(
             entries[0].outcome,
             ConsultationOutcome::Unavailable {
-                reason: "image_opt_in_required"
+                reason: "image_opt_in_required".to_owned()
             }
         );
         Ok(())
@@ -617,7 +408,9 @@ mod tests {
             );
             assert_eq!(
                 log.entries()[0].outcome,
-                ConsultationOutcome::Unavailable { reason: expected }
+                ConsultationOutcome::Unavailable {
+                    reason: expected.to_owned()
+                }
             );
         }
         Ok(())

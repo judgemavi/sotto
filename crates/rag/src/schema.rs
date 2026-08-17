@@ -2,7 +2,7 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, Statement};
 use sea_orm_migration::{MigrationName, MigrationTrait, MigratorTrait, SchemaManager};
 use sotto_core::{RagError, SQLITE_SCHEMA};
 
-pub(crate) const SCHEMA_VERSION: u32 = 18;
+pub(crate) const SCHEMA_VERSION: u32 = 19;
 
 const RAG_SCHEMA: &str = r#"
 CREATE TABLE documents (
@@ -138,6 +138,8 @@ struct NotesOverlayMigration;
 
 struct EntrySeriesMigration;
 
+struct GroundedConsultationsMigration;
+
 impl MigrationName for BaselineMigration {
     fn name(&self) -> &str {
         "m0001_current_schema_baseline"
@@ -187,6 +189,36 @@ impl MigrationName for NotesOverlayMigration {
 impl MigrationName for EntrySeriesMigration {
     fn name(&self) -> &str {
         "m0004_entry_series"
+    }
+}
+
+impl MigrationName for GroundedConsultationsMigration {
+    fn name(&self) -> &str {
+        "m0005_persist_grounded_screen_consultations"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for GroundedConsultationsMigration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), sea_orm::DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE grounded_derived_views \
+                 ADD COLUMN consultations TEXT NOT NULL DEFAULT '[]';",
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(&format!("PRAGMA user_version={SCHEMA_VERSION};"))
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), sea_orm::DbErr> {
+        Err(sea_orm::DbErr::Migration(
+            "screen consultation receipts are intentionally durable".to_owned(),
+        ))
     }
 }
 
@@ -268,6 +300,7 @@ impl MigratorTrait for Migrator {
             Box::new(GroundedNormalizationsMigration),
             Box::new(NotesOverlayMigration),
             Box::new(EntrySeriesMigration),
+            Box::new(GroundedConsultationsMigration),
         ]
     }
 }

@@ -8,8 +8,9 @@ use std::{
 
 use insight::{
     GroundedMeetingNotesReport, GroundingInput, MeetingNotesGenerator, NotesOverlayOperation,
-    PresentedNotesDocument, RecordingNotes, SourceStatus, append_notes_overlay_operation,
-    load_latest_grounded_notes_status, load_presented_notes_document,
+    PresentedNotesDocument, RecordingNotes, ScreenConsultation, ScreenConsultationLog,
+    SourceStatus, append_notes_overlay_operation, load_latest_grounded_notes_status,
+    load_presented_notes_document,
 };
 use providers::backend::ObservedRequestNormalization;
 use providers::{BackendFingerprint, ReasoningProvider, ResolvedBackend};
@@ -19,9 +20,7 @@ use sotto_core::CancellationToken;
 use sotto_core::SessionId;
 
 use crate::persistence_runtime::block_on;
-use crate::reasoning::inspection::{
-    ScreenConsultation, ScreenInspectorAssembly, product_screen_inspectors,
-};
+use crate::reasoning::inspection::{ScreenInspectorAssembly, product_screen_inspectors};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NotesState {
@@ -38,6 +37,7 @@ pub enum NotesState {
         /// Controls the selected backend could not honor while producing this run.
         /// Cached reports retain the same run qualification as fresh reports.
         normalizations: Vec<ObservedRequestNormalization>,
+        screen_consultations: Vec<ScreenConsultation>,
     },
     Stale {
         notes: Box<RecordingNotes>,
@@ -47,6 +47,7 @@ pub enum NotesState {
         model: String,
         /// Controls the selected backend could not honor while producing this cached run.
         normalizations: Vec<ObservedRequestNormalization>,
+        screen_consultations: Vec<ScreenConsultation>,
     },
     Failed(String),
 }
@@ -224,6 +225,7 @@ impl NotesController {
                     fingerprint,
                     grounding,
                     inspector,
+                    consultations.clone(),
                     worker_cancellation,
                 );
                 let _ = sender.send(GenerationResult {
@@ -270,8 +272,8 @@ impl NotesController {
         {
             return false;
         }
-        self.screen_consultations = result.consultations;
         self.state = match result.result.and_then(|report| {
+            self.screen_consultations = report.screen_consultations.clone();
             let document = self.presented_document(result.session_id, &report.artifact)?;
             Ok((report, document))
         }) {
@@ -283,9 +285,13 @@ impl NotesController {
                 cached: report.cached,
                 model: report.model,
                 normalizations: report.normalizations,
+                screen_consultations: report.screen_consultations,
             },
             Err(error) => NotesState::Failed(error),
         };
+        if matches!(self.state, NotesState::Failed(_)) {
+            self.screen_consultations = result.consultations;
+        }
         true
     }
 
@@ -383,7 +389,7 @@ impl NotesController {
             self.state = NotesState::NoMeeting;
             return;
         };
-        self.state = match block_on(async {
+        let loaded = block_on(async {
             let store = Store::open(&self.database).await?;
             let cached = load_latest_grounded_notes_status(&store, session_id)
                 .await
@@ -396,7 +402,15 @@ impl NotesController {
                 .await
                 .map_err(|error| sotto_core::RagError::Storage(error.to_string()))?;
             Ok(Some((cached, document)))
-        }) {
+        });
+        self.screen_consultations = loaded
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map_or_else(Vec::new, |(cached, _)| {
+                cached.report.screen_consultations.clone()
+            });
+        self.state = match loaded {
             Ok(Some((cached, document))) if cached.stale => NotesState::Stale {
                 notes: Box::new(cached.report.artifact),
                 document: Box::new(document),
@@ -404,6 +418,7 @@ impl NotesController {
                 source_status: cached.report.source_status,
                 model: cached.report.model,
                 normalizations: cached.report.normalizations,
+                screen_consultations: cached.report.screen_consultations,
             },
             Ok(Some((cached, document))) => NotesState::Ready {
                 notes: Box::new(cached.report.artifact),
@@ -413,6 +428,7 @@ impl NotesController {
                 cached: true,
                 model: cached.report.model,
                 normalizations: cached.report.normalizations,
+                screen_consultations: cached.report.screen_consultations,
             },
             Ok(None) => NotesState::Disabled,
             Err(_) => NotesState::Failed(
@@ -433,6 +449,10 @@ impl Drop for NotesController {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the worker boundary keeps backend identity, grounding, inspection audit, and cancellation explicit"
+)]
 fn run_generation(
     database: &std::path::Path,
     session_id: SessionId,
@@ -440,6 +460,7 @@ fn run_generation(
     fingerprint: BackendFingerprint,
     grounding: Option<crate::mcp::FrozenGrounding>,
     screen_inspector: Arc<dyn ScreenInspectionSource>,
+    screen_consultation_log: ScreenConsultationLog,
     cancellation: CancellationToken,
 ) -> Result<GroundedMeetingNotesReport, String> {
     block_on(async {
@@ -450,6 +471,7 @@ fn run_generation(
             .with_reasoning_provider(provider)
             .with_backend_fingerprint(fingerprint)
             .with_screen_inspector(screen_inspector)
+            .with_screen_consultation_log(screen_consultation_log)
             .generate_grounded_with_cancellation(
                 session_id,
                 grounding.map(|grounding| GroundingInput {
@@ -554,6 +576,7 @@ mod tests {
                         cached: false,
                         calls: 1,
                         normalizations: vec![normalization],
+                        screen_consultations: Vec::new(),
                     }),
                     consultations: Vec::new(),
                 });
@@ -1317,6 +1340,78 @@ mod tests {
                 "local OCR text is the evidence the model asked for"
             );
             assert_no_image_left_the_app(&turns, &fixture.recording_path);
+
+            let mut reopened = NotesController::new(fixture.database);
+            reopened.refresh_catalogue()?;
+            assert_eq!(
+                reopened.screen_consultations(),
+                consultations,
+                "a cached reopen after app restart must restore the full consultation receipt"
+            );
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_fourth_screen_request_is_refused_reported_and_logged_by_the_app_runtime()
+        -> TestResult {
+            let fixture = fixture().await?;
+            let decodes = Arc::new(AtomicUsize::new(0));
+            let ocr = Arc::new(AtomicUsize::new(0));
+            let assembled = Arc::new(AtomicUsize::new(0));
+            let mut controller = controller_for(
+                &fixture,
+                Some(available(&fixture)),
+                &decodes,
+                &ocr,
+                &assembled,
+            )?;
+            let inspect = inspect_action(fixture.event_id, "local_ocr");
+            let provider = Arc::new(CapturingProvider::new([
+                inspect.clone(),
+                inspect.clone(),
+                inspect.clone(),
+                inspect,
+                notes_json(fixture.event_id),
+            ]));
+            let turns = Arc::clone(&provider.turns);
+
+            run(&mut controller, resolved(Arc::clone(&provider))?)?;
+
+            assert!(matches!(
+                controller.snapshot().state,
+                NotesState::Ready { .. }
+            ));
+            assert_eq!(
+                decodes.load(Ordering::Relaxed),
+                3,
+                "the fixed budget is three"
+            );
+            assert_eq!(ocr.load(Ordering::Relaxed), 3, "refusal performs no OCR");
+            let consultations = controller.screen_consultations();
+            assert_eq!(
+                consultations.len(),
+                4,
+                "the refused request remains auditable"
+            );
+            assert_eq!(
+                consultations.last().map(|entry| &entry.outcome),
+                Some(&ConsultationOutcome::Unavailable {
+                    reason: "inspection_budget_exhausted".to_owned(),
+                })
+            );
+            let turns = locked(&turns);
+            assert_eq!(
+                turns.len(),
+                5,
+                "the refusal is returned before the final answer"
+            );
+            assert!(
+                turns[4]
+                    .serialized_request
+                    .contains("reason=inspection_budget_exhausted"),
+                "the model must receive the budget refusal"
+            );
+            assert_no_image_left_the_app(&turns, &fixture.recording_path);
             Ok(())
         }
 
@@ -1404,7 +1499,7 @@ mod tests {
             assert_eq!(
                 controller.screen_consultations()[0].outcome,
                 ConsultationOutcome::Unavailable {
-                    reason: "image_opt_in_required"
+                    reason: "image_opt_in_required".to_owned()
                 }
             );
             let turns = locked(&turns);

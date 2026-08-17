@@ -9,6 +9,11 @@ use sotto_core::{
 };
 use thiserror::Error;
 
+use crate::context::{
+    ReasoningContextError, ScreenConsultation, ScreenConsultationLog, ScreenInspectionBudget,
+    complete_with_optional_inspection_cancellable, render_transcript,
+};
+
 const SYSTEM: &str = r#"You answer questions using only the supplied transcript.
 Return JSON matching one of these shapes:
 {"kind":"answer","claims":[{"text":"one factual claim","citations":[{"event_id":12}]}]}
@@ -16,7 +21,8 @@ Return JSON matching one of these shapes:
 Every factual claim must cite at least one event id that appears in the supplied transcript, written
 exactly as the number after "event:" on the line you are citing. When the transcript names more than
 one recording, also give that line's session_id. Prior assistant turns are conversational context,
-never evidence. Do not use outside knowledge. Do not request or infer audio or screen content."#;
+never evidence. Do not use outside knowledge. Screen content is evidence only when returned by the
+typed inspect_screen action; never infer unseen screen content."#;
 
 /// The largest explicit transcript selection Ask will send to a reasoning backend.
 ///
@@ -72,12 +78,14 @@ pub enum AskReply {
 pub struct AskResult {
     pub reply: AskReply,
     pub normalizations: Vec<ObservedRequestNormalization>,
+    pub screen_consultations: Vec<ScreenConsultation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AskTurn {
     pub question: String,
     pub reply: AskReply,
+    pub screen_consultations: Vec<ScreenConsultation>,
 }
 
 #[derive(Debug, Error)]
@@ -95,16 +103,35 @@ pub enum AskError {
     UnknownCitedSession(u64),
     #[error("Ask was cancelled")]
     Cancelled,
+    #[error(transparent)]
+    Context(#[from] ReasoningContextError),
 }
 
 pub struct AskEngine {
     provider: std::sync::Arc<dyn ReasoningProvider>,
+    screen_inspector: Option<std::sync::Arc<dyn screen::ScreenInspectionSource>>,
+    screen_consultation_log: Option<ScreenConsultationLog>,
 }
 
 impl AskEngine {
     #[must_use]
     pub fn new(provider: std::sync::Arc<dyn ReasoningProvider>) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            screen_inspector: None,
+            screen_consultation_log: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_screen_inspector(
+        mut self,
+        inspector: std::sync::Arc<dyn screen::ScreenInspectionSource>,
+        log: ScreenConsultationLog,
+    ) -> Self {
+        self.screen_inspector = Some(inspector);
+        self.screen_consultation_log = Some(log);
+        self
     }
 
     #[expect(
@@ -123,6 +150,46 @@ impl AskEngine {
     ) -> Result<AskResult, AskError> {
         if cancellation.is_cancelled() {
             return Err(AskError::Cancelled);
+        }
+        if self.screen_inspector.is_some() {
+            let transcript = render_transcript(target, events);
+            let conversation = history
+                .iter()
+                .map(|turn| {
+                    format!(
+                        "Prior question: {}\nPrior answer: {}",
+                        turn.question,
+                        serde_json::to_string(&turn.reply).unwrap_or_default()
+                    )
+                })
+                .chain(std::iter::once(format!("Question: {question}")))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let inspection_budget = ScreenInspectionBudget::default();
+            let result = complete_with_optional_inspection_cancellable::<WireReply>(
+                self.provider.as_ref(),
+                SYSTEM,
+                format!("{transcript}\n\n{conversation}"),
+                events,
+                self.screen_inspector.as_deref(),
+                self.screen_consultation_log.as_ref(),
+                &inspection_budget,
+                &cancellation,
+            )
+            .await?;
+            let allowed = std::collections::BTreeMap::from([(session_id, final_event_ids(events))]);
+            let reply = validate_reply(&allowed, result.value)?;
+            if let Some(sender) = &updates {
+                let _ = sender.send(serde_json::to_string(&reply).unwrap_or_default());
+            }
+            return Ok(AskResult {
+                reply,
+                normalizations: result.normalizations,
+                screen_consultations: self
+                    .screen_consultation_log
+                    .as_ref()
+                    .map_or_else(Vec::new, ScreenConsultationLog::entries),
+            });
         }
         let _stale = self.provider.take_request_normalizations();
         let request = build_request(self.provider.model_id(), target, events, history, question);
@@ -150,6 +217,7 @@ impl AskEngine {
         Ok(AskResult {
             reply,
             normalizations: self.provider.take_request_normalizations(),
+            screen_consultations: Vec::new(),
         })
     }
 
@@ -272,6 +340,7 @@ impl AskEngine {
         Ok(AskResult {
             reply,
             normalizations: self.provider.take_request_normalizations(),
+            screen_consultations: Vec::new(),
         })
     }
 }
@@ -283,6 +352,7 @@ fn local_selection_refusal(reason: impl Into<String>) -> AskResult {
             covered: Vec::new(),
         },
         normalizations: Vec::new(),
+        screen_consultations: Vec::new(),
     }
 }
 
@@ -433,6 +503,7 @@ fn strip_fence(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -441,6 +512,9 @@ mod tests {
     use providers::{
         AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendId, ReasoningProvider,
         Registry, Role,
+    };
+    use screen::{
+        InspectScreenRequest, ScreenInspection, ScreenInspectionSource, ScreenUnavailableReason,
     };
     use sotto_core::{
         Annotation, BoxFuture, BoxStream, CancellationToken, CaptureTarget, CompletionProvider,
@@ -452,8 +526,64 @@ mod tests {
         AskEngine, AskError, AskReply, MAX_SELECTION_FINALS, WireClaim, WireReply, build_request,
         validate_reply,
     };
+    use crate::context::{ScreenConsultationLog, consultation};
 
     struct RefusalProvider;
+
+    struct InspectionProvider(Mutex<VecDeque<String>>);
+
+    impl CompletionProvider for InspectionProvider {
+        fn stream(
+            &self,
+            _request: CompletionRequest,
+            _cancellation: CancellationToken,
+        ) -> BoxFuture<'_, Result<BoxStream<'static, Result<Delta, ProviderError>>, ProviderError>>
+        {
+            let output = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front();
+            Box::pin(async move {
+                let output = output.ok_or_else(|| {
+                    ProviderError::Network("missing Ask inspection turn".to_owned())
+                })?;
+                Ok(Box::pin(stream::iter([Ok(Delta {
+                    text: output,
+                    is_final: true,
+                    usage: Some(Usage::default()),
+                    stop_reason: Some(StopReason::EndTurn),
+                })]))
+                    as BoxStream<'static, Result<Delta, ProviderError>>)
+            })
+        }
+
+        fn model_id(&self) -> &str {
+            "ask-inspection"
+        }
+    }
+
+    impl ReasoningProvider for InspectionProvider {}
+
+    struct LoggedInspector {
+        log: ScreenConsultationLog,
+    }
+
+    impl ScreenInspectionSource for LoggedInspector {
+        fn inspect(
+            &self,
+            _events: &[TimelineEvent],
+            request: &InspectScreenRequest,
+        ) -> ScreenInspection {
+            let inspection = ScreenInspection::Unavailable {
+                requested: request.selector.clone(),
+                reason: ScreenUnavailableReason::NoSnapshots,
+            };
+            self.log
+                .record(consultation(SessionId::new(7), request, &inspection));
+            inspection
+        }
+    }
 
     impl CompletionProvider for RefusalProvider {
         fn stream(
@@ -684,6 +814,39 @@ mod tests {
         assert!(serialized.contains("hesitant"));
         assert!(!serialized.contains("outside-only owner"));
         assert!(!serialized.contains("provisional secret tail"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_recording_ask_can_consult_screen_and_returns_its_receipt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let events = boundary_events();
+        let log = ScreenConsultationLog::new(SessionId::new(7));
+        let inspector = Arc::new(LoggedInspector { log: log.clone() });
+        let provider = Arc::new(InspectionProvider(Mutex::new(VecDeque::from([
+            r#"{"action":"inspect_screen","event_id":1,"evidence":"local_ocr","reason":"read the slide behind the cited words"}"#.to_owned(),
+            r#"{"kind":"answer","claims":[{"text":"The deadline is Friday.","citations":[{"event_id":1}]}]}"#.to_owned(),
+        ]))));
+        let result = AskEngine::new(provider)
+            .with_screen_inspector(inspector, log)
+            .ask(
+                SessionId::new(7),
+                &target(),
+                &events,
+                &[],
+                "What was on the slide?",
+                CancellationToken::new(),
+                None,
+            )
+            .await?;
+
+        assert!(matches!(result.reply, AskReply::Answer { .. }));
+        assert_eq!(result.screen_consultations.len(), 1);
+        assert!(
+            result.screen_consultations[0]
+                .describe()
+                .contains("unavailable (no_snapshots)")
+        );
         Ok(())
     }
 

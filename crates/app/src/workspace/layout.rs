@@ -2818,6 +2818,23 @@ mod tests {
         Ok((cancel, ok))
     }
 
+    /// Waits for the dialog to actually go away rather than assuming one frame settles it.
+    ///
+    /// Dismissal is deferred, so `refresh` + `run_until_parked` is a race the test loses under a
+    /// loaded `--workspace` run — `the_view_bar_delete_asks_in_a_dialog_and_cancel_keeps_everything`
+    /// failed roughly one run in three on "Cancel must dismiss the dialog" while passing five times
+    /// out of five alone. The wait is bounded so a dialog that genuinely never closes still fails.
+    fn wait_for_dialog_dismissed(visual: &mut gpui::VisualTestContext) -> bool {
+        for _ in 0..50 {
+            if !visual.update(|window, cx| window.has_active_dialog(cx)) {
+                return true;
+            }
+            visual.executor().advance_clock(Duration::from_millis(20));
+            visual.run_until_parked();
+        }
+        false
+    }
+
     /// Opens the view bar's trash control and returns the dialog's Cancel and OK bounds.
     fn open_view_bar_delete_dialog(
         visual: &mut VisualTestContext,
@@ -2861,7 +2878,7 @@ mod tests {
         visual.refresh()?;
         visual.run_until_parked();
         assert!(
-            !visual.update(|window, cx| window.has_active_dialog(cx)),
+            wait_for_dialog_dismissed(visual),
             "Cancel must dismiss the dialog"
         );
         assert!(
@@ -2891,7 +2908,7 @@ mod tests {
         visual.refresh()?;
         visual.run_until_parked();
         assert!(
-            !visual.update(|window, cx| window.has_active_dialog(cx)),
+            wait_for_dialog_dismissed(visual),
             "Escape must cancel the dialog"
         );
         assert!(
@@ -2925,7 +2942,7 @@ mod tests {
         visual.refresh()?;
         visual.run_until_parked();
         assert!(
-            !visual.update(|window, cx| window.has_active_dialog(cx)),
+            wait_for_dialog_dismissed(visual),
             "confirming must close the dialog"
         );
         assert!(

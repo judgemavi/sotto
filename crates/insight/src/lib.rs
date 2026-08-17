@@ -12,7 +12,11 @@ pub use ask::{
     AskAnswer, AskCitation, AskClaim, AskEngine, AskError, AskEvidence, AskReply, AskResult,
     AskTurn,
 };
-pub use context::ReasoningContextError;
+pub use context::{
+    ConsultationOutcome, ConsultedEvidence, ConsultedMoment, ConsultedPrecision,
+    ReasoningContextError, SCREEN_INSPECTION_BUDGET, ScreenConsultation, ScreenConsultationLog,
+    ScreenInspectionBudget,
+};
 
 pub use clustering::{
     ClusterError, ClusterReport, Clusterer, DerivedView, OpenThread, OpenThreadKind, TopicLink,

@@ -568,6 +568,7 @@ mod tests {
                 "available",
                 r#"{"excerpts":[],"digest":"test","estimated_tokens":0}"#,
                 r#"[{"dispatch_id":17,"backend_id":"test.notes","control":"temperature"}]"#,
+                r#"[{"requested":"event:1","outcome":"available"}]"#,
             )
             .await?;
         let replay = store
@@ -588,6 +589,10 @@ mod tests {
             replay.normalizations,
             r#"[{"dispatch_id":17,"backend_id":"test.notes","control":"temperature"}]"#
         );
+        assert_eq!(
+            replay.consultations,
+            r#"[{"requested":"event:1","outcome":"available"}]"#
+        );
         assert!(
             store
                 .save_grounded_derived_view(
@@ -601,11 +606,12 @@ mod tests {
                     Some("mcp-grant-v1-test"),
                     "available",
                     r#"{"excerpts":[],"digest":"test","estimated_tokens":0}"#,
+                    r#"[{"dispatch_id":17,"backend_id":"test.notes","control":"temperature"}]"#,
                     "[]",
                 )
                 .await
                 .is_err(),
-            "the run's downgrade history participates in replay integrity"
+            "the run's consultation receipt participates in replay integrity"
         );
         assert!(
             store
@@ -621,6 +627,7 @@ mod tests {
                     "available",
                     r#"{"excerpts":[],"digest":"test","estimated_tokens":0}"#,
                     r#"[{"dispatch_id":17,"backend_id":"test.notes","control":"temperature"}]"#,
+                    r#"[{"requested":"event:1","outcome":"available"}]"#,
                 )
                 .await
                 .is_err()
@@ -686,6 +693,7 @@ mod tests {
                 None,
                 "not_selected",
                 r#"{"excerpts":[],"digest":"test","estimated_tokens":0}"#,
+                "[]",
                 "[]",
             )
             .await?;

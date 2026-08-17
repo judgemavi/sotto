@@ -1,13 +1,19 @@
 //! Transcript-first prompt assembly and the bounded `inspect_screen` second pass.
 
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use futures_util::StreamExt;
 use screen::{
     AuthorizedReasoningImage, InspectScreenRequest, ScreenEvidence, ScreenInspection,
     ScreenInspectionSource, ScreenPrecision, ScreenSelector, ScreenUnavailableReason,
 };
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sotto_core::{
     CancellationToken, CaptureTarget, CompletionMessage, CompletionRequest, EventPayload,
     MessageRole, ProviderError, ReasoningRequest, TimelineEvent, Usage,
@@ -16,14 +22,177 @@ use thiserror::Error;
 
 use providers::{ReasoningProvider, backend::ObservedRequestNormalization};
 
+pub const SCREEN_INSPECTION_BUDGET: usize = 3;
+
+#[derive(Clone, Default)]
+pub struct ScreenInspectionBudget(Arc<AtomicUsize>);
+
+impl ScreenInspectionBudget {
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        SCREEN_INSPECTION_BUDGET.saturating_sub(self.0.load(Ordering::Acquire))
+    }
+
+    fn try_spend(&self) -> bool {
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |spent| {
+                (spent < SCREEN_INSPECTION_BUDGET).then_some(spent.saturating_add(1))
+            })
+            .is_ok()
+    }
+}
+
 const INSPECTION_INSTRUCTIONS: &str = r#"
 The input intentionally contains only capture-target metadata and timestamped final transcript.
 If screen evidence is materially necessary, return only one JSON action instead of a result:
 {"action":"inspect_screen","timestamp_seconds":12.3,"evidence":"metadata|local_ocr|image","reason":"why this moment is necessary"}
-or use "event_id" instead of "timestamp_seconds". Provide exactly one selector. Request at most
-one inspection. Evidence reports its actual sampled or decoded media timestamp and never implies
-greater precision than its source provides.
+or use "event_id" instead of "timestamp_seconds". Provide exactly one selector. You have a fixed
+budget of three inspections for this run. After each result, either return the final requested JSON
+or spend another inspection. Evidence reports its actual sampled or decoded media timestamp and
+never implies greater precision than its source provides. An exhausted request is refused and does
+not inspect or decode anything.
 "#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsultedMoment {
+    Timestamp(Duration),
+    Event(sotto_core::EventId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsultedEvidence {
+    Metadata,
+    LocalOcr,
+    Image,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsultedPrecision {
+    SampledChangeFrame,
+    DecodedVideoFrame,
+}
+
+impl ConsultedPrecision {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::SampledChangeFrame => "sampled change frame",
+            Self::DecodedVideoFrame => "decoded video frame",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ConsultationOutcome {
+    Frame {
+        requested_media_time: Duration,
+        decoded_media_time: Duration,
+        precision: ConsultedPrecision,
+        ocr_characters: Option<usize>,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScreenConsultation {
+    pub session_id: sotto_core::SessionId,
+    pub requested: ConsultedMoment,
+    pub evidence: ConsultedEvidence,
+    pub reason: String,
+    pub outcome: ConsultationOutcome,
+}
+
+impl ScreenConsultation {
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let moment = match self.requested {
+            ConsultedMoment::Timestamp(value) => format!("at {}", format_clock(value)),
+            ConsultedMoment::Event(id) => format!("at transcript row {}", id.get()),
+        };
+        match &self.outcome {
+            ConsultationOutcome::Frame {
+                requested_media_time,
+                decoded_media_time,
+                precision,
+                ocr_characters,
+            } => {
+                let text = ocr_characters.map_or_else(String::new, |count| {
+                    format!(" · local text recognition returned {count} characters")
+                });
+                format!(
+                    "Reasoning consulted the screen {moment} · {} at {} (requested {}){text} · no image was sent to the reasoning backend.",
+                    precision.label(),
+                    format_precise(*decoded_media_time),
+                    format_precise(*requested_media_time),
+                )
+            }
+            ConsultationOutcome::Unavailable { reason } => format!(
+                "Reasoning asked for the screen {moment} · unavailable ({reason}) · the run continued from the transcript alone."
+            ),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ScreenConsultationLog {
+    session_id: sotto_core::SessionId,
+    entries: Arc<Mutex<Vec<ScreenConsultation>>>,
+}
+
+impl ScreenConsultationLog {
+    #[must_use]
+    pub fn new(session_id: sotto_core::SessionId) -> Self {
+        Self {
+            session_id,
+            entries: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn locked(&self) -> MutexGuard<'_, Vec<ScreenConsultation>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn record(&self, consultation: ScreenConsultation) {
+        self.locked().push(consultation);
+    }
+
+    pub fn record_budget_exhausted(&self, request: &InspectScreenRequest) {
+        self.record(ScreenConsultation {
+            session_id: self.session_id,
+            requested: consulted_moment(&request.selector),
+            evidence: consulted_evidence(request.evidence),
+            reason: request.reason.clone(),
+            outcome: ConsultationOutcome::Unavailable {
+                reason: "inspection_budget_exhausted".to_owned(),
+            },
+        });
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> Vec<ScreenConsultation> {
+        self.locked().clone()
+    }
+}
+
+pub fn consultation(
+    session_id: sotto_core::SessionId,
+    request: &InspectScreenRequest,
+    inspection: &ScreenInspection,
+) -> ScreenConsultation {
+    ScreenConsultation {
+        session_id,
+        requested: consulted_moment(&request.selector),
+        evidence: consulted_evidence(request.evidence),
+        reason: request.reason.clone(),
+        outcome: consultation_outcome(inspection),
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ReasoningContextError {
@@ -97,21 +266,32 @@ pub(crate) async fn complete_with_optional_inspection<T: DeserializeOwned>(
         transcript_context,
         events,
         inspector,
+        None,
+        &ScreenInspectionBudget::default(),
         &CancellationToken::new(),
     )
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the reasoning boundary keeps provider, evidence authority, shared budget, audit log, and cancellation explicit"
+)]
 pub(crate) async fn complete_with_optional_inspection_cancellable<T: DeserializeOwned>(
     provider: &dyn ReasoningProvider,
     system: &str,
     transcript_context: String,
     events: &[TimelineEvent],
     inspector: Option<&dyn ScreenInspectionSource>,
+    consultation_log: Option<&ScreenConsultationLog>,
+    inspection_budget: &ScreenInspectionBudget,
     cancellation: &CancellationToken,
 ) -> Result<ReasoningResult<T>, ReasoningContextError> {
     let _stale = provider.take_request_normalizations();
-    let system = format!("{system}\n{INSPECTION_INSTRUCTIONS}");
+    let system = format!(
+        "{system}\n{INSPECTION_INSTRUCTIONS}\nThis run currently has {} screen inspection(s) remaining.",
+        inspection_budget.remaining()
+    );
     let (first, mut usage) = complete_raw(
         provider,
         &system,
@@ -120,38 +300,62 @@ pub(crate) async fn complete_with_optional_inspection_cancellable<T: Deserialize
         cancellation,
     )
     .await?;
-    match parse_turn(&first)? {
-        ReasoningTurn::Complete(value) => Ok(ReasoningResult {
-            value,
-            usage,
-            calls: 1,
-            normalizations: provider.take_request_normalizations(),
-        }),
-        ReasoningTurn::Inspect(request) => {
-            let mut inspection = inspector.map_or_else(
-                || ScreenInspection::Unavailable {
-                    requested: request.selector.clone(),
-                    reason: ScreenUnavailableReason::InspectorUnavailable,
-                },
-                |source| source.inspect(events, &request),
-            );
-            let image = inspection.take_authorized_image_for(&request);
-            let second_input = format!(
-                "{transcript_context}\n\n{}\nReturn the final requested JSON now. Do not request another inspection.",
-                render_inspection(&inspection, image.is_some())
-            );
-            let (second, second_usage) =
-                complete_raw(provider, &system, second_input, image, cancellation).await?;
-            add_usage(&mut usage, second_usage);
-            match parse_turn(&second)? {
-                ReasoningTurn::Complete(value) => Ok(ReasoningResult {
+    let mut turn = parse_turn(&first)?;
+    let mut calls = 1_usize;
+    let mut context = transcript_context;
+    let mut exhausted_reported = false;
+    loop {
+        match turn {
+            ReasoningTurn::Complete(value) => {
+                return Ok(ReasoningResult {
                     value,
                     usage,
-                    calls: 2,
+                    calls,
                     normalizations: provider.take_request_normalizations(),
-                }),
-                ReasoningTurn::Inspect(_) => Err(ReasoningContextError::RepeatedInspection),
+                });
             }
+            ReasoningTurn::Inspect(request) if inspection_budget.try_spend() => {
+                let mut inspection = inspector.map_or_else(
+                    || ScreenInspection::Unavailable {
+                        requested: request.selector.clone(),
+                        reason: ScreenUnavailableReason::InspectorUnavailable,
+                    },
+                    |source| source.inspect(events, &request),
+                );
+                if inspector.is_none()
+                    && let Some(log) = consultation_log
+                {
+                    log.record(consultation(log.session_id, &request, &inspection));
+                }
+                let image = inspection.take_authorized_image_for(&request);
+                context.push_str("\n\n");
+                context.push_str(&render_inspection(&inspection, image.is_some()));
+                context.push_str(&format!(
+                    "\n{} screen inspection(s) remain. Return the final requested JSON or request another inspection only if materially necessary.",
+                    inspection_budget.remaining()
+                ));
+                let (next, next_usage) =
+                    complete_raw(provider, &system, context.clone(), image, cancellation).await?;
+                calls = calls.saturating_add(1);
+                add_usage(&mut usage, next_usage);
+                turn = parse_turn(&next)?;
+            }
+            ReasoningTurn::Inspect(request) if !exhausted_reported => {
+                if let Some(log) = consultation_log {
+                    log.record_budget_exhausted(&request);
+                }
+                context.push_str(&format!(
+                    "\n\nScreen inspection (derived evidence; does not amend the timeline): availability=unavailable requested={} reason=inspection_budget_exhausted\nThe fixed budget of {SCREEN_INSPECTION_BUDGET} inspections is exhausted. Return the final requested JSON now; no further inspection is possible.",
+                    render_selector(&request.selector)
+                ));
+                let (next, next_usage) =
+                    complete_raw(provider, &system, context.clone(), None, cancellation).await?;
+                calls = calls.saturating_add(1);
+                add_usage(&mut usage, next_usage);
+                exhausted_reported = true;
+                turn = parse_turn(&next)?;
+            }
+            ReasoningTurn::Inspect(_) => return Err(ReasoningContextError::RepeatedInspection),
         }
     }
 }
@@ -371,6 +575,70 @@ fn duration_offset_ms(actual: Duration, requested: Duration) -> f64 {
     } else {
         -(requested.saturating_sub(actual).as_secs_f64() * 1_000.0)
     }
+}
+
+const fn consulted_moment(selector: &ScreenSelector) -> ConsultedMoment {
+    match selector {
+        ScreenSelector::Timestamp(value) => ConsultedMoment::Timestamp(*value),
+        ScreenSelector::Event(value) => ConsultedMoment::Event(*value),
+    }
+}
+
+const fn consulted_evidence(evidence: ScreenEvidence) -> ConsultedEvidence {
+    match evidence {
+        ScreenEvidence::Metadata => ConsultedEvidence::Metadata,
+        ScreenEvidence::LocalOcr => ConsultedEvidence::LocalOcr,
+        ScreenEvidence::Image => ConsultedEvidence::Image,
+    }
+}
+
+fn consultation_outcome(inspection: &ScreenInspection) -> ConsultationOutcome {
+    match inspection {
+        ScreenInspection::RecordingAvailable {
+            provenance,
+            ocr_text,
+        } => ConsultationOutcome::Frame {
+            requested_media_time: provenance.requested_media_time,
+            decoded_media_time: provenance.decoded_media_time,
+            precision: consulted_precision(provenance.precision),
+            ocr_characters: ocr_text.as_ref().map(|text| text.chars().count()),
+        },
+        ScreenInspection::Available {
+            provenance,
+            ocr_text,
+            ..
+        } => ConsultationOutcome::Frame {
+            requested_media_time: provenance.captured_at,
+            decoded_media_time: provenance.captured_at,
+            precision: consulted_precision(provenance.precision),
+            ocr_characters: ocr_text.as_ref().map(|text| text.chars().count()),
+        },
+        ScreenInspection::Unavailable { reason, .. } => ConsultationOutcome::Unavailable {
+            reason: render_unavailable(reason).to_owned(),
+        },
+    }
+}
+
+const fn consulted_precision(precision: ScreenPrecision) -> ConsultedPrecision {
+    match precision {
+        ScreenPrecision::SampledChangeFrame => ConsultedPrecision::SampledChangeFrame,
+        ScreenPrecision::DecodedVideoFrame => ConsultedPrecision::DecodedVideoFrame,
+    }
+}
+
+fn format_clock(value: Duration) -> String {
+    let seconds = value.as_secs();
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
+fn format_precise(value: Duration) -> String {
+    let seconds = value.as_secs();
+    format!(
+        "{:02}:{:02}.{:03}",
+        seconds / 60,
+        seconds % 60,
+        value.subsec_millis()
+    )
 }
 
 fn add_usage(total: &mut Usage, increment: Usage) {

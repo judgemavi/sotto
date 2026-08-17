@@ -192,6 +192,7 @@ pub struct GroundedDerivedView {
     pub source_status: String,
     pub bundle: String,
     pub normalizations: String,
+    pub consultations: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -869,6 +870,7 @@ fn decode_grounded_view(row: entities::grounded_derived_views::Model) -> Grounde
         source_status: row.source_status,
         bundle: row.bundle,
         normalizations: row.normalizations,
+        consultations: row.consultations,
     }
 }
 
@@ -2386,17 +2388,19 @@ impl Store {
         source_status: &str,
         bundle: &str,
         normalizations: &str,
+        consultations: &str,
     ) -> Result<(), RagError> {
         let transaction = self.writer.begin().await.map_err(storage)?;
         execute(
             &transaction,
-            "INSERT INTO grounded_derived_views(session_id,kind,model,content_hash,artifact,usage,provider_model,grant_fingerprint,source_status,bundle,normalizations,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id,kind,model,content_hash) DO NOTHING",
+            "INSERT INTO grounded_derived_views(session_id,kind,model,content_hash,artifact,usage,provider_model,grant_fingerprint,source_status,bundle,normalizations,consultations,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id,kind,model,content_hash) DO NOTHING",
             vec![
                 session_id.get().to_string().into(), kind.to_owned().into(), model.to_owned().into(),
                 content_hash.to_owned().into(), artifact.to_owned().into(), usage.to_owned().into(),
                 provider_model.to_owned().into(), grant_fingerprint.map(str::to_owned).into(),
                 source_status.to_owned().into(), bundle.to_owned().into(),
                 normalizations.to_owned().into(),
+                consultations.to_owned().into(),
                 to_i64(wall_clock_unix_ms()?)?.into(),
             ],
         ).await?;
@@ -2417,6 +2421,7 @@ impl Store {
             || stored.source_status != source_status
             || stored.bundle != bundle
             || stored.normalizations != normalizations
+            || stored.consultations != consultations
         {
             return Err(RagError::Storage(
                 "grounded derived artifact identity already contains different evidence".to_owned(),

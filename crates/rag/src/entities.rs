@@ -113,6 +113,7 @@ entity_without_relations!(grounded_derived_views, "grounded_derived_views", {
     pub source_status: String,
     pub bundle: String,
     pub normalizations: String,
+    pub consultations: String,
     pub created_at: i64,
 });
 

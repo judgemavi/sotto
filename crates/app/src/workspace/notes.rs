@@ -34,7 +34,8 @@ use gpui_component::{
 };
 use insight::{
     NotesBlockProvenance, NotesOverlayOperation, OverlayTarget, PresentedNotesBlock,
-    PresentedNotesBlockId, PresentedNotesDocument, RecordingNotesSectionKind, SourceStatus,
+    PresentedNotesBlockId, PresentedNotesDocument, RecordingNotesSectionKind, ScreenConsultation,
+    SourceStatus,
 };
 #[cfg(test)]
 use insight::{RecordingNotes, RecordingNotesBlock, RecordingNotesSection};
@@ -1201,6 +1202,7 @@ struct SummaryView {
     pending: Option<String>,
     sections: Vec<SummarySection>,
     bundle: Option<mcp::ContextBundle>,
+    screen_consultations: Vec<ScreenConsultation>,
 }
 
 impl SummaryView {
@@ -1239,6 +1241,7 @@ impl SummaryView {
                 cached,
                 model,
                 normalizations,
+                screen_consultations,
                 ..
             } => Self::ready(
                 *document,
@@ -1247,6 +1250,7 @@ impl SummaryView {
                 ready_origin(cached),
                 model,
                 normalization_line(&normalizations),
+                screen_consultations,
             ),
             NotesState::Stale {
                 document,
@@ -1254,6 +1258,7 @@ impl SummaryView {
                 source_status,
                 model,
                 normalizations,
+                screen_consultations,
                 ..
             } => Self::ready(
                 *document,
@@ -1270,6 +1275,7 @@ impl SummaryView {
                     .collect::<Vec<_>>()
                     .join(" "),
                 ),
+                screen_consultations,
             ),
         }
     }
@@ -1282,6 +1288,7 @@ impl SummaryView {
             pending: Some(pending.to_owned()),
             sections: Vec::new(),
             bundle: None,
+            screen_consultations: Vec::new(),
         }
     }
 
@@ -1292,6 +1299,7 @@ impl SummaryView {
         origin: &str,
         model: String,
         caution: Option<String>,
+        screen_consultations: Vec<ScreenConsultation>,
     ) -> Self {
         let sections = document_sections(document);
         // A summary with no section at all is not a summary; say so rather than drawing a heading
@@ -1303,6 +1311,7 @@ impl SummaryView {
             );
             view.provenance = vec![format!("{origin} · {model}")];
             view.caution = caution;
+            view.screen_consultations = screen_consultations;
             return view;
         }
         Self {
@@ -1314,6 +1323,7 @@ impl SummaryView {
             pending: None,
             sections,
             bundle: Some(bundle),
+            screen_consultations,
         }
     }
 }
@@ -1374,13 +1384,17 @@ struct EvidenceDisclosure {
     summary: u64,
     /// Whether the whole-summary toggle currently shows every claim's chips.
     all: bool,
+    screen: bool,
 }
 
 impl EvidenceDisclosure {
     /// The choices that apply to `summary`. A different summary reads quiet again.
     fn revealed(&self, summary: u64) -> Revealed {
         if self.summary == summary {
-            Revealed { all: self.all }
+            Revealed {
+                all: self.all,
+                screen: self.screen,
+            }
         } else {
             Revealed::default()
         }
@@ -1392,6 +1406,7 @@ impl EvidenceDisclosure {
         if self.summary != summary {
             self.summary = summary;
             self.all = false;
+            self.screen = false;
         }
     }
 
@@ -1399,12 +1414,18 @@ impl EvidenceDisclosure {
         self.rebind(summary);
         self.all = !self.all;
     }
+
+    fn toggle_screen(&mut self, summary: u64) {
+        self.rebind(summary);
+        self.screen = !self.screen;
+    }
 }
 
 /// The disclosure choice in force for the summary being drawn.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct Revealed {
     all: bool,
+    screen: bool,
 }
 
 /// Identifies a rendered summary, so evidence choices never carry over to a different one.
@@ -1418,6 +1439,15 @@ fn summary_fingerprint(sections: &[SummarySection]) -> u64 {
             claim.meeting.len().hash(&mut hasher);
             claim.external.len().hash(&mut hasher);
         }
+    }
+    hasher.finish()
+}
+
+fn consultation_fingerprint(summary: u64, consultations: &[ScreenConsultation]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    summary.hash(&mut hasher);
+    for consultation in consultations {
+        consultation.describe().hash(&mut hasher);
     }
     hasher.finish()
 }
@@ -1450,7 +1480,11 @@ impl RenderOnce for SummaryBody {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let tokens = WorkspaceTokens::resolve(cx);
         let summary = self.summary;
-        let fingerprint = summary_fingerprint(&summary.sections);
+        let screen_consultations = summary.screen_consultations.clone();
+        let fingerprint = consultation_fingerprint(
+            summary_fingerprint(&summary.sections),
+            &screen_consultations,
+        );
         let disclosure = window.use_keyed_state("summary-evidence-disclosure", cx, |_, _| {
             EvidenceDisclosure::default()
         });
@@ -1495,6 +1529,15 @@ impl RenderOnce for SummaryBody {
                     .debug_selector(|| "summary-pending".into())
                     .child(pending)
             }))
+            .children((!screen_consultations.is_empty()).then(|| {
+                render_screen_receipt(
+                    &screen_consultations,
+                    fingerprint,
+                    context.disclosure.clone(),
+                    revealed.screen,
+                    tokens,
+                )
+            }))
             .children((!summary.sections.is_empty()).then(|| render_evidence_control(&context)))
             .children(
                 summary
@@ -1503,6 +1546,45 @@ impl RenderOnce for SummaryBody {
                     .map(|section| render_section(section, &context, &mut ordinal)),
             )
     }
+}
+
+fn render_screen_receipt(
+    consultations: &[ScreenConsultation],
+    summary: u64,
+    disclosure: Entity<EvidenceDisclosure>,
+    revealed: bool,
+    tokens: WorkspaceTokens,
+) -> gpui::AnyElement {
+    let count = consultations.len();
+    div()
+        .mt_2()
+        .debug_selector(|| "summary-screen-receipt".into())
+        .child(
+            Button::new("summary-screen-receipt-toggle", tokens)
+                .label(if revealed {
+                    "Hide screen consultation receipt".to_owned()
+                } else {
+                    format!("Screen requests: {count} · Show receipt")
+                })
+                .ghost()
+                .small()
+                .on_click(move |_, _, cx| {
+                    disclosure.update(cx, |state, cx| {
+                        state.toggle_screen(summary);
+                        cx.notify();
+                    });
+                }),
+        )
+        .children(revealed.then(|| {
+            div().children(consultations.iter().map(|entry| {
+                div()
+                    .mt_1()
+                    .text_sm()
+                    .text_color(tokens.faint)
+                    .child(entry.describe())
+            }))
+        }))
+        .into_any_element()
 }
 
 /// The one control that reveals or hides every claim's evidence at once.
@@ -2269,6 +2351,7 @@ mod tests {
                 source_status: insight::SourceStatus::NotSelected,
                 model: "gpt-5.4-codex".to_owned(),
                 normalizations: Vec::new(),
+                screen_consultations: Vec::new(),
             },
             false,
         );
@@ -2293,6 +2376,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let view = SummaryView::resolve(
             NotesState::Ready {
+                screen_consultations: Vec::new(),
                 notes: Box::new(recording_notes(vec![section(
                     "overview",
                     vec![note("Planning.", 1)],
@@ -2334,6 +2418,7 @@ mod tests {
 
         let view = SummaryView::resolve(
             NotesState::Ready {
+                screen_consultations: Vec::new(),
                 notes: Box::new(recording_notes(vec![section(
                     "overview",
                     vec![note("Planning.", 1)],
@@ -2368,6 +2453,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let view = SummaryView::resolve(
             NotesState::Ready {
+                screen_consultations: Vec::new(),
                 notes: Box::new(RecordingNotes::default()),
                 document: Box::new(document(RecordingNotes::default())?),
                 bundle: mcp::ContextBundle::empty(),

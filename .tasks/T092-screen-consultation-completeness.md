@@ -1,6 +1,6 @@
 # T092 — Screen consultation, finished: a budget, Ask's reach, and a disclosure that survives
 
-**Status:** todo
+**Status:** in-review
 
 **Wave:** D1 — living notes
 
@@ -62,9 +62,56 @@ the capability smaller than the product needs, all recorded by T066 itself:
 - No image reaches a backend without the separate opt-in, asserted over the serialized request —
   unchanged and re-proven under the budget.
 - The ADR entry amending the one-inspection rule is written and referenced here.
+  See ADR-0022 (`docs/adr/0022-bounded-screen-consultation-receipts.md`).
 - Focused and full tests, strict Clippy over all targets, formatting, and diff checks pass.
 
 ## Out of scope
 
 The image-transport opt-in itself (Phase 5), decoder or OCR changes, proposal-path inspection
 (T013), and any UI beyond the two receipts.
+
+## Evidence (2026-08-16)
+
+- App-owned recording assembly: 5 focused screen tests pass, including three successful decodes,
+  a fourth logged/refused request, zero-work default, pre-decode image denial, missing-media
+  degradation, serialized-request inspection, and cached restart restoration.
+- Retained-recording Ask: focused `AskEngine` inspection/receipt test passes; the app assembles the
+  same product inspector for single-recording and selection scope and renders an expandable answer
+  receipt.
+- Persistence: schema v19 adds the consultation record to grounded-artifact identity; focused
+  atomic replay/conflict/delete and pre-upgrade migration tests pass.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo test --workspace --locked` passes in the approved
+  environment. The sandboxed run reached only the known local-loopback MCP restriction; the exact
+  `cargo test -p mcp --test rmcp_http --locked` gate passes 4/4 outside that sandbox.
+- `WHISPER_DONT_GENERATE_BINDINGS=1 cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `cargo fmt --all -- --check`, and `git diff --check` pass.
+
+## Planner review — 2026-08-16
+
+Returned from `done` to `in-review`: the board reserves `done` for the planner. Same correction as
+T087's handoff; the work is not in question.
+
+Verified independently rather than from the handoff. All four T066 tests survive by name in
+`reasoning/inspection.rs` — the 249-line reduction there is the consultation types relocating up
+into `crates/insight`, which is where they belong once Ask and notes share a budget, not coverage
+being dropped.
+
+The inherited defect is genuinely fixed and the fix is pinned. Replacing the cached load's
+`screen_consultations` with an empty vec makes
+`a_notes_run_pulls_one_frame_through_the_apps_own_runtime_assembly` fail on *"a cached reopen after
+app restart must restore the full consultation receipt"*, so the assertion is not vacuous. It
+builds a fresh `NotesController` over the same database, which is the restart.
+
+`SCREEN_INSPECTION_BUDGET = 3` with the refusal path covered by
+`the_fourth_screen_request_is_refused_reported_and_logged_by_the_app_runtime`, and ADR-0022 is
+written and amends ADR-0009 as required.
+
+**One flake fixed during review, the third of this shape today.**
+`the_view_bar_delete_asks_in_a_dialog_and_cancel_keeps_everything` failed roughly one full run in
+three on *"Cancel must dismiss the dialog"* while passing five times out of five alone. Dismissal
+is deferred, so `refresh` + `run_until_parked` is a race under load. The three dismissal assertions
+in `layout.rs` now go through a bounded `wait_for_dialog_dismissed`, which still fails a dialog
+that genuinely never closes. Three consecutive full runs pass.
+
+Residual: the receipt's appearance in the notes column and in Ask is unverified by eye, as with
+every visual claim on this board. The disclosure's *content* is asserted.
