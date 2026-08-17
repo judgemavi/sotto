@@ -196,6 +196,17 @@ Its historical result remains evidence about GPUI, not a requirement to preserve
 - ADRs in /docs for any deviation from decisions in this file.
 - Memory discipline: Whisper model loads lazily, unloads when idle. We share the machine with Zoom — profile regularly; the small-footprint claim is a feature. Screen frames are sampled, referenced, and pruned — never accumulate raw video.
 - The core must always build and run headless (`cli` crate is the proof and stays green in CI).
+- **Files no gate parses need their own check, named in the task.** `cargo test`, clippy, `fmt` and
+  `git diff --check` say nothing about `scripts/Info.plist`, and on 2026-08-16 four green gates
+  shipped a malformed one that stopped the app launching. Any edit there runs
+  `plutil -lint scripts/Info.plist`. The general rule: when you edit something the Rust gates cannot
+  read, say which command does read it, and run that one too.
+- **A wall-clock budget is a poor proxy for "did not block."** Two tests failed intermittently on
+  2026-08-16 asserting that a non-blocking call returned within 50 ms while the worker it must not
+  join slept 200 ms. Under a loaded `--workspace` run the non-blocking path itself exceeded the
+  budget. Prefer a deadline loop over a spin count, and where a timing assertion is genuinely the
+  clearest expression of the property, make the separation an order of magnitude, not a factor of
+  four.
 
 ## Explicit non-goals (v1)
 
