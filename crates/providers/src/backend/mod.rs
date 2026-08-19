@@ -1,4 +1,4 @@
-//! Product-facing reasoning backend identity and role selection.
+//! Product-facing reasoning backend identity and per-surface selection.
 //!
 //! Transport implementations stay behind [`sotto_core::CompletionProvider`]. This
 //! module adds only the provider-layer information needed to select, display, and
@@ -389,12 +389,24 @@ impl BackendDescriptor {
     }
 }
 
-/// Runtime purpose assigned to a configured backend.
+/// Product surface that can pin one ready backend for a call.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum Role {
-    Watcher,
-    Suggester,
-    Summarizer,
+pub enum ReasoningSurface {
+    Notes,
+    Ask,
+}
+
+impl ReasoningSurface {
+    pub const ALL: [Self; 2] = [Self::Notes, Self::Ask];
+}
+
+impl fmt::Display for ReasoningSurface {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Notes => formatter.write_str("notes"),
+            Self::Ask => formatter.write_str("ask"),
+        }
+    }
 }
 
 struct RegisteredBackend {
@@ -639,14 +651,14 @@ impl ResolvedBackend {
     }
 }
 
-/// Registered connectors and independent role selections.
+/// Registered connectors and independent notes/Ask selections.
 ///
 /// Resolving clones both descriptor and `Arc`, so later registration or selection
 /// changes cannot retarget an in-flight call.
 #[derive(Default)]
 pub struct Registry {
     backends: HashMap<BackendId, RegisteredBackend>,
-    selections: HashMap<Role, BackendId>,
+    selections: HashMap<ReasoningSurface, BackendId>,
 }
 
 impl Registry {
@@ -705,22 +717,26 @@ impl Registry {
         Ok(())
     }
 
-    pub fn select(&mut self, role: Role, backend: Option<&BackendId>) -> Result<(), RegistryError> {
+    pub fn select(
+        &mut self,
+        surface: ReasoningSurface,
+        backend: Option<&BackendId>,
+    ) -> Result<(), RegistryError> {
         match backend {
             Some(id) if self.backends.contains_key(id) => {
-                self.selections.insert(role, id.clone());
+                self.selections.insert(surface, id.clone());
             }
             Some(id) => return Err(RegistryError::UnknownBackend(id.clone())),
             None => {
-                self.selections.remove(&role);
+                self.selections.remove(&surface);
             }
         }
         Ok(())
     }
 
     #[must_use]
-    pub fn selected_id(&self, role: Role) -> Option<&BackendId> {
-        self.selections.get(&role)
+    pub fn selected_id(&self, surface: ReasoningSurface) -> Option<&BackendId> {
+        self.selections.get(&surface)
     }
 
     #[must_use]
@@ -754,8 +770,11 @@ impl Registry {
         Ok(())
     }
 
-    pub fn resolve(&self, role: Role) -> Result<Option<ResolvedBackend>, RegistryError> {
-        let Some(id) = self.selections.get(&role) else {
+    pub fn resolve(
+        &self,
+        surface: ReasoningSurface,
+    ) -> Result<Option<ResolvedBackend>, RegistryError> {
+        let Some(id) = self.selections.get(&surface) else {
             return Ok(None);
         };
         let backend = self
@@ -870,8 +889,8 @@ impl std::error::Error for RegistryError {}
 mod tests {
     use super::{
         AuthKind, AuthStatus, BackendCapabilities, BackendCapability, BackendContractError,
-        BackendDescriptor, BackendId, ControlRequirement, Registry, RegistryError,
-        RequestNormalizationPolicy, Role, SamplingControl, prepare_reasoning_request,
+        BackendDescriptor, BackendId, ControlRequirement, ReasoningSurface, Registry,
+        RegistryError, RequestNormalizationPolicy, SamplingControl, prepare_reasoning_request,
     };
     use crate::{ReasoningProvider, text_reasoning_provider};
     use futures_util::{StreamExt, stream};
@@ -1066,10 +1085,10 @@ mod tests {
         let fake = descriptor("example.future-runtime", "same-model")?;
         let id = fake.id().clone();
         registry.register(fake, provider("same-model"))?;
-        registry.select(Role::Summarizer, Some(&id))?;
+        registry.select(ReasoningSurface::Notes, Some(&id))?;
 
         let resolved = registry
-            .resolve(Role::Summarizer)?
+            .resolve(ReasoningSurface::Notes)?
             .ok_or("selected backend must resolve")?;
         assert_eq!(
             resolved.descriptor().id().as_str(),
@@ -1093,9 +1112,9 @@ mod tests {
             advanced_called: Arc::clone(&advanced_called),
         });
         registry.register_reasoning(descriptor, provider)?;
-        registry.select(Role::Summarizer, Some(&id))?;
+        registry.select(ReasoningSurface::Notes, Some(&id))?;
         let resolved = registry
-            .resolve(Role::Summarizer)?
+            .resolve(ReasoningSurface::Notes)?
             .ok_or("advanced backend must resolve")?;
         let cancellation = CancellationToken::new();
         let mut output = resolved
@@ -1276,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn role_and_cache_identity_include_backend_not_only_model()
+    fn surface_and_cache_identity_include_backend_not_only_model()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut registry = Registry::default();
         let codex = descriptor("openai.codex-cli", "shared-model")?;
@@ -1290,18 +1309,18 @@ mod tests {
         );
         registry.register(codex, provider("shared-model"))?;
         registry.register(responses, provider("shared-model"))?;
-        registry.select(Role::Watcher, Some(&codex_id))?;
-        registry.select(Role::Summarizer, Some(&responses_id))?;
+        registry.select(ReasoningSurface::Ask, Some(&codex_id))?;
+        registry.select(ReasoningSurface::Notes, Some(&responses_id))?;
 
         assert_eq!(
-            registry.selected_id(Role::Watcher),
+            registry.selected_id(ReasoningSurface::Ask),
             Some(&codex_id),
-            "watcher selection must remain independent"
+            "Ask selection must remain independent"
         );
         assert_eq!(
-            registry.selected_id(Role::Summarizer),
+            registry.selected_id(ReasoningSurface::Notes),
             Some(&responses_id),
-            "summarizer selection must remain independent"
+            "notes selection must remain independent"
         );
         Ok(())
     }
@@ -1316,11 +1335,11 @@ mod tests {
         let second_id = second.id().clone();
         registry.register(first, provider("first"))?;
         registry.register(second, provider("second"))?;
-        registry.select(Role::Suggester, Some(&first_id))?;
+        registry.select(ReasoningSurface::Ask, Some(&first_id))?;
         let pinned = registry
-            .resolve(Role::Suggester)?
+            .resolve(ReasoningSurface::Ask)?
             .ok_or("first backend must resolve")?;
-        registry.select(Role::Suggester, Some(&second_id))?;
+        registry.select(ReasoningSurface::Ask, Some(&second_id))?;
 
         assert_eq!(
             pinned.provider().model_id(),
@@ -1365,7 +1384,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut registry = Registry::default();
         assert!(
-            registry.resolve(Role::Watcher)?.is_none(),
+            registry.resolve(ReasoningSurface::Ask)?.is_none(),
             "no reasoning must be an ordinary configuration"
         );
         let unavailable = BackendDescriptor::new(
@@ -1379,10 +1398,10 @@ mod tests {
         )?;
         let id = unavailable.id().clone();
         registry.register(unavailable, provider("model"))?;
-        registry.select(Role::Watcher, Some(&id))?;
+        registry.select(ReasoningSurface::Ask, Some(&id))?;
         assert!(
             matches!(
-                registry.resolve(Role::Watcher),
+                registry.resolve(ReasoningSurface::Ask),
                 Err(RegistryError::BackendNotReady {
                     status: AuthStatus::NeedsLogin,
                     ..
@@ -1409,9 +1428,9 @@ mod tests {
         let id = codex.id().clone();
         let fingerprint = codex.fingerprint().clone();
         registry.register(codex, provider("model"))?;
-        registry.select(Role::Summarizer, Some(&id))?;
+        registry.select(ReasoningSurface::Notes, Some(&id))?;
         let pinned = registry
-            .resolve(Role::Summarizer)?
+            .resolve(ReasoningSurface::Notes)?
             .ok_or("ready backend must resolve")?;
 
         registry.refresh_auth_status(&id, AuthStatus::NeedsLogin)?;
@@ -1428,7 +1447,7 @@ mod tests {
         );
         assert!(
             matches!(
-                registry.resolve(Role::Summarizer),
+                registry.resolve(ReasoningSurface::Notes),
                 Err(RegistryError::BackendNotReady {
                     status: AuthStatus::NeedsLogin,
                     ..
@@ -1486,9 +1505,9 @@ mod tests {
                 observed: Arc::clone(&observed),
             }),
         )?;
-        registry.select(Role::Summarizer, Some(&id))?;
+        registry.select(ReasoningSurface::Notes, Some(&id))?;
         let resolved = registry
-            .resolve(Role::Summarizer)?
+            .resolve(ReasoningSurface::Notes)?
             .ok_or("selected backend must resolve")?;
         let request = ReasoningRequest::json_object(CompletionRequest {
             model: "model".to_owned(),

@@ -40,7 +40,12 @@ const SHUTDOWN_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const APP_QUIT_WORKER_TIMEOUT: Duration = Duration::from_secs(5);
 const LIFECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const LIFECYCLE_CHANNEL_CAPACITY: usize = 32;
-const RECORDING_FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
+// Stop is not the same as a playable file. ScreenCaptureKit can emit UserStopped immediately,
+// while Swift still runs `AVAssetWriter.finishWriting` and then re-encodes the whole AAC
+// timeline into a conventional MP4. That remux is what emits CaptureStatus::Stopped, and on a
+// real meeting it is minutes, not seconds. Five seconds left 45-minute recordings stranded as
+// `growing` with a timeout error even after the MP4 landed. Tests inject a short deadline.
+const RECORDING_FINALIZE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 // The writer commits two-second fMP4 segments, so boundary rounding and the final segment flush
 // can only move a finalized file two seconds off the wall-clock capture bracket. Five seconds is
 // therefore a loose bound rather than a fitted one, and deliberately so: this exists to catch
@@ -134,7 +139,7 @@ impl SessionLifecycle {
             }
             Self::Stopping { was_recording, .. } => {
                 if *was_recording {
-                    "Finalizing the transcript tail and stopping capture…".to_owned()
+                    "Stopping capture and finishing the local recording…".to_owned()
                 } else {
                     "Cancelling model setup…".to_owned()
                 }
@@ -1651,7 +1656,7 @@ async fn run(
         }
     }
     let finalization = async {
-        wait_for_recording_finalization(&mut statuses).await?;
+        wait_for_recording_finalization(&mut statuses).await;
         let probe = probe_recording(&recording_path).map_err(capture_failure)?;
         let tail_updates = recording_transcription
             .transcribe_complete()
@@ -1975,29 +1980,32 @@ pub fn application_recording_directory() -> PathBuf {
 
 async fn wait_for_recording_finalization(
     statuses: &mut tokio::sync::broadcast::Receiver<CaptureStatus>,
-) -> Result<(), SessionFailure> {
+) {
+    wait_for_recording_finalization_until(statuses, RECORDING_FINALIZE_TIMEOUT).await;
+}
+
+/// Waits for Swift to report Stopped after remux, then lets the caller probe the file.
+///
+/// A missed Stopped (broadcast lag) is followed by a closed channel once CallbackState is
+/// dropped; that is enough to proceed. A timeout is also not fatal: the remux Task can still
+/// finish later, and `probe_recording` / stranded-growing recovery decide whether the MP4 is
+/// usable. Tests pass a short deadline so CI does not wait ten minutes.
+async fn wait_for_recording_finalization_until(
+    statuses: &mut tokio::sync::broadcast::Receiver<CaptureStatus>,
+    timeout: Duration,
+) {
     let wait = async {
         loop {
             match statuses.recv().await {
-                Ok(CaptureStatus::Stopped) => return Ok(()),
+                Ok(CaptureStatus::Stopped) => return,
                 Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    return Err(SessionFailure::new(
-                        SessionFailureKind::Capture,
-                        "Capture closed before the local recording finished.",
-                    ));
-                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }
     };
-    tokio::time::timeout(RECORDING_FINALIZE_TIMEOUT, wait)
-        .await
-        .map_err(|_| {
-            SessionFailure::new(
-                SessionFailureKind::Capture,
-                "The local recording did not finish within five seconds.",
-            )
-        })?
+    if tokio::time::timeout(timeout, wait).await.is_err() {
+        eprintln!("Local recording finalization exceeded {timeout:?}; probing the file anyway");
+    }
 }
 
 async fn persistence() -> Result<(Arc<TimelinePersistence>, Arc<Store>), SessionFailure> {
@@ -2183,6 +2191,7 @@ mod tests {
         drain_until_closed, ensure_not_cancelled, finalization_failure_reason, finish_state,
         preserve_failed_finalization, recording_duration_discrepancy, retained_recording_message,
         send_finished, send_phase_progress, settle_recording, terminal_status,
+        wait_for_recording_finalization_until,
     };
     use crate::devwindow::test_ingress;
 
@@ -2313,6 +2322,43 @@ mod tests {
 
         assert_eq!(finalization_failure_reason(detail), expected);
         assert_eq!(finalization_failure_reason(expected), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recording_finalization_wait_accepts_stopped() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        assert!(
+            tx.send(CaptureStatus::Stopped).is_ok(),
+            "test status send must succeed"
+        );
+        wait_for_recording_finalization_until(&mut rx, Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recording_finalization_wait_treats_closed_as_finished() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<CaptureStatus>(8);
+        drop(tx);
+        wait_for_recording_finalization_until(&mut rx, Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recording_finalization_wait_does_not_fail_when_stopped_is_lagged_away() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(1);
+        assert!(
+            tx.send(CaptureStatus::Stopped).is_ok(),
+            "test status send must succeed"
+        );
+        for _ in 0..8 {
+            let _ = tx.send(CaptureStatus::Running);
+        }
+        drop(tx);
+        wait_for_recording_finalization_until(&mut rx, Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recording_finalization_wait_times_out_without_failing() {
+        let (_tx, mut rx) = tokio::sync::broadcast::channel::<CaptureStatus>(8);
+        wait_for_recording_finalization_until(&mut rx, Duration::from_millis(30)).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -3,7 +3,7 @@
 //! The community SDK is deliberately contained in this module. Callers see only
 //! Sotto's provider-neutral completion and backend contracts. Requests are
 //! stateless (`store: false`), expose no tools, and default to JSON mode because
-//! the initial insight and advisor roles all consume structured JSON.
+//! the initial insight notes and Ask consumers all consume structured JSON.
 
 mod credentials;
 
@@ -100,7 +100,7 @@ impl OpenAiProvider {
         self
     }
 
-    /// Product metadata used by settings, role selection, and derived-view caches.
+    /// Product metadata used by settings, Notes/Ask provider pickers, and derived-view caches.
     pub fn descriptor(&self) -> Result<BackendDescriptor, BackendContractError> {
         BackendDescriptor::new(
             BackendId::new(OPENAI_RESPONSES_BACKEND_ID)?,

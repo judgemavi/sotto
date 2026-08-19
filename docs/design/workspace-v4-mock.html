@@ -1,0 +1,690 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sotto — quiet page (v4)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   Sotto workspace mock v4 — the quiet page
+
+   Direction: everyday notebook, not an engineering console.
+   Product structure is unchanged (Home, live two-column,
+   notes-first review, Ask collapsed). The visual and verbal
+   system is what changes.
+
+   What this mock is allowed to keep from v3:
+   - one window, capture bar only while recording
+   - library rail, notes and transcript as peers
+   - citations still jump to the exact moment
+   - visual calm: no cards-in-cards, no toast, no chips soup
+
+   What it refuses:
+   - uppercase eyebrows, 13px chrome, indigo wash
+   - "entry / backend / Summarize / app audio"
+   - bordered citation chips and keyboard glyphs on Home
+   - equal-weight start cards (the job is still "record a call")
+
+   GPUI-buildable: nested flex, token colours, no backdrop-filter,
+   no grid areas. Page lift is a surface-on-ground fill, not a
+   drop shadow. Newsreader stands in for macOS New York.
+   ============================================================ */
+
+:root {
+  color-scheme: light;
+  --paper: #F3F2F7;
+  --page: #FFFDFF;
+  --page-2: #F7F6FB;
+  --ink: #1C1924;
+  --soft: #5F5A6A;
+  --hush: #8B8696;
+  --line: #E4E1EB;
+  --voice: #5A4588;
+  --voice-soft: #EDE8F6;
+  --live: #C94B40;
+  --live-wash: #FBEDEC;
+  --you: #8A5A28;
+  --meeting: #5A4588;
+  --scrim: rgba(28, 25, 36, .36);
+  --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --read: "Newsreader", "Iowan Old Style", "Palatino Linotype", Palatino, serif;
+}
+[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #16141C;
+  --page: #1E1B26;
+  --page-2: #252230;
+  --ink: #F4F1F8;
+  --soft: #B7B1C4;
+  --hush: #8A8498;
+  --line: #2F2B3A;
+  --voice: #C8B6EE;
+  --voice-soft: #2A2438;
+  --live: #F07A70;
+  --live-wash: #3A2220;
+  --you: #E0B07A;
+  --meeting: #C8B6EE;
+  --scrim: rgba(0, 0, 0, .55);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  font: 15px/1.45 var(--ui);
+  color: var(--ink);
+  background: #0E0D12;
+  -webkit-font-smoothing: antialiased;
+}
+button, input { font: inherit; color: inherit; background: none; border: 0; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--voice); outline-offset: 2px; border-radius: 10px; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+/* demo stage around the window */
+.stage {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 28px 20px 40px;
+}
+.stage-head {
+  width: min(1180px, 100%);
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  margin-bottom: 16px;
+  color: #D8D4E0;
+}
+.stage-head h1 { font-size: 15px; font-weight: 600; letter-spacing: -.01em; }
+.stage-head p { color: #9C97A8; font-size: 13px; }
+.scenes {
+  display: flex; gap: 4px; margin-left: auto;
+  padding: 3px; border-radius: 999px; background: #1C1A24;
+}
+.scenes button {
+  padding: 6px 12px; border-radius: 999px; font-size: 12.5px; color: #B7B1C4;
+}
+.scenes button[aria-pressed="true"] { background: #2A2733; color: #fff; }
+.theme {
+  margin-left: 8px; padding: 6px 11px; border-radius: 999px;
+  font-size: 12.5px; color: #B7B1C4; background: #1C1A24;
+}
+
+.window {
+  width: min(1180px, 100%);
+  height: min(760px, calc(100vh - 110px));
+  display: flex; flex-direction: column;
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,.06);
+}
+
+.toolbar {
+  display: flex; align-items: center; gap: 8px;
+  height: 48px; padding: 0 14px 0 84px;
+  flex: none;
+}
+.tool {
+  width: 30px; height: 30px; border-radius: 9px;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--soft);
+}
+.tool:hover, .tool[aria-pressed="true"] { background: var(--page-2); color: var(--ink); }
+.search {
+  flex: 1; max-width: 280px; margin-left: 4px;
+  height: 30px; padding: 0 11px; border-radius: 9px;
+  background: var(--page); color: var(--hush); font-size: 13px;
+}
+.toolbar .spacer { flex: 1; }
+.ask-btn {
+  height: 30px; padding: 0 12px; border-radius: 9px;
+  font-size: 13px; font-weight: 550; color: var(--soft);
+}
+.ask-btn:hover, .ask-btn[aria-pressed="true"] { background: var(--voice-soft); color: var(--voice); }
+
+.capture {
+  display: flex; align-items: center; gap: 12px;
+  min-height: 52px; padding: 0 18px; flex: none;
+  background: var(--live-wash);
+}
+.dot {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--live); flex: none;
+  animation: pulse 1.8s ease-in-out infinite;
+}
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+.capture .now { font-weight: 600; font-size: 14px; }
+.capture .where { color: var(--soft); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.clock { font-variant-numeric: tabular-nums; font-size: 20px; font-weight: 500; letter-spacing: -.02em; }
+.stop {
+  height: 32px; padding: 0 14px; border-radius: 999px;
+  background: var(--live); color: #fff; font-weight: 600; font-size: 13.5px;
+}
+
+.body { flex: 1; display: flex; min-height: 0; }
+
+.rail {
+  width: 232px; flex: none;
+  display: flex; flex-direction: column;
+  padding: 8px 10px 16px;
+}
+.rail-label {
+  font-size: 12px; font-weight: 600; color: var(--hush);
+  padding: 10px 10px 8px;
+}
+.row {
+  width: 100%; display: flex; gap: 10px; text-align: left;
+  padding: 9px 10px; border-radius: 12px; align-items: flex-start;
+}
+.row:hover { background: rgba(255,255,255,.35); }
+[data-theme="dark"] .row:hover { background: rgba(255,255,255,.04); }
+.row[aria-current="true"] { background: var(--page); }
+.row .mark {
+  width: 8px; height: 8px; border-radius: 50%; flex: none; margin-top: 6px;
+  background: transparent;
+}
+.row.live .mark { background: var(--live); }
+.row .name { font-weight: 600; font-size: 13.5px; }
+.row .meta { color: var(--hush); font-size: 12px; margin-top: 1px; }
+.day { padding: 14px 10px 4px; font-size: 11.5px; font-weight: 600; color: var(--hush); }
+
+.main { flex: 1; min-width: 0; display: flex; background: var(--page); }
+.col { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.col + .col { border-left: 1px solid var(--line); }
+
+/* Home ----------------------------------------------------------- */
+.home {
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  padding: 40px 32px;
+}
+.home-inner { width: min(440px, 100%); }
+.kicker {
+  font-size: 12px; font-weight: 600; color: var(--voice); margin-bottom: 8px;
+}
+.home h2 {
+  font-family: var(--read);
+  font-size: 34px; font-weight: 500; letter-spacing: -.03em; line-height: 1.15;
+}
+.home .lede {
+  margin: 12px 0 28px; color: var(--soft); font-size: 16px; line-height: 1.5;
+}
+.primary {
+  width: 100%; height: 48px; border-radius: 14px;
+  background: var(--ink); color: var(--page);
+  font-size: 16px; font-weight: 600;
+}
+.primary:hover { filter: brightness(1.08); }
+[data-theme="dark"] .primary { background: var(--ink); color: var(--paper); }
+.quiet-actions {
+  display: flex; gap: 8px; margin-top: 10px;
+}
+.quiet {
+  flex: 1; height: 40px; border-radius: 12px;
+  font-size: 14px; font-weight: 550; color: var(--soft);
+}
+.quiet:hover { background: var(--page-2); color: var(--ink); }
+.prepare {
+  display: flex; gap: 8px; margin-top: 16px; align-items: center;
+}
+.prepare input {
+  flex: 1; height: 40px; padding: 0 12px; border-radius: 12px;
+  background: var(--page); border: 1px solid var(--line); font-size: 14px;
+}
+.prepare button {
+  height: 40px; padding: 0 12px; border-radius: 12px;
+  font-size: 14px; font-weight: 550; color: var(--soft);
+}
+.prepare button:hover { background: var(--page-2); color: var(--ink); }
+.stay {
+  margin-top: 22px; color: var(--hush); font-size: 13px;
+}
+
+/* Live transcript ------------------------------------------------ */
+.talk {
+  flex: 1; overflow-y: auto; padding: 18px 8px 28px;
+}
+.turn {
+  display: flex; gap: 14px; padding: 10px 22px;
+  border-radius: 0;
+}
+.turn:hover { background: var(--page-2); }
+.turn .when {
+  width: 44px; flex: none; padding-top: 4px;
+  font-size: 12px; color: transparent; font-variant-numeric: tabular-nums;
+}
+.turn:hover .when, .turn:focus-within .when { color: var(--hush); }
+.who {
+  font-size: 12.5px; font-weight: 650; margin-bottom: 2px;
+}
+.who.you { color: var(--you); }
+.who.them { color: var(--meeting); }
+.said {
+  font-size: 16px; line-height: 1.55; max-width: 52ch;
+}
+.said.live { color: var(--soft); font-style: italic; }
+.follow {
+  position: sticky; bottom: 16px; margin: 0 auto;
+  display: block; height: 32px; padding: 0 14px; border-radius: 999px;
+  background: var(--ink); color: var(--page); font-size: 13px; font-weight: 600;
+}
+
+/* Notes document ------------------------------------------------- */
+.sheet {
+  flex: 1; overflow-y: auto;
+  padding: 28px 0 72px;
+}
+.doc {
+  width: min(640px, calc(100% - 56px));
+  margin: 0 auto;
+}
+.doc header h3 {
+  font-family: var(--read);
+  font-size: 28px; font-weight: 500; letter-spacing: -.03em; line-height: 1.2;
+}
+.doc header p { margin-top: 8px; color: var(--hush); font-size: 14px; }
+.sec { margin-top: 28px; }
+.sec h4 {
+  font-size: 12px; font-weight: 650; color: var(--hush);
+  margin-bottom: 8px;
+}
+.sec p, .sec li {
+  font-family: var(--read);
+  font-size: 18px; line-height: 1.55; font-weight: 400;
+}
+.sec ul { list-style: none; }
+.sec li { padding: 5px 0 5px 18px; position: relative; }
+.sec li::before {
+  content: ""; position: absolute; left: 4px; top: 15px;
+  width: 5px; height: 5px; border-radius: 50%; background: var(--hush);
+}
+.sec.tasks li::before { display: none; }
+.sec.tasks li { padding-left: 0; display: flex; gap: 10px; align-items: flex-start; }
+.check {
+  width: 18px; height: 18px; border-radius: 6px; flex: none; margin-top: 6px;
+  border: 1.5px solid var(--line); background: var(--page);
+}
+.check.on { background: var(--voice); border-color: var(--voice); }
+.who-did { font-weight: 600; font-style: normal; }
+
+/* the signature: a citation is ink under the words, not a chip */
+cite.jump {
+  font-style: inherit;
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--voice) 55%, transparent);
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+  cursor: pointer;
+  border-radius: 2px;
+}
+cite.jump:hover {
+  background: var(--voice-soft);
+  text-decoration-color: var(--voice);
+}
+
+.peek {
+  margin-top: 10px; padding: 12px 14px; border-radius: 12px;
+  background: var(--voice-soft); color: var(--ink);
+  font-family: var(--ui); font-size: 13.5px; line-height: 1.45;
+}
+.peek .src { color: var(--voice); font-weight: 650; font-size: 12px; margin-bottom: 4px; }
+
+.write {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-top: 36px; padding-top: 18px; border-top: 1px solid var(--line);
+}
+.write p { color: var(--hush); font-size: 13.5px; }
+.ghost {
+  height: 36px; padding: 0 14px; border-radius: 999px;
+  font-size: 14px; font-weight: 600; color: var(--voice);
+  background: var(--voice-soft);
+}
+
+.composer {
+  display: flex; gap: 8px; align-items: center;
+  padding: 12px 22px 16px; flex: none;
+}
+.composer input {
+  flex: 1; height: 40px; padding: 0 14px; border-radius: 12px;
+  background: var(--page-2); font-size: 14px;
+}
+.composer input::placeholder { color: var(--hush); }
+.add {
+  height: 40px; padding: 0 14px; border-radius: 12px;
+  font-weight: 600; font-size: 14px; color: var(--soft);
+}
+
+.ask {
+  width: 320px; flex: none;
+  display: flex; flex-direction: column;
+  background: var(--paper);
+  border-left: 1px solid var(--line);
+}
+.ask header {
+  display: flex; align-items: center; padding: 14px 14px 8px;
+}
+.ask header strong { font-size: 14px; }
+.ask header span { margin-left: 8px; color: var(--hush); font-size: 12.5px; }
+.ask .q {
+  margin: 8px 14px; padding: 12px 14px; border-radius: 14px;
+  background: var(--page); font-size: 14px;
+}
+.ask .a {
+  margin: 0 14px 14px; color: var(--soft); font-size: 14px; line-height: 1.5;
+}
+.ask form { margin-top: auto; padding: 12px; }
+.ask input {
+  width: 100%; height: 40px; padding: 0 12px; border-radius: 12px;
+  background: var(--page); font-size: 14px;
+}
+
+.hidden { display: none !important; }
+.note { font-size: 12px; color: #8A8498; margin-top: 14px; width: min(1180px, 100%); }
+.note code { font-size: 11.5px; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="stage-head">
+    <h1>Sotto · quiet page</h1>
+    <p>A mock of the everyday-user direction. Click the scenes.</p>
+    <div class="scenes" role="tablist" aria-label="Scene">
+      <button type="button" data-scene="home" aria-pressed="true">Home</button>
+      <button type="button" data-scene="live" aria-pressed="false">During a call</button>
+      <button type="button" data-scene="notes" aria-pressed="false">After</button>
+    </div>
+    <button class="theme" id="themeBtn" type="button">Dark</button>
+  </div>
+
+  <div class="window" id="window">
+    <div class="toolbar">
+      <button class="tool" type="button" title="Hide recents" aria-label="Hide recents">☰</button>
+      <input class="search" value="" placeholder="Search recents" aria-label="Search recents" readonly>
+      <span class="spacer"></span>
+      <button class="ask-btn" id="askToggle" type="button" aria-pressed="false">Ask</button>
+    </div>
+
+    <div class="capture hidden" id="capture">
+      <span class="dot" aria-hidden="true"></span>
+      <span class="now">Recording</span>
+      <span class="where">Zoom · this Mac’s microphone</span>
+      <span class="clock" id="clock">12:41</span>
+      <button class="stop" type="button">Stop</button>
+    </div>
+
+    <div class="body">
+      <nav class="rail" aria-label="Recents">
+        <div class="rail-label">Recents</div>
+        <button class="row" id="rowHome" type="button" aria-current="true">
+          <span class="mark"></span>
+          <span>
+            <span class="name" style="display:block">Home</span>
+            <span class="meta">Ready when you are</span>
+          </span>
+        </button>
+        <div class="day" id="dayNow">Now</div>
+        <button class="row live hidden" id="rowLive" type="button">
+          <span class="mark"></span>
+          <span>
+            <span class="name" style="display:block">Sprint planning</span>
+            <span class="meta">Recording now</span>
+          </span>
+        </button>
+        <div class="day">Today</div>
+        <button class="row" id="rowNotes" type="button">
+          <span class="mark"></span>
+          <span>
+            <span class="name" style="display:block">Sprint planning</span>
+            <span class="meta">34 min · this morning</span>
+          </span>
+        </button>
+        <div class="day">Yesterday</div>
+        <button class="row" type="button">
+          <span class="mark"></span>
+          <span>
+            <span class="name" style="display:block">Weekly standup</span>
+            <span class="meta">28 min</span>
+          </span>
+        </button>
+      </nav>
+
+      <div class="main">
+        <section class="col" id="home" aria-label="Home">
+          <div class="home">
+            <div class="home-inner">
+              <p class="kicker">On this Mac</p>
+              <h2>Ready when the call is.</h2>
+              <p class="lede">Pick the window. Sotto hears that call, writes it down here, and keeps it on this computer.</p>
+              <button class="primary" id="recordCall" type="button">Record a call</button>
+              <div class="quiet-actions">
+                <button class="quiet" type="button">Just this room</button>
+                <button class="quiet" type="button">Add a file</button>
+              </div>
+              <div class="prepare">
+                <input placeholder="Name this entry" aria-label="Name this entry">
+                <button type="button">Save for later</button>
+              </div>
+              <p class="stay">Audio never leaves this Mac. Notes only leave if you turn that on.</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="col hidden" id="transcript" aria-label="Conversation">
+          <div class="talk" id="talk">
+            <div class="turn">
+              <span class="when">02:14</span>
+              <div>
+                <div class="who them">Priya</div>
+                <p class="said">Carry-over first: the payments retry work slipped because staging was down for two days.</p>
+              </div>
+            </div>
+            <div class="turn">
+              <span class="when">05:31</span>
+              <div>
+                <div class="who them">Marcus</div>
+                <p class="said">Retries stay as cleanup. New scope goes to the rewrite or nowhere.</p>
+              </div>
+            </div>
+            <div class="turn">
+              <span class="when">12:41</span>
+              <div>
+                <div class="who them">Priya</div>
+                <p class="said">Then we’re agreed — the rewrite goes in behind a flag, and the flag waits on the capacity review.</p>
+              </div>
+            </div>
+            <div class="turn">
+              <span class="when">18:05</span>
+              <div>
+                <div class="who you">You</div>
+                <p class="said">The security review has to be booked this week or it blocks the flag anyway.</p>
+              </div>
+            </div>
+            <div class="turn" id="liveTurn">
+              <span class="when">22:47</span>
+              <div>
+                <div class="who them">Dana</div>
+                <p class="said live">I’ll own the retry rollout checklist and have it reviewed by…</p>
+              </div>
+            </div>
+            <button class="follow hidden" id="follow" type="button">Jump to live</button>
+          </div>
+        </section>
+
+        <section class="col hidden" id="notesLive" aria-label="Your notes">
+          <div class="sheet">
+            <div class="doc">
+              <header>
+                <h3>Your notes</h3>
+                <p>Jot during the call. A full write-up waits until you stop.</p>
+              </header>
+              <div class="sec">
+                <ul>
+                  <li>Retries are cleanup only — don’t let scope creep in.</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+          <form class="composer" autocomplete="off">
+            <input placeholder="Add a note" aria-label="Add a note">
+            <button class="add" type="submit">Add</button>
+          </form>
+        </section>
+
+        <section class="col hidden" id="notesReview" aria-label="Notes">
+          <div class="sheet">
+            <div class="doc">
+              <header>
+                <h3>Sprint planning</h3>
+                <p>This morning · 34 minutes · from the call</p>
+              </header>
+
+              <div class="sec">
+                <h4>What happened</h4>
+                <p>
+                  The search rewrite ships this sprint,
+                  <cite class="jump" data-peek="priya">behind a flag until capacity is clear</cite>.
+                  Retry work from last sprint continues as cleanup only.
+                </p>
+                <div class="peek hidden" id="peek">
+                  <div class="src">Priya · 12:41</div>
+                  Then we’re agreed — the rewrite goes in behind a flag, and the flag waits on the capacity review.
+                </div>
+              </div>
+
+              <div class="sec">
+                <h4>Decided</h4>
+                <ul>
+                  <li>Search rewrite lands this sprint, gated until the capacity review.</li>
+                  <li>Retry work continues as cleanup — no new scope.</li>
+                  <li>Capacity review happens before the flag flips, not after.</li>
+                </ul>
+              </div>
+
+              <div class="sec tasks">
+                <h4>To do</h4>
+                <ul>
+                  <li>
+                    <span class="check on" aria-hidden="true"></span>
+                    <span><i class="who-did">Dana</i> — retry rollout checklist, reviewed Thursday.</span>
+                  </li>
+                  <li>
+                    <span class="check" aria-hidden="true"></span>
+                    <span><i class="who-did">You</i> — book the security review this week.</span>
+                  </li>
+                  <li>
+                    <span class="check" aria-hidden="true"></span>
+                    <span><i class="who-did">Marcus</i> — capacity numbers before the flag flips.</span>
+                  </li>
+                </ul>
+              </div>
+
+              <div class="sec">
+                <h4>Still open</h4>
+                <ul>
+                  <li>Does the legacy exporter live one more quarter?</li>
+                </ul>
+              </div>
+
+              <div class="write">
+                <p>Written from the recording on this Mac.</p>
+                <button class="ghost" type="button">Write notes again</button>
+              </div>
+            </div>
+          </div>
+          <form class="composer" autocomplete="off">
+            <input placeholder="Add to these notes" aria-label="Add to these notes">
+            <button class="add" type="submit">Add</button>
+          </form>
+        </section>
+      </div>
+
+      <aside class="ask hidden" id="ask" aria-label="Ask">
+        <header>
+          <strong>Ask</strong>
+          <span>Across everything on this Mac</span>
+          <span class="spacer"></span>
+          <button class="tool" id="askClose" type="button" aria-label="Close Ask">✕</button>
+        </header>
+        <div class="q">What did we decide about the rewrite?</div>
+        <p class="a">Ship it this sprint, behind a flag, after Marcus brings capacity numbers. You still need to book the security review this week.</p>
+        <form autocomplete="off">
+          <input placeholder="Ask anything" aria-label="Ask anything" readonly>
+        </form>
+      </aside>
+    </div>
+  </div>
+
+  <p class="note">
+    Open this file in a browser. The product tokens live in
+    <code>crates/app/src/workspace/tokens.rs</code>; this mock is the proposed replacement,
+    not the shipping theme yet.
+  </p>
+</div>
+
+<script>
+var scene = "home";
+var $ = function (id) { return document.getElementById(id); };
+
+function setScene(next) {
+  scene = next;
+  document.querySelectorAll(".scenes button").forEach(function (b) {
+    b.setAttribute("aria-pressed", b.getAttribute("data-scene") === next);
+  });
+  $("home").classList.toggle("hidden", next !== "home");
+  $("transcript").classList.toggle("hidden", next === "home");
+  $("notesLive").classList.toggle("hidden", next !== "live");
+  $("notesReview").classList.toggle("hidden", next !== "notes");
+  $("capture").classList.toggle("hidden", next !== "live");
+  $("rowLive").classList.toggle("hidden", next !== "live");
+  $("dayNow").classList.toggle("hidden", next !== "live");
+  $("liveTurn").classList.toggle("hidden", next !== "live");
+  $("rowHome").setAttribute("aria-current", next === "home");
+  $("rowLive").setAttribute("aria-current", next === "live");
+  $("rowNotes").setAttribute("aria-current", next === "notes");
+}
+
+document.querySelectorAll(".scenes button").forEach(function (b) {
+  b.onclick = function () { setScene(b.getAttribute("data-scene")); };
+});
+$("rowHome").onclick = function () { setScene("home"); };
+$("rowLive").onclick = function () { setScene("live"); };
+$("rowNotes").onclick = function () { setScene("notes"); };
+$("recordCall").onclick = function () { setScene("live"); };
+
+$("askToggle").onclick = function () {
+  var open = $("ask").classList.contains("hidden");
+  $("ask").classList.toggle("hidden", !open);
+  this.setAttribute("aria-pressed", open);
+};
+$("askClose").onclick = function () {
+  $("ask").classList.add("hidden");
+  $("askToggle").setAttribute("aria-pressed", "false");
+};
+
+document.querySelector("cite.jump").onclick = function () {
+  $("peek").classList.toggle("hidden");
+};
+
+$("themeBtn").onclick = function () {
+  var dark = document.documentElement.getAttribute("data-theme") === "dark";
+  document.documentElement.setAttribute("data-theme", dark ? "light" : "dark");
+  this.textContent = dark ? "Dark" : "Light";
+};
+
+var sec = 12 * 60 + 41;
+setInterval(function () {
+  if (scene !== "live") return;
+  sec += 1;
+  var m = Math.floor(sec / 60), s = sec % 60;
+  $("clock").textContent = m + ":" + (s < 10 ? "0" : "") + s;
+}, 1000);
+</script>
+</body>
+</html>

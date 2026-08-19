@@ -19,14 +19,14 @@
 //! the whole summary.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     hash::{Hash as _, Hasher as _},
     time::Duration,
 };
 
 use gpui::{App, Context, ElementId, Entity, Rgba, WeakEntity, Window, div, prelude::*};
 use gpui_component::{
-    Disableable, Sizable as _,
+    Disableable, Selectable as _, Sizable as _,
     button::ButtonVariants as _,
     input::{Input, InputState},
     scroll::ScrollableElement,
@@ -39,7 +39,10 @@ use insight::{
 };
 #[cfg(test)]
 use insight::{RecordingNotes, RecordingNotesBlock, RecordingNotesSection};
-use providers::backend::ObservedRequestNormalization;
+use providers::{
+    CODEX_CLI_BACKEND_ID, OPENAI_RESPONSES_BACKEND_ID, ReasoningSurface,
+    backend::{ObservedRequestNormalization, SamplingControl},
+};
 use sotto_core::{EventId, EventPayload, MarkKind, TimelineEvent, replay_lenient};
 
 use crate::{
@@ -50,7 +53,8 @@ use crate::{
 use super::{
     Button, MeetingWorkspace,
     control_row::{ControlRole, ControlRow},
-    tokens::WorkspaceTokens,
+    motion,
+    tokens::{TypeScale, WorkspaceTokens},
 };
 
 /// Media time of each transcript row a claim may cite, used to label citation chips.
@@ -59,6 +63,15 @@ use super::{
 /// lives in the transcript column, so this column takes them as input rather than re-deriving them:
 /// see [`render_with_citation_times`].
 pub(crate) type CitationTimes = BTreeMap<EventId, Duration>;
+
+/// Provider picker state for the notes column head. Computed on the workspace entity
+/// before render so the column never re-reads that entity while GPUI is updating it.
+pub(crate) struct NotesProviderPicker {
+    pub ready: bool,
+    pub openai_ok: bool,
+    pub codex_ok: bool,
+    pub selected: Option<String>,
+}
 
 /// Renders the column with transcript moments available for citation and anchor labels.
 #[expect(
@@ -76,6 +89,7 @@ pub(crate) fn render_with_citation_times(
     servers: Vec<ConfiguredServer>,
     selected_grant: Option<SessionGrantView>,
     citation_times: &CitationTimes,
+    picker: NotesProviderPicker,
     cx: &mut Context<MeetingWorkspace>,
 ) -> gpui::AnyElement {
     let tokens = WorkspaceTokens::resolve(cx);
@@ -86,7 +100,7 @@ pub(crate) fn render_with_citation_times(
         .flex()
         .flex_col()
         .debug_selector(|| "notes-column".into())
-        .child(render_head(&summary, live, generation_running, cx))
+        .child(render_head(&summary, live, generation_running, picker, cx))
         .child(
             div()
                 .flex_1()
@@ -203,41 +217,78 @@ fn render_head(
     summary: &SummaryView,
     live: bool,
     generation_running: bool,
+    picker: NotesProviderPicker,
     cx: &mut Context<MeetingWorkspace>,
 ) -> gpui::AnyElement {
     let tokens = WorkspaceTokens::resolve(cx);
+    let notes_ready = picker.ready;
+    let selected = picker.selected;
+    let openai_ok = picker.openai_ok;
+    let codex_ok = picker.codex_ok;
+    let mut row = ControlRow::new()
+        .child(
+            ControlRole::Essential,
+            div().text_color(tokens.ink).child("Notes"),
+        )
+        .child(
+            ControlRole::Ellipsizing,
+            div()
+                .text_sm()
+                .text_color(tokens.faint)
+                .child(summary.meta.clone()),
+        );
+    if openai_ok {
+        let selected_openai = selected.as_deref() == Some(OPENAI_RESPONSES_BACKEND_ID);
+        row = row.child(
+            ControlRole::Essential,
+            Button::new("notes-provider-openai", tokens)
+                .label("OpenAI")
+                .small()
+                .selected(selected_openai)
+                .disabled(live || generation_running)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.select_provider(
+                        ReasoningSurface::Notes,
+                        Some(OPENAI_RESPONSES_BACKEND_ID),
+                        cx,
+                    );
+                })),
+        );
+    }
+    if codex_ok {
+        let selected_codex = selected.as_deref() == Some(CODEX_CLI_BACKEND_ID);
+        row = row.child(
+            ControlRole::Essential,
+            Button::new("notes-provider-codex", tokens)
+                .label("Codex")
+                .small()
+                .selected(selected_codex)
+                .disabled(live || generation_running)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.select_provider(ReasoningSurface::Notes, Some(CODEX_CLI_BACKEND_ID), cx);
+                })),
+        );
+    }
+    row = row.child(
+        ControlRole::Essential,
+        Button::new("summarize", tokens)
+            .label(if summary.sections.is_empty() {
+                "Write notes"
+            } else {
+                "Write notes again"
+            })
+            .small()
+            .disabled(live || generation_running || !notes_ready)
+            .debug_selector(|| "summarize-control".into())
+            .on_click(cx.listener(|this, _, _, cx| this.generate_notes(cx))),
+    );
     div()
         .px_4()
         .py_2()
         .border_b_1()
         .border_color(tokens.line_soft)
         .child(
-            ControlRow::new()
-                .child(
-                    ControlRole::Essential,
-                    div().text_color(tokens.ink).child("Notes"),
-                )
-                .child(
-                    ControlRole::Ellipsizing,
-                    div()
-                        .text_sm()
-                        .text_color(tokens.faint)
-                        .child(summary.meta.clone()),
-                )
-                .child(
-                    ControlRole::Essential,
-                    Button::new("summarize", tokens)
-                        .label(if summary.sections.is_empty() {
-                            "Summarize"
-                        } else {
-                            "Re-summarize"
-                        })
-                        .small()
-                        .disabled(live || generation_running)
-                        .debug_selector(|| "summarize-control".into())
-                        .on_click(cx.listener(|this, _, _, cx| this.generate_notes(cx))),
-                )
-                .finish()
+            row.finish()
                 .gap_2()
                 .debug_selector(|| "notes-head-row".into()),
         )
@@ -725,9 +776,7 @@ impl MeetingWorkspace {
                     self.message = None;
                 } else {
                     self.load_transcript(id);
-                    let enabled = self
-                        .reasoning_backend(cx)
-                        .is_ok_and(|backend| backend.is_some());
+                    let enabled = self.notes_ready(cx);
                     self.notes.update(cx, |notes, _| {
                         let _ = notes.select(id, enabled);
                     });
@@ -1203,14 +1252,16 @@ struct SummaryView {
     sections: Vec<SummarySection>,
     bundle: Option<mcp::ContextBundle>,
     screen_consultations: Vec<ScreenConsultation>,
+    /// True while a notes pass is in flight. Drives the indeterminate bar, not copy.
+    writing: bool,
 }
 
 impl SummaryView {
     fn resolve(state: NotesState, live: bool) -> Self {
         if live {
             return Self::pending(
-                "summary comes after you stop",
-                "The summary is written after you stop — from the retained recording, so it can cite every claim. Notes you type below are kept in the transcript at the moment you typed them.",
+                "Notes after you stop",
+                "Notes are written after you stop — from the recording, so every claim can point at a moment. Anything you type below is kept at the moment you typed it.",
             );
         }
         match state {
@@ -1219,19 +1270,23 @@ impl SummaryView {
                 "No recording is open. Start or import one, and the summary is written from its transcript after it stops.",
             ),
             NotesState::Disabled => Self::pending(
-                "not summarized yet",
-                "No summary yet. Summarizing reads the transcript and writes only the sections this recording supports — with a timecode on every claim. It needs a ready Summarizer backend in Settings.",
+                "no notes yet",
+                "No notes yet. Writing them reads the transcript and keeps only what this recording supports — with a moment on every claim. Add a writing source in Settings, then pick it here.",
             ),
-            NotesState::Generating => Self::pending(
-                "summarizing…",
-                "Summarizing — reading the transcript and writing only the sections it supports. The transcript stays readable while this runs.",
-            ),
+            NotesState::Generating => {
+                let mut view = Self::pending(
+                    "writing notes…",
+                    "Reading the transcript and writing only what it supports. You can still read while this runs.",
+                );
+                view.writing = true;
+                view
+            }
             NotesState::Failed(error) => {
                 let mut view = Self::pending(
-                    "not summarized",
-                    "The transcript is unchanged and still complete. Summarize again once the cause above is addressed.",
+                    "no notes",
+                    "The transcript is unchanged and still complete. Write notes again once the cause above is addressed.",
                 );
-                view.caution = Some(format!("Summarizing failed: {error}"));
+                view.caution = Some(format!("Writing notes failed: {error}"));
                 view
             }
             NotesState::Ready {
@@ -1247,9 +1302,9 @@ impl SummaryView {
                 *document,
                 bundle,
                 source_status,
-                ready_origin(cached),
-                model,
-                normalization_line(&normalizations),
+                format!("{} · {model}", ready_origin(cached)),
+                None,
+                &normalizations,
                 screen_consultations,
             ),
             NotesState::Stale {
@@ -1264,17 +1319,12 @@ impl SummaryView {
                 *document,
                 bundle,
                 source_status,
-                "Saved summary",
-                model,
+                format!("Saved notes · {model}"),
                 Some(
-                    std::iter::once(
-                        "This summary predates your latest typed note. Re-summarize when you want it to account for that note."
-                            .to_owned(),
-                    )
-                    .chain(normalization_line(&normalizations))
-                    .collect::<Vec<_>>()
-                    .join(" "),
+                    "This write-up is from before your latest typed note. Write notes again when you want it to include that note."
+                        .to_owned(),
                 ),
+                &normalizations,
                 screen_consultations,
             ),
         }
@@ -1289,6 +1339,7 @@ impl SummaryView {
             sections: Vec::new(),
             bundle: None,
             screen_consultations: Vec::new(),
+            writing: false,
         }
     }
 
@@ -1296,12 +1347,16 @@ impl SummaryView {
         document: PresentedNotesDocument,
         bundle: mcp::ContextBundle,
         source_status: SourceStatus,
-        origin: &str,
-        model: String,
+        heading: String,
         caution: Option<String>,
+        normalizations: &[ObservedRequestNormalization],
         screen_consultations: Vec<ScreenConsultation>,
     ) -> Self {
         let sections = document_sections(document);
+        let provenance = std::iter::once(heading)
+            .chain(source_line(source_status).map(ToOwned::to_owned))
+            .chain(normalization_line(normalizations))
+            .collect();
         // A summary with no section at all is not a summary; say so rather than drawing a heading
         // count of zero over an empty column.
         if sections.is_empty() {
@@ -1309,52 +1364,89 @@ impl SummaryView {
                 "no sections supported",
                 "The transcript did not support a single section. Nothing was written rather than something unevidenced.",
             );
-            view.provenance = vec![format!("{origin} · {model}")];
+            view.provenance = provenance;
             view.caution = caution;
             view.screen_consultations = screen_consultations;
             return view;
         }
         Self {
             meta: sections_meta(sections.len()),
-            provenance: std::iter::once(format!("{origin} · {model}"))
-                .chain(source_line(source_status).map(ToOwned::to_owned))
-                .collect(),
+            provenance,
             caution,
             pending: None,
             sections,
             bundle: Some(bundle),
             screen_consultations,
+            writing: false,
         }
     }
 }
 
 fn sections_meta(count: usize) -> String {
     if count == 1 {
-        "1 section · every claim cited".to_owned()
+        "1 section".to_owned()
     } else {
-        format!("{count} sections · every claim cited")
+        format!("{count} sections")
     }
 }
 
 const fn ready_origin(cached: bool) -> &'static str {
     if cached {
-        "Saved summary"
+        "Saved notes"
     } else {
-        "Summarized just now"
+        "Written just now"
     }
 }
 
 /// Names each unsupported control once even when a multi-dispatch notes run observed the same
 /// normalization during more than one map/reduce request.
-fn normalization_line(normalizations: &[ObservedRequestNormalization]) -> Option<String> {
-    let controls = normalizations
-        .iter()
-        .map(|item| item.normalization.control.to_string())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>()
-        .join(", ");
-    (!controls.is_empty()).then(|| format!("This backend could not apply: {controls}."))
+///
+/// This is provenance, not a failure. Codex has none of these knobs by design; Insight still
+/// parses the reply and rejects uncited claims. Putting the same sentence in the warning wash
+/// made a successful summary look like it had failed.
+pub(super) fn normalization_line(
+    normalizations: &[ObservedRequestNormalization],
+) -> Option<String> {
+    let names = lost_control_names(normalizations);
+    (!names.is_empty()).then(|| {
+        format!(
+            "This backend cannot set {}. The summary was still written from the reply.",
+            join_control_names(&names)
+        )
+    })
+}
+
+fn lost_control_names(normalizations: &[ObservedRequestNormalization]) -> Vec<&'static str> {
+    let mut json_object = false;
+    let mut max_tokens = false;
+    let mut temperature = false;
+    for item in normalizations {
+        match item.normalization.control {
+            SamplingControl::JsonObjectOutput => json_object = true,
+            SamplingControl::MaxTokens => max_tokens = true,
+            SamplingControl::Temperature => temperature = true,
+        }
+    }
+    let mut names = Vec::new();
+    if json_object {
+        names.push("JSON mode");
+    }
+    if max_tokens {
+        names.push("a token cap");
+    }
+    if temperature {
+        names.push("temperature");
+    }
+    names
+}
+
+fn join_control_names(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [first, second] => format!("{first} or {second}"),
+        [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
+    }
 }
 
 /// Sources are worth a line only when they changed the answer, or when they were meant to and
@@ -1499,6 +1591,7 @@ impl RenderOnce for SummaryBody {
             tokens,
         };
         let mut ordinal = 0_usize;
+        let writing = summary.writing;
         div()
             .debug_selector(|| "summary-area".into())
             .children(summary.caution.map(|caution| {
@@ -1522,12 +1615,17 @@ impl RenderOnce for SummaryBody {
                     .mt_2()
                     .p_3()
                     .rounded_lg()
-                    .border_1()
-                    .border_color(tokens.line)
                     .text_sm()
                     .text_color(tokens.muted)
                     .debug_selector(|| "summary-pending".into())
                     .child(pending)
+                    .when(writing, |view| {
+                        view.child(
+                            div()
+                                .mt_3()
+                                .child(motion::writing_progress("notes-writing", tokens)),
+                        )
+                    })
             }))
             .children((!screen_consultations.is_empty()).then(|| {
                 render_screen_receipt(
@@ -1632,24 +1730,23 @@ fn render_section(
     div()
         .mt_3()
         .child(
-            div()
-                .pb_1()
-                .mb_2()
-                .border_b_1()
-                .border_color(tokens.line_soft)
-                .child(
-                    ControlRow::new()
-                        .child(
-                            ControlRole::Ellipsizing,
-                            div().text_color(tokens.ink).child(section.heading),
-                        )
-                        .child(
-                            ControlRole::Essential,
-                            div().text_sm().text_color(tokens.faint).child(count),
-                        )
-                        .finish()
-                        .gap_2(),
-                ),
+            div().pb_1().mb_2().child(
+                ControlRow::new()
+                    .child(
+                        ControlRole::Ellipsizing,
+                        div()
+                            .font_family(TypeScale::READING)
+                            .text_size(TypeScale::TITLE)
+                            .text_color(tokens.ink)
+                            .child(section.heading),
+                    )
+                    .child(
+                        ControlRole::Essential,
+                        div().text_sm().text_color(tokens.faint).child(count),
+                    )
+                    .finish()
+                    .gap_2(),
+            ),
         )
         .children(section.claims.into_iter().map(|claim| {
             let index = *ordinal;
@@ -2090,12 +2187,12 @@ mod tests {
         assert_eq!(sections.len(), 7, "seven supported sections render seven");
         assert_eq!(
             sections_meta(sections.len()),
-            "7 sections · every claim cited",
+            "7 sections",
             "the meta line counts what was rendered"
         );
         assert_eq!(
             sections_meta(1),
-            "1 section · every claim cited",
+            "1 section",
             "a single section is not reported in the plural"
         );
     }
@@ -2280,16 +2377,16 @@ mod tests {
     fn the_pending_state_says_what_summarizing_will_do() {
         let view = SummaryView::resolve(NotesState::Disabled, false);
 
-        assert_eq!(view.meta, "not summarized yet", "the head states the state");
+        assert_eq!(view.meta, "no notes yet", "the head states the state");
         let pending = view
             .pending
             .unwrap_or_else(|| "no pending copy was produced".to_owned());
         assert!(
-            pending.contains("only the sections this recording supports"),
+            pending.contains("only what this recording supports"),
             "the pending state explains adaptivity: {pending}"
         );
         assert!(
-            pending.contains("timecode on every claim"),
+            pending.contains("moment on every claim"),
             "the pending state promises citations: {pending}"
         );
         assert!(
@@ -2302,10 +2399,7 @@ mod tests {
     fn a_live_recording_is_told_the_summary_comes_after_it_stops() {
         let view = SummaryView::resolve(NotesState::NoMeeting, true);
 
-        assert_eq!(
-            view.meta, "summary comes after you stop",
-            "the head is live"
-        );
+        assert_eq!(view.meta, "Notes after you stop", "the head is live");
         assert!(
             view.pending
                 .unwrap_or_default()
@@ -2358,7 +2452,7 @@ mod tests {
 
         assert_eq!(view.sections.len(), 1, "a stale summary is still readable");
         assert!(
-            view.caution.unwrap_or_default().contains("predates"),
+            view.caution.unwrap_or_default().contains("from before"),
             "a stale summary must say why it is stale"
         );
         assert!(
@@ -2397,7 +2491,7 @@ mod tests {
         assert_eq!(
             view.provenance,
             vec![
-                "Summarized just now · gpt-5.4-codex".to_owned(),
+                "Written just now · gpt-5.4-codex".to_owned(),
                 "Sources: unavailable; the summary fell back to this recording alone.".to_owned(),
             ],
             "the column states who wrote the summary and on what footing"
@@ -2435,15 +2529,23 @@ mod tests {
                     observation(1, SamplingControl::Temperature),
                     observation(2, SamplingControl::MaxTokens),
                     observation(3, SamplingControl::Temperature),
+                    observation(4, SamplingControl::JsonObjectOutput),
                 ],
             },
             false,
         );
 
         assert_eq!(
-            view.caution,
-            Some("This backend could not apply: max_tokens, temperature.".to_owned()),
-            "map/reduce dispatches must not repeat the same lost control in the warning"
+            view.caution, None,
+            "a successful downgrade is not a failure"
+        );
+        assert!(
+            view.provenance.iter().any(|line| {
+                line.contains("JSON mode, a token cap, or temperature")
+                    && line.contains("still written from the reply")
+            }),
+            "map/reduce dispatches must not repeat the same lost control: {:?}",
+            view.provenance
         );
         Ok(())
     }
@@ -2482,7 +2584,7 @@ mod tests {
     fn empty_notes_copy_is_honest() {
         let view = SummaryView::resolve(NotesState::Disabled, false);
         assert!(
-            view.pending.unwrap_or_default().contains("No summary yet"),
+            view.pending.unwrap_or_default().contains("No notes yet"),
             "the empty state must not imply a summary exists"
         );
     }

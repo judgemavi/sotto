@@ -4,7 +4,7 @@ use gpui::{App, AppContext, Entity, Timer};
 use sotto_core::TimelineEvent;
 use tokio::sync::mpsc;
 
-/// GPUI-owned append-only projection shared by the dev list and T016's board.
+/// GPUI-owned append-only projection of the session timeline.
 #[derive(Debug, Default)]
 pub struct TimelineState {
     events: Vec<TimelineEvent>,

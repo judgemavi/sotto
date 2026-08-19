@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use crate::context::{
     ReasoningContextError, ScreenConsultation, ScreenConsultationLog, ScreenInspectionBudget,
-    complete_with_optional_inspection_cancellable, render_transcript,
+    complete_with_optional_inspection_cancellable, parse_first_json_value, render_transcript,
 };
 
 const SYSTEM: &str = r#"You answer questions using only the supplied transcript.
@@ -211,7 +211,7 @@ impl AskEngine {
                 let _ = sender.send(output.clone());
             }
         }
-        let wire: WireReply = serde_json::from_str(strip_fence(&output))?;
+        let wire: WireReply = serde_json::from_value(parse_first_json_value(&output)?)?;
         let allowed = std::collections::BTreeMap::from([(session_id, final_event_ids(events))]);
         let reply = validate_reply(&allowed, wire)?;
         Ok(AskResult {
@@ -328,7 +328,7 @@ impl AskEngine {
                 let _ = sender.send(output.clone());
             }
         }
-        let wire: WireReply = serde_json::from_str(strip_fence(&output))?;
+        let wire: WireReply = serde_json::from_value(parse_first_json_value(&output)?)?;
         let mut allowed = std::collections::BTreeMap::new();
         for item in bounded {
             allowed
@@ -491,15 +491,6 @@ fn final_event_ids(events: &[TimelineEvent]) -> std::collections::BTreeSet<Event
         .collect()
 }
 
-fn strip_fence(value: &str) -> &str {
-    let value = value.trim();
-    value
-        .strip_prefix("```json")
-        .or_else(|| value.strip_prefix("```"))
-        .and_then(|value| value.strip_suffix("```"))
-        .map_or(value, str::trim)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -511,7 +502,7 @@ mod tests {
     use futures_util::stream;
     use providers::{
         AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendId, ReasoningProvider,
-        Registry, Role,
+        ReasoningSurface, Registry,
     };
     use screen::{
         InspectScreenRequest, ScreenInspection, ScreenInspectionSource, ScreenUnavailableReason,
@@ -955,9 +946,9 @@ mod tests {
         )?;
         let id = descriptor.id().clone();
         registry.register_reasoning(descriptor, Arc::new(RefusalProvider))?;
-        registry.select(Role::Summarizer, Some(&id))?;
+        registry.select(ReasoningSurface::Ask, Some(&id))?;
         let resolved = registry
-            .resolve(Role::Summarizer)?
+            .resolve(ReasoningSurface::Ask)?
             .ok_or("Ask backend must resolve")?;
         let engine = AskEngine::new(resolved.provider());
         let result = engine

@@ -166,6 +166,80 @@ pub(super) struct RecordingNotesDraft {
     sections: Vec<RecordingNotesDraftSection>,
 }
 
+impl DraftBlock {
+    fn retain_supported(
+        self,
+        meeting_ids: &HashSet<EventId>,
+        external_ids: &HashSet<EvidenceId>,
+    ) -> Option<Self> {
+        if self.has_unsupported_citation(meeting_ids, external_ids) {
+            return None;
+        }
+        let keep = match &self {
+            Self::Claim {
+                meeting_citations,
+                external_citations,
+                ..
+            } => !meeting_citations.is_empty() || !external_citations.is_empty(),
+            Self::Action {
+                meeting_citations,
+                external_citations,
+                owner,
+                owner_meeting_citations,
+                owner_external_citations,
+                due_date,
+                due_date_meeting_citations,
+                due_date_external_citations,
+                ..
+            } => {
+                let owner_unevidenced = owner.is_some()
+                    && owner_meeting_citations.is_empty()
+                    && owner_external_citations.is_empty();
+                let due_unevidenced = due_date.is_some()
+                    && due_date_meeting_citations.is_empty()
+                    && due_date_external_citations.is_empty();
+                !owner_unevidenced
+                    && !due_unevidenced
+                    && (!meeting_citations.is_empty() || !external_citations.is_empty())
+            }
+        };
+        keep.then_some(self)
+    }
+
+    fn has_unsupported_citation(
+        &self,
+        meeting_ids: &HashSet<EventId>,
+        external_ids: &HashSet<EvidenceId>,
+    ) -> bool {
+        let unsupported_meeting = |ids: &[EventId]| ids.iter().any(|id| !meeting_ids.contains(id));
+        let unsupported_external =
+            |ids: &[EvidenceId]| ids.iter().any(|id| !external_ids.contains(id));
+        match self {
+            Self::Claim {
+                meeting_citations,
+                external_citations,
+                ..
+            } => unsupported_meeting(meeting_citations) || unsupported_external(external_citations),
+            Self::Action {
+                meeting_citations,
+                external_citations,
+                owner_meeting_citations,
+                owner_external_citations,
+                due_date_meeting_citations,
+                due_date_external_citations,
+                ..
+            } => {
+                unsupported_meeting(meeting_citations)
+                    || unsupported_external(external_citations)
+                    || unsupported_meeting(owner_meeting_citations)
+                    || unsupported_external(owner_external_citations)
+                    || unsupported_meeting(due_date_meeting_citations)
+                    || unsupported_external(due_date_external_citations)
+            }
+        }
+    }
+}
+
 impl From<&RecordingNotes> for RecordingNotesDraft {
     fn from(notes: &RecordingNotes) -> Self {
         Self {
@@ -219,6 +293,54 @@ impl From<&RecordingNotes> for RecordingNotesDraft {
 }
 
 impl RecordingNotesDraft {
+    /// Drops blocks that cite evidence this draft was not given, instead of failing the recording.
+    ///
+    /// A model routinely invents a nearby event id, especially across map/reduce windows. One
+    /// unknown citation in `risks` used to fail the whole summary. A tainted block is omitted
+    /// entirely — citations are not stripped in place, which would launder an unresolvable id
+    /// behind a remaining valid one. Owner and due-date claims with no supporting citations drop
+    /// with their action. What remains is still fully evidenced.
+    pub(super) fn retain_supported(
+        mut self,
+        meeting_ids: &HashSet<EventId>,
+        external_ids: &HashSet<EvidenceId>,
+    ) -> Self {
+        self.sections = self
+            .sections
+            .into_iter()
+            .filter_map(|section| {
+                let blocks = section
+                    .blocks
+                    .into_iter()
+                    .filter_map(|block| block.retain_supported(meeting_ids, external_ids))
+                    .collect::<Vec<_>>();
+                (!blocks.is_empty()).then_some(RecordingNotesDraftSection {
+                    kind: section.kind,
+                    blocks,
+                })
+            })
+            .collect();
+        self
+    }
+
+    /// Rebuilds a draft from already-validated window partials when reduce invents citations.
+    pub(super) fn merge_finalized(partials: &[RecordingNotes]) -> Self {
+        let mut sections: Vec<RecordingNotesDraftSection> = Vec::new();
+        for partial in partials {
+            for section in RecordingNotesDraft::from(partial).sections {
+                if let Some(existing) = sections
+                    .iter_mut()
+                    .find(|candidate| candidate.kind == section.kind)
+                {
+                    existing.blocks.extend(section.blocks);
+                } else {
+                    sections.push(section);
+                }
+            }
+        }
+        Self { sections }
+    }
+
     pub(super) fn finalize(self, session_id: SessionId) -> RecordingNotes {
         RecordingNotes {
             sections: self

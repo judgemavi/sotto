@@ -17,7 +17,11 @@ pub(super) const SETTINGS_FILE_NAME: &str = "reasoning-settings.json";
 pub(super) struct PersistedSettings {
     pub version: u32,
     pub backends: PersistedBackends,
-    pub roles: PersistedRoles,
+    #[serde(default)]
+    pub surfaces: PersistedSurfaces,
+    /// Pre-v2 per-role ids. Read for migration, never written.
+    #[serde(default, skip_serializing)]
+    pub roles: Option<PersistedRoles>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -34,10 +38,32 @@ fn default_codex_model_id() -> String {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct PersistedSurfaces {
+    pub notes: Option<String>,
+    pub ask: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct PersistedRoles {
     pub watcher: Option<String>,
     pub suggester: Option<String>,
     pub summarizer: Option<String>,
+}
+
+impl PersistedSettings {
+    pub(super) fn migrate(mut self) -> Self {
+        if self.surfaces.notes.is_none()
+            && self.surfaces.ask.is_none()
+            && let Some(roles) = self.roles.as_ref()
+        {
+            let inherited = roles.summarizer.clone();
+            self.surfaces.notes = inherited.clone();
+            self.surfaces.ask = inherited;
+        }
+        self.roles = None;
+        self.version = super::SETTINGS_VERSION;
+        self
+    }
 }
 
 pub(super) fn application_support_path() -> Result<PathBuf, ReasoningError> {

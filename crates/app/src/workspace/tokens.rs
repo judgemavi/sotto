@@ -1,17 +1,14 @@
-//! Theme-resolved workspace design tokens ported from the normative HTML mock.
+//! Theme-resolved workspace design tokens for the quiet-page visual system.
 //!
-//! Every value below is defined in *both* branches of [`WorkspaceTokens::resolve`], so no colour
-//! exists in only one theme. The field names follow `docs/design/workspace-v2-mock.html`'s `:root`
-//! custom properties, with two carry-overs the mock dropped but the columns still use:
+//! `docs/design/workspace-v4-mock.html` is the direction: a readable notebook for everyday use,
+//! not an engineering console. Field names still follow the older mocks so existing callers keep
+//! compiling; the hex values moved together in both appearances so one theme cannot paint the
+//! other's ink.
 //!
-//! - `surface_2` is the mock's `--hover`: the raised/hovered variant of `surface`.
-//! - `ink_2` has no mock equivalent and stays as the mid-weight body ink.
-//! - `accent_on` and `live_on` are the inks that sit *on* those fills. The mock never needs them
-//!   because CSS inherits a readable colour; GPUI does not, so a filled control must be told.
-//!
-//! Repointed to the mock's neutral-grey and indigo palette on 2026-08-14, replacing the earlier
-//! teal scheme. Both branches moved together: a palette changed in one theme only is how a
-//! product ends up rendering one theme's text on the other theme's ground.
+//! - `surface_2` is the raised/hovered variant of `surface`.
+//! - `ink_2` is the mid-weight body ink.
+//! - `accent_on` and `live_on` are the inks that sit *on* those fills. CSS would inherit; GPUI
+//!   must be told.
 
 use std::rc::Rc;
 
@@ -42,6 +39,15 @@ pub(crate) fn install_component_focus_ring(cx: &mut App) {
     } else {
         rgb(0x000000).into()
     };
+}
+
+/// Overlay scrollbars stay visible so a long transcript or notes column can be judged at a glance.
+///
+/// `gpui_component::init` copies macOS "Show scroll bars: When scrolling", which fades the thumb
+/// after idle. That hides how much of the recording is off-screen. Appearance changes do not
+/// reset this; call it after init and after any `Theme::change` that might rebuild the global.
+pub(crate) fn install_visible_scrollbars(cx: &mut App) {
+    Theme::global_mut(cx).scrollbar_show = gpui_component::scroll::ScrollbarShow::Always;
 }
 
 /// Non-tab-stop focus origin which lets the first Tab enter `gpui-component::Root`'s key context.
@@ -118,57 +124,57 @@ impl WorkspaceTokens {
     pub(crate) fn resolve(cx: &App) -> Self {
         if cx.theme().is_dark() {
             Self {
-                ground: rgb(0x101014),
-                surface: rgb(0x17171c),
-                surface_2: rgb(0x1d1d24),
-                sunken: rgb(0x0b0b0e),
-                line: rgb(0x2a2a33),
-                line_soft: rgb(0x222229),
-                ink: rgb(0xececf1),
-                ink_2: rgb(0xc6c6d0),
-                muted: rgb(0x9494a1),
-                faint: rgb(0x62626e),
+                ground: rgb(0x16141c),
+                surface: rgb(0x1e1b26),
+                surface_2: rgb(0x252230),
+                sunken: rgb(0x121018),
+                line: rgb(0x2f2b3a),
+                line_soft: rgb(0x272430),
+                ink: rgb(0xf4f1f8),
+                ink_2: rgb(0xcfc8dc),
+                muted: rgb(0xb7b1c4),
+                faint: rgb(0x8a8498),
                 focus: rgb(0xffffff),
-                accent: rgb(0x8a8fff),
-                accent_ink: rgb(0xa5a8ff),
-                accent_on: rgb(0x0f0f1a),
-                accent_wash: rgb(0x1e1e38),
-                accent_line: rgb(0x3c3d78),
-                live: rgb(0xf2685c),
-                live_ink: rgb(0xf8837a),
+                accent: rgb(0xc8b6ee),
+                accent_ink: rgb(0xd4c6f4),
+                accent_on: rgb(0x1c1924),
+                accent_wash: rgb(0x2a2438),
+                accent_line: rgb(0x4a3f68),
+                live: rgb(0xf07a70),
+                live_ink: rgb(0xf49a93),
                 live_on: rgb(0x2a0f0c),
-                live_wash: rgb(0x351d1b),
+                live_wash: rgb(0x3a2220),
                 live_line: rgb(0x63302a),
-                warn: rgb(0xd9a24a),
-                warn_wash: rgb(0x2e2617),
+                warn: rgb(0xe0b07a),
+                warn_wash: rgb(0x32261a),
                 scrim: rgba(0x00000099),
             }
         } else {
             Self {
-                ground: rgb(0xf4f4f6),
-                surface: rgb(0xffffff),
-                surface_2: rgb(0xf0f0f3),
-                sunken: rgb(0xececef),
-                line: rgb(0xe0e0e6),
-                line_soft: rgb(0xebebf0),
-                ink: rgb(0x1a1a1f),
-                ink_2: rgb(0x3c3c45),
-                muted: rgb(0x62626d),
-                faint: rgb(0x9a9aa5),
+                ground: rgb(0xf3f2f7),
+                surface: rgb(0xfffdff),
+                surface_2: rgb(0xf7f6fb),
+                sunken: rgb(0xeeeaf4),
+                line: rgb(0xe4e1eb),
+                line_soft: rgb(0xeceaf1),
+                ink: rgb(0x1c1924),
+                ink_2: rgb(0x3d3848),
+                muted: rgb(0x5f5a6a),
+                faint: rgb(0x8b8696),
                 focus: rgb(0x000000),
-                accent: rgb(0x5558d9),
-                accent_ink: rgb(0x4649c9),
+                accent: rgb(0x5a4588),
+                accent_ink: rgb(0x4b3874),
                 accent_on: rgb(0xffffff),
-                accent_wash: rgb(0xececfd),
-                accent_line: rgb(0xc9caf5),
-                live: rgb(0xdc4a3f),
-                live_ink: rgb(0xc23d33),
+                accent_wash: rgb(0xede8f6),
+                accent_line: rgb(0xd4cce8),
+                live: rgb(0xc94b40),
+                live_ink: rgb(0xb43e35),
                 live_on: rgb(0xffffff),
-                live_wash: rgb(0xfdecea),
-                live_line: rgb(0xf2c4bf),
-                warn: rgb(0x966410),
-                warn_wash: rgb(0xf7eeda),
-                scrim: rgba(0x14141a73),
+                live_wash: rgb(0xfbedec),
+                live_line: rgb(0xf0c7c3),
+                warn: rgb(0x8a5a28),
+                warn_wash: rgb(0xf7eedf),
+                scrim: rgba(0x1c19245c),
             }
         }
     }
@@ -178,15 +184,20 @@ pub(crate) struct TypeScale;
 
 impl TypeScale {
     /// Eyebrows, chips, timecodes and other measured metadata.
-    pub(crate) const META: Pixels = px(10.5);
+    pub(crate) const META: Pixels = px(12.0);
     /// Scope chips and the capture bar's recording kind.
-    pub(crate) const CHIP: Pixels = px(11.0);
-    /// Buttons and tab labels.
-    pub(crate) const CONTROL: Pixels = px(12.5);
-    pub(crate) const BODY: Pixels = px(13.0);
+    pub(crate) const CHIP: Pixels = px(12.5);
+    /// Buttons, Ask copy, and other chrome that should share one size.
+    pub(crate) const CONTROL: Pixels = px(14.0);
+    pub(crate) const BODY: Pixels = px(15.0);
+    /// Home lede and the primary Record a call label.
+    pub(crate) const LEDE: Pixels = px(16.0);
     /// The open session's title in the view bar.
-    pub(crate) const TITLE: Pixels = px(14.0);
-    pub(crate) const CLOCK: Pixels = px(17.0);
+    pub(crate) const TITLE: Pixels = px(17.0);
+    pub(crate) const CLOCK: Pixels = px(22.0);
+    /// Home headline. macOS ships New York; elsewhere GPUI falls back.
+    pub(crate) const DISPLAY: Pixels = px(34.0);
+    pub(crate) const READING: &'static str = "New York";
 }
 
 pub(crate) struct Space;
@@ -258,6 +269,33 @@ mod tests {
             assert_eq!(Theme::global(cx).colors.ring, gpui::rgb(0xffffff).into());
             Theme::change(ThemeMode::Light, None, cx);
             assert_eq!(Theme::global(cx).colors.ring, gpui::rgb(0x000000).into());
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn scrollbars_stay_visible_across_appearance_changes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let cx = TestAppContext::single();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            super::install_visible_scrollbars(cx);
+            assert_eq!(
+                Theme::global(cx).scrollbar_show,
+                gpui_component::scroll::ScrollbarShow::Always
+            );
+            Theme::change(ThemeMode::Dark, None, cx);
+            super::install_visible_scrollbars(cx);
+            assert_eq!(
+                Theme::global(cx).scrollbar_show,
+                gpui_component::scroll::ScrollbarShow::Always
+            );
+            Theme::change(ThemeMode::Light, None, cx);
+            super::install_visible_scrollbars(cx);
+            assert_eq!(
+                Theme::global(cx).scrollbar_show,
+                gpui_component::scroll::ScrollbarShow::Always
+            );
         });
         Ok(())
     }

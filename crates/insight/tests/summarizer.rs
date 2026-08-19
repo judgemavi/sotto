@@ -328,6 +328,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trailing_characters_after_valid_recap_json_do_not_fail_the_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = persisted_store().await?;
+        let provider = Arc::new(QueueProvider {
+            outputs: Mutex::new(VecDeque::from([format!(
+                "{RECAP} leftover commentary from an unconstrained backend"
+            )])),
+            inputs: Arc::new(Mutex::new(Vec::new())),
+        });
+        let report = Summarizer::new(&store, provider)
+            .summarize(SessionId::new(7))
+            .await?;
+        assert_eq!(report.recap.topics[0].text, "pricing");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn two_hour_timeline_is_mapped_in_bounded_windows_then_reduced()
     -> Result<(), Box<dyn std::error::Error>> {
         let store = rag::Store::open_in_memory().await?;

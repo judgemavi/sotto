@@ -20,23 +20,26 @@
 use std::{collections::BTreeSet, sync::mpsc};
 
 use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, Window, div,
-    prelude::*,
+    Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, Render, Window,
+    div, prelude::*, px,
 };
 use gpui_component::{
     Disableable, Selectable as _, Sizable as _,
     button::ButtonVariants as _,
     dock::{Panel, PanelEvent},
     input::{Input, InputEvent, InputState},
+    scroll::ScrollableElement,
 };
 use insight::{AskCitation, AskEngine, AskEvidence, AskReply, AskResult, AskTurn};
+use providers::{CODEX_CLI_BACKEND_ID, OPENAI_RESPONSES_BACKEND_ID, ReasoningSurface};
 use rag::{DocumentKind, SearchFilter};
 use sotto_core::{CancellationToken, EventId, SessionId};
 
 use super::{
     Button, MeetingWorkspace,
     control_row::{ControlRole, ControlRow},
-    tokens::{Space, WorkspaceTokens},
+    motion, notes,
+    tokens::{Space, TypeScale, WorkspaceTokens},
     transcript,
 };
 use crate::reasoning::inspection::{ScreenInspectorAssembly, product_screen_inspectors};
@@ -71,6 +74,9 @@ pub(super) struct AskPanel {
     /// The open recording and its name, live or stopped. `None` on Home.
     scope: Option<(Vec<SessionId>, String)>,
     backend_ready: bool,
+    openai_ok: bool,
+    codex_ok: bool,
+    selected_provider: Option<String>,
     chosen: AskScope,
     previous_non_selection: AskScope,
     selection: Option<AskSelection>,
@@ -80,6 +86,7 @@ pub(super) struct AskPanel {
     progress: Option<String>,
     turns: Vec<AskTurn>,
     message: Option<String>,
+    notice: Option<String>,
     revealed_receipts: BTreeSet<usize>,
 }
 
@@ -90,6 +97,7 @@ pub(super) enum AskPanelEvent {
     Citation(AskCitation),
     SelectScope(AskScope),
     ClearSelection,
+    SelectProvider(Option<&'static str>),
 }
 
 pub(super) struct PendingAsk {
@@ -119,6 +127,9 @@ impl AskPanel {
             input,
             scope: None,
             backend_ready: false,
+            openai_ok: false,
+            codex_ok: false,
+            selected_provider: None,
             chosen: AskScope::default(),
             previous_non_selection: AskScope::default(),
             selection: None,
@@ -127,6 +138,7 @@ impl AskPanel {
             progress: None,
             turns: Vec::new(),
             message: None,
+            notice: None,
             revealed_receipts: BTreeSet::new(),
         }
     }
@@ -187,11 +199,23 @@ impl AskPanel {
             self.turns.clear();
             self.revealed_receipts.clear();
             self.message = None;
+            self.notice = None;
             self.progress = None;
         }
         self.scope = scope;
         self.backend_ready = ready;
         self.live = live;
+    }
+
+    pub(super) fn set_providers(
+        &mut self,
+        openai_ok: bool,
+        codex_ok: bool,
+        selected_provider: Option<String>,
+    ) {
+        self.openai_ok = openai_ok;
+        self.codex_ok = codex_ok;
+        self.selected_provider = selected_provider;
     }
 
     pub(super) fn set_selection(&mut self, selection: Option<AskSelection>) {
@@ -202,6 +226,7 @@ impl AskPanel {
         self.turns.clear();
         self.revealed_receipts.clear();
         self.message = None;
+        self.notice = None;
         self.progress = None;
         if self.selection.is_none() && self.chosen == AskScope::Selection {
             self.chosen = self.previous_non_selection;
@@ -236,6 +261,7 @@ impl AskPanel {
         self.running = true;
         self.progress = Some("Receiving a grounded answer…".to_owned());
         self.message = None;
+        self.notice = None;
     }
 
     pub(super) fn progress(&mut self, bytes: usize) {
@@ -254,17 +280,13 @@ impl AskPanel {
                     reply: result.reply,
                     screen_consultations: result.screen_consultations,
                 });
-                self.message = (!result.normalizations.is_empty()).then(|| {
-                    let controls = result
-                        .normalizations
-                        .iter()
-                        .map(|item| item.normalization.control.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("This backend could not apply: {controls}.")
-                });
+                self.notice = notes::normalization_line(&result.normalizations);
+                self.message = None;
             }
-            Err(error) => self.message = Some(error),
+            Err(error) => {
+                self.notice = None;
+                self.message = Some(error);
+            }
         }
     }
 
@@ -297,6 +319,7 @@ impl AskPanel {
         self.turns.clear();
         self.revealed_receipts.clear();
         self.message = None;
+        self.notice = None;
         self.progress = None;
     }
 }
@@ -315,18 +338,52 @@ impl Render for AskPanel {
             None
         } else {
             Some(
-                "Ask is unavailable until a ready reasoning backend is enabled. The record remains usable.",
+                "Ask is unavailable until you add a provider in Settings and pick it here. The record remains usable.",
             )
         };
-        let mut ask_form = ControlRow::new()
+        let mut ask_form = ControlRow::new();
+        if self.openai_ok {
+            let selected = self.selected_provider.as_deref() == Some(OPENAI_RESPONSES_BACKEND_ID);
+            ask_form = ask_form.child(
+                ControlRole::Essential,
+                Button::new("ask-provider-openai", tokens)
+                    .label("OpenAI")
+                    .small()
+                    .selected(selected)
+                    .disabled(self.running)
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(AskPanelEvent::SelectProvider(Some(
+                            OPENAI_RESPONSES_BACKEND_ID,
+                        )));
+                    })),
+            );
+        }
+        if self.codex_ok {
+            let selected = self.selected_provider.as_deref() == Some(CODEX_CLI_BACKEND_ID);
+            ask_form = ask_form.child(
+                ControlRole::Essential,
+                Button::new("ask-provider-codex", tokens)
+                    .label("Codex")
+                    .small()
+                    .selected(selected)
+                    .disabled(self.running)
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(AskPanelEvent::SelectProvider(Some(CODEX_CLI_BACKEND_ID)));
+                    })),
+            );
+        }
+        ask_form = ask_form
             .child(
                 ControlRole::Ellipsizing,
-                Input::new(&self.input).disabled(disabled_reason.is_some() || self.running),
+                Input::new(&self.input)
+                    .small()
+                    .disabled(disabled_reason.is_some() || self.running),
             )
             .child(
                 ControlRole::Essential,
                 Button::new("submit-ask", tokens)
                     .label("Ask")
+                    .small()
                     .disabled(disabled_reason.is_some() || self.running)
                     .on_click(cx.listener(|this, _, _, cx| this.emit_submit(cx))),
             );
@@ -335,123 +392,171 @@ impl Render for AskPanel {
                 ControlRole::Essential,
                 Button::new("cancel-ask", tokens)
                     .label("Cancel")
+                    .small()
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(AskPanelEvent::Cancel))),
             );
         }
         div()
             .size_full()
             .min_w_0()
-            .overflow_hidden()
-            .p_4()
+            .flex()
+            .flex_col()
             .bg(tokens.surface)
             .text_color(tokens.ink)
-            // Two peers, not a toggle that renames itself. A control labelled "Use all recordings"
-            // never says which scope is *current* — you have to infer it from the label of the
-            // thing you would switch to. Both scopes are always shown, and the selected one is
-            // selected; "Only this recording" simply has nothing to point at on Home.
-            .child(
-                ControlRow::new()
-                    .child(
-                        ControlRole::Essential,
-                        Button::new("ask-scope-all", tokens)
-                            .label("All recordings")
-                            .small()
-                            .selected(effective == AskScope::AllRecordings)
-                            .disabled(self.running)
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                cx.emit(AskPanelEvent::SelectScope(AskScope::AllRecordings));
-                            })),
-                    )
-                    .child(
-                        ControlRole::Essential,
-                        div()
-                            .debug_selector(|| "ask-scope-entry-control".into())
-                            .child(
-                                Button::new("ask-scope-open", tokens)
-                                    .label(if self.live {
-                                        "This entry (live)"
-                                    } else {
-                                        "This entry"
-                                    })
-                                    .small()
-                                    .selected(effective == AskScope::OpenRecording)
-                                    .disabled(self.scope.is_none() || self.running)
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(AskPanelEvent::SelectScope(
-                                            AskScope::OpenRecording,
-                                        ));
-                                    })),
-                            ),
-                    )
-                    .finish()
-                    .gap(Space::SM)
-                    .debug_selector(|| "ask-scope-row".into()),
-            )
-            .children(self.selection.as_ref().map(|selection| {
-                ControlRow::new()
-                    .child(
-                        ControlRole::Essential,
-                        Button::new("ask-scope-selection", tokens)
-                            .label("This selection")
-                            .small()
-                            .selected(effective == AskScope::Selection)
-                            .disabled(self.running)
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                cx.emit(AskPanelEvent::SelectScope(AskScope::Selection));
-                            })),
-                    )
-                    .child(
-                        ControlRole::Ellipsizing,
-                        div()
-                            .text_sm()
-                            .text_color(tokens.muted)
-                            .child(selection.label.clone()),
-                    )
-                    .child(
-                        ControlRole::Essential,
-                        Button::new("ask-clear-selection", tokens)
-                            .label("Clear")
-                            .ghost()
-                            .small()
-                            .disabled(self.running)
-                            .on_click(cx.listener(|_, _, _, cx| {
-                                cx.emit(AskPanelEvent::ClearSelection);
-                            })),
-                    )
-                    .finish()
-                    .mt_1()
-                    .gap(Space::SM)
-                    .debug_selector(|| "ask-selection-row".into())
-            }))
-            // Selectable because this is the line the scope controls used to sit on top of: the
-            // defect that filed T069 was "Use every retained meeting" overlapping the retention
-            // sentence beneath it, and an overlap is only assertable if both sides have bounds.
+            .text_size(TypeScale::CONTROL)
             .child(
                 div()
-                    .mt_1()
-                    .text_sm()
-                    .text_color(tokens.muted)
-                    .debug_selector(|| "ask-scope-line".into())
-                    .child(scope),
+                    .flex_none()
+                    .px(px(14.0))
+                    .pt(px(14.0))
+                    .pb(px(8.0))
+                    .child(
+                        div()
+                            .text_size(TypeScale::CONTROL)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Ask"),
+                    ),
             )
-            .when_some(disabled_reason, |view, reason| {
-                view.child(div().mt_3().text_color(tokens.muted).child(reason))
-            })
-            .children(self.turns.iter().enumerate().map(|(turn_ix, turn)| {
-                render_turn(turn_ix, turn, self.revealed_receipts.contains(&turn_ix), cx)
-            }))
-            .when_some(self.progress.clone(), |view, progress| {
-                view.child(div().mt_3().child(progress))
-            })
-            .when_some(self.message.clone(), |view, message| {
-                view.child(div().mt_3().text_color(tokens.warn).child(message))
-            })
             .child(
-                ask_form
-                    .finish()
-                    .mt_4()
-                    .gap(Space::SM)
-                    .debug_selector(|| "ask-form-row".into()),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_y_scrollbar()
+                    .px(px(14.0))
+                    .pb(px(14.0))
+                    .text_size(TypeScale::CONTROL)
+                    // Two peers, not a toggle that renames itself. A control labelled "Use all recordings"
+                    // never says which scope is *current* — you have to infer it from the label of the
+                    // thing you would switch to. Both scopes are always shown, and the selected one is
+                    // selected; "Only this recording" simply has nothing to point at on Home.
+                    .child(
+                        ControlRow::new()
+                            .child(
+                                ControlRole::Essential,
+                                Button::new("ask-scope-all", tokens)
+                                    .label("All recordings")
+                                    .small()
+                                    .selected(effective == AskScope::AllRecordings)
+                                    .disabled(self.running)
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(AskPanelEvent::SelectScope(
+                                            AskScope::AllRecordings,
+                                        ));
+                                    })),
+                            )
+                            .child(
+                                ControlRole::Essential,
+                                div()
+                                    .debug_selector(|| "ask-scope-entry-control".into())
+                                    .child(
+                                        Button::new("ask-scope-open", tokens)
+                                            .label(if self.live {
+                                                "This entry (live)"
+                                            } else {
+                                                "This entry"
+                                            })
+                                            .small()
+                                            .selected(effective == AskScope::OpenRecording)
+                                            .disabled(self.scope.is_none() || self.running)
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                cx.emit(AskPanelEvent::SelectScope(
+                                                    AskScope::OpenRecording,
+                                                ));
+                                            })),
+                                    ),
+                            )
+                            .finish()
+                            .gap(Space::SM)
+                            .debug_selector(|| "ask-scope-row".into()),
+                    )
+                    .children(self.selection.as_ref().map(|selection| {
+                        ControlRow::new()
+                            .child(
+                                ControlRole::Essential,
+                                Button::new("ask-scope-selection", tokens)
+                                    .label("This selection")
+                                    .small()
+                                    .selected(effective == AskScope::Selection)
+                                    .disabled(self.running)
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(AskPanelEvent::SelectScope(AskScope::Selection));
+                                    })),
+                            )
+                            .child(
+                                ControlRole::Ellipsizing,
+                                div()
+                                    .text_size(TypeScale::CONTROL)
+                                    .text_color(tokens.muted)
+                                    .child(selection.label.clone()),
+                            )
+                            .child(
+                                ControlRole::Essential,
+                                Button::new("ask-clear-selection", tokens)
+                                    .label("Clear")
+                                    .ghost()
+                                    .small()
+                                    .disabled(self.running)
+                                    .on_click(cx.listener(|_, _, _, cx| {
+                                        cx.emit(AskPanelEvent::ClearSelection);
+                                    })),
+                            )
+                            .finish()
+                            .mt_1()
+                            .gap(Space::SM)
+                            .debug_selector(|| "ask-selection-row".into())
+                    }))
+                    // Selectable because this is the line the scope controls used to sit on top of: the
+                    // defect that filed T069 was "Use every retained meeting" overlapping the retention
+                    // sentence beneath it, and an overlap is only assertable if both sides have bounds.
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_size(TypeScale::CONTROL)
+                            .text_color(tokens.muted)
+                            .debug_selector(|| "ask-scope-line".into())
+                            .child(scope),
+                    )
+                    .when_some(disabled_reason, |view, reason| {
+                        view.child(
+                            div()
+                                .mt(Space::MD)
+                                .text_size(TypeScale::CONTROL)
+                                .text_color(tokens.muted)
+                                .child(reason),
+                        )
+                    })
+                    .children(self.turns.iter().enumerate().map(|(turn_ix, turn)| {
+                        render_turn(turn_ix, turn, self.revealed_receipts.contains(&turn_ix), cx)
+                    }))
+                    .when_some(self.progress.clone(), |view, progress| {
+                        view.child(
+                            div().mt_3().child(progress).child(
+                                div()
+                                    .mt_2()
+                                    .child(motion::writing_progress("ask-writing", tokens)),
+                            ),
+                        )
+                    })
+                    .when_some(self.notice.clone(), |view, notice| {
+                        view.child(
+                            div()
+                                .mt_3()
+                                .text_size(TypeScale::CONTROL)
+                                .text_color(tokens.faint)
+                                .child(notice),
+                        )
+                    })
+                    .when_some(self.message.clone(), |view, message| {
+                        view.child(div().mt_3().text_color(tokens.warn).child(message))
+                    })
+                    .child(
+                        ask_form
+                            .finish()
+                            .mt_4()
+                            .gap(Space::SM)
+                            .debug_selector(|| "ask-form-row".into()),
+                    ),
             )
     }
 }
@@ -561,7 +666,7 @@ fn render_turn(
                     div().children(turn.screen_consultations.iter().map(|entry| {
                         div()
                             .mt_1()
-                            .text_sm()
+                            .text_size(TypeScale::CONTROL)
                             .text_color(tokens.faint)
                             .child(entry.describe())
                     }))
@@ -613,7 +718,7 @@ impl MeetingWorkspace {
             .as_ref()
             .map(|selection| selection.session_id)
             .or_else(|| self.ask_panel.read(cx).open_recording());
-        let backend = match self.reasoning_backend(cx) {
+        let backend = match self.reasoning_backend(ReasoningSurface::Ask, cx) {
             Ok(Some(value)) => value,
             Ok(None) => return,
             Err(error) => {

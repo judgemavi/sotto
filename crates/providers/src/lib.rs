@@ -1,11 +1,7 @@
-//! BYOK adapters for streaming provider-neutral completions.
+//! Historical hand-written HTTP adapters used by evals and loopback tests.
 //!
-//! `CompletionRequest::model` is authoritative for each call. [`Provider::model_id`]
-//! reports only the configured default used by settings and [`Registry`]. A cancelled
-//! call with no emitted text yields `ProviderError::Cancelled`; after text has been
-//! emitted it ends with a final `StopReason::Aborted` delta (usage is preserved when
-//! the upstream supplied it). A single `cache_boundary` is accepted; Anthropic maps
-//! it to `cache_control`, while other providers deliberately ignore it.
+//! Product reasoning uses the OpenAI Responses SDK and the Codex CLI connector.
+//! These transports are not selectable in Settings.
 
 #![deny(warnings)]
 
@@ -13,13 +9,9 @@ pub mod inspection;
 mod parse;
 mod reasoning;
 
-pub mod anthropic;
 pub mod backend;
 pub mod codex;
-pub mod google;
-pub mod ollama;
 pub mod openai;
-pub mod openrouter;
 
 use std::fmt;
 
@@ -32,7 +24,7 @@ use sotto_core::{
 pub use backend::{
     AuthKind, AuthStatus, BackendCapabilities, BackendCapability, BackendContractError,
     BackendDescriptor, BackendFingerprint, BackendId, CODEX_CLI_BACKEND_ID,
-    OPENAI_RESPONSES_BACKEND_ID, Registry, RegistryError, ResolvedBackend, Role,
+    OPENAI_RESPONSES_BACKEND_ID, ReasoningSurface, Registry, RegistryError, ResolvedBackend,
 };
 pub use parse::{ProviderKind, Transport};
 pub use reasoning::{ReasoningProvider, TextReasoningProvider, text_reasoning_provider};

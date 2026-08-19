@@ -6,6 +6,7 @@ pub(crate) mod focus;
 pub(crate) mod icons;
 mod layout;
 mod library;
+pub(crate) mod motion;
 mod notes;
 mod pacing;
 mod runtime;
@@ -27,12 +28,11 @@ use gpui_component::{
     IconName, Root, Sizable as _, Size, Theme, ThemeMode, WindowExt as _,
     button::{Button as ComponentButton, ButtonVariant, ButtonVariants as _},
     dialog::{Dialog, DialogButtonProps},
-    dock::{DockArea, DockItem, DockPlacement},
     input::{InputEvent, InputState},
 };
 
 use focus::Button;
-use providers::Role;
+use providers::ReasoningSurface;
 use serde::{Deserialize, Serialize};
 use sotto_core::{Entry, EntryId, EventId, SessionId, TimelineEvent};
 
@@ -466,7 +466,6 @@ pub struct MeetingWorkspace {
     library_collapsed: bool,
     ask_panel: Entity<ask::AskPanel>,
     pending_ask: Option<(ask::PendingAsk, String)>,
-    ask_dock: Entity<DockArea>,
     ask_open: bool,
     /// The settings sheet, built the first time it is asked for and kept afterwards. Building it
     /// probes the Codex CLI and starts the MCP poll, so cold launch must not build it and each
@@ -517,19 +516,13 @@ impl MeetingWorkspace {
         if let Some(theme) = persisted.theme {
             Theme::change(theme.mode(), Some(window), cx);
         }
+        tokens::install_visible_scrollbars(cx);
         // The menu bar carries the app name, Settings and the appearance switch, so it has to be
         // published before the first frame and to already mark the recorded choice.
         cx.set_menus(application_menus(Appearance::from_persisted(
             persisted.theme,
         )));
         let ask_panel = cx.new(|cx| ask::AskPanel::new(window, cx));
-        let ask_dock = cx.new(|cx| {
-            let mut area = DockArea::new("sotto-ask-dock", Some(1), window, cx);
-            let item = DockItem::tab(ask_panel.clone(), &cx.entity().downgrade(), window, cx);
-            area.set_right_dock(item, Some(px(320.0)), ask_open, window, cx);
-            area.set_locked(true, window, cx);
-            area
-        });
         let following_system = cx.entity().downgrade();
         let subscriptions = vec![
             // "Follow System" has to keep following. `gpui_component::init` reads the system
@@ -616,6 +609,9 @@ impl MeetingWorkspace {
                         cx.notify();
                     }
                     ask::AskPanelEvent::ClearSelection => this.clear_ask_selection(cx),
+                    ask::AskPanelEvent::SelectProvider(backend) => {
+                        this.select_provider(ReasoningSurface::Ask, *backend, cx);
+                    }
                 },
             ),
         ];
@@ -653,7 +649,6 @@ impl MeetingWorkspace {
             library_collapsed: persisted.library_collapsed,
             ask_panel,
             pending_ask: None,
-            ask_dock,
             ask_open,
             settings: None,
             settings_open: false,
@@ -668,9 +663,7 @@ impl MeetingWorkspace {
         // so no recording is the one the person came back for; opening the newest one made Sotto
         // present itself as a viewer of a single capture and put its own entry points out of
         // reach. Home is the only state that is correct whatever the library holds.
-        let ask_ready = workspace
-            .reasoning_backend(cx)
-            .is_ok_and(|value| value.is_some());
+        let ask_ready = workspace.ask_ready(cx);
         workspace.sync_ask_scope(ask_ready, cx);
         workspace.poll_notes(cx);
         workspace.poll_ask_updates(cx);
@@ -681,26 +674,34 @@ impl MeetingWorkspace {
 
     fn reasoning_backend(
         &self,
+        surface: ReasoningSurface,
         cx: &Context<Self>,
     ) -> Result<Option<providers::ResolvedBackend>, String> {
         // No capability gate here. `JsonObjectOutput` means the backend can *guarantee* JSON
         // syntactically; lacking it is a downgrade, not an inability. Insight's normalization
         // policy owns that decision at a single seam, parses every reply defensively, and records
-        // the loss on the result so the user sees it. Re-deciding it here refused Codex outright
-        // for a guarantee the notes path never depended on.
+        // the loss on the result so the user sees it.
         self.reasoning
             .read(cx)
-            .resolve(Role::Summarizer)
+            .resolve(surface)
             .map_err(|error| error.to_string())
     }
 
+    pub(crate) fn notes_ready(&self, cx: &Context<Self>) -> bool {
+        self.reasoning_backend(ReasoningSurface::Notes, cx)
+            .is_ok_and(|backend| backend.is_some())
+    }
+
+    pub(crate) fn ask_ready(&self, cx: &Context<Self>) -> bool {
+        self.reasoning_backend(ReasoningSurface::Ask, cx)
+            .is_ok_and(|backend| backend.is_some())
+    }
+
     fn sync_reasoning(&mut self, cx: &mut Context<Self>) {
-        let enabled = self
-            .reasoning_backend(cx)
-            .is_ok_and(|backend| backend.is_some());
+        let notes_ready = self.notes_ready(cx);
         self.notes
-            .update(cx, |notes, _| notes.set_reasoning_enabled(enabled));
-        self.sync_ask_scope(enabled, cx);
+            .update(cx, |notes, _| notes.set_reasoning_enabled(notes_ready));
+        self.sync_ask_scope(self.ask_ready(cx), cx);
     }
 
     fn refresh_after_session(&mut self, cx: &mut Context<Self>) {
@@ -734,9 +735,7 @@ impl MeetingWorkspace {
             return;
         }
         self.live_started_at = None;
-        let enabled = self
-            .reasoning_backend(cx)
-            .is_ok_and(|backend| backend.is_some());
+        let enabled = self.notes_ready(cx);
         self.message = self
             .notes
             .update(cx, |notes, _| {
@@ -756,13 +755,29 @@ impl MeetingWorkspace {
         }
     }
 
-    pub(crate) fn generate_notes(&mut self, cx: &mut Context<Self>) {
-        let backend = match self.reasoning_backend(cx) {
+    pub fn select_provider(
+        &mut self,
+        surface: ReasoningSurface,
+        backend: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        self.message = self
+            .reasoning
+            .update(cx, |controller, cx| {
+                controller.select_surface(surface, backend, cx)
+            })
+            .err()
+            .map(|error| error.to_string());
+        self.sync_reasoning(cx);
+        cx.notify();
+    }
+
+    fn generate_notes(&mut self, cx: &mut Context<Self>) {
+        let backend = match self.reasoning_backend(ReasoningSurface::Notes, cx) {
             Ok(Some(value)) => value,
             Ok(None) => {
-                self.message = Some(
-                    "Enable a ready Summarizer backend in Settings to generate AI notes.".into(),
-                );
+                self.message =
+                    Some("Add a ready provider in Settings, then pick it on Notes.".into());
                 cx.notify();
                 return;
             }
@@ -793,9 +808,7 @@ impl MeetingWorkspace {
             cx.notify();
             return;
         }
-        let enabled = self
-            .reasoning_backend(cx)
-            .is_ok_and(|backend| backend.is_some());
+        let enabled = self.notes_ready(cx);
         let notes_session = self
             .entry_id_for_session(id)
             .and_then(|entry_id| self.entries.iter().find(|entry| entry.id() == entry_id))
@@ -811,7 +824,7 @@ impl MeetingWorkspace {
             self.load_transcript(id);
             self.mcp
                 .update(cx, |controller, cx| controller.select_session(id, cx));
-            self.sync_ask_scope(enabled, cx);
+            self.sync_ask_scope(self.ask_ready(cx), cx);
         } else {
             self.message = Some("That recording is no longer available.".into());
         }
@@ -847,11 +860,7 @@ impl MeetingWorkspace {
         self.focused_event = None;
         self.message = None;
         self.refresh_prepared_notes(entry_id);
-        self.sync_ask_scope(
-            self.reasoning_backend(cx)
-                .is_ok_and(|backend| backend.is_some()),
-            cx,
-        );
+        self.sync_ask_scope(self.ask_ready(cx), cx);
         cx.notify();
     }
 
@@ -1058,9 +1067,7 @@ impl MeetingWorkspace {
         self.focused_event = None;
         self.open_recording = None;
         self.message = None;
-        let ready = self
-            .reasoning_backend(cx)
-            .is_ok_and(|value| value.is_some());
+        let ready = self.ask_ready(cx);
         self.sync_ask_scope(ready, cx);
         cx.notify();
     }
@@ -1179,10 +1186,7 @@ impl MeetingWorkspace {
         }
         // Deleting what you were reading lands you on Home, not inside an unrelated recording the
         // shell picked for you. Same reasoning as launch: nothing here is the obvious next thing.
-        let enabled = self
-            .reasoning_backend(cx)
-            .is_ok_and(|backend| backend.is_some());
-        self.sync_ask_scope(enabled, cx);
+        self.sync_ask_scope(self.ask_ready(cx), cx);
         cx.notify();
     }
 
@@ -1312,8 +1316,16 @@ impl MeetingWorkspace {
         });
         let live = self.transcript_live;
         let selection = self.ask_selection.clone();
+        let openai_ok = self.reasoning.read(cx).openai_selectable();
+        let codex_ok = self.reasoning.read(cx).codex_selectable();
+        let selected_provider = self
+            .reasoning
+            .read(cx)
+            .selected_id(ReasoningSurface::Ask)
+            .map(|id| id.as_str().to_owned());
         self.ask_panel.update(cx, |panel, _| {
             panel.set_entry_scope(scope, ready, live);
+            panel.set_providers(openai_ok, codex_ok, selected_provider);
             panel.set_selection(selection);
         });
     }
@@ -1532,11 +1544,8 @@ impl MeetingWorkspace {
         self.persist_workspace_state();
     }
 
-    fn toggle_ask(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_ask(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.ask_open = !self.ask_open;
-        self.ask_dock.update(cx, |dock, cx| {
-            dock.toggle_dock(DockPlacement::Right, window, cx)
-        });
         self.persist_workspace_state();
         cx.notify();
     }
@@ -1563,6 +1572,7 @@ impl MeetingWorkspace {
             Some(theme) => Theme::change(theme.mode(), Some(window), cx),
             None => Theme::sync_system_appearance(Some(window), cx),
         }
+        tokens::install_visible_scrollbars(cx);
         self.persist_workspace_state();
         self.refresh_application_menus(cx);
         cx.notify();

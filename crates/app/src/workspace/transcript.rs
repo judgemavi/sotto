@@ -36,7 +36,10 @@ use gpui::{
     Pixels, Rgba, SharedString, Stateful, Timer, WeakEntity, Window, div, list, prelude::*, px,
     rems,
 };
-use gpui_component::text::{TextView, TextViewStyle};
+use gpui_component::{
+    scroll::{Scrollbar, ScrollbarShow},
+    text::{TextView, TextViewStyle},
+};
 use sotto_core::{EventId, EventPayload, Source, SpeechState, TimelineEvent, replay_lenient};
 
 use crate::reasoning::inspection::ScreenConsultation;
@@ -774,7 +777,11 @@ pub(crate) fn render(
                     container.child(div().px_5().py_4().text_color(tokens.muted).child(empty))
                 })
                 .when(!rows.is_empty(), |container| {
-                    container.child(transcript_list)
+                    container.relative().child(transcript_list).child(
+                        Scrollbar::vertical(list_state)
+                            .id("transcript-scrollbar")
+                            .scrollbar_show(ScrollbarShow::Always),
+                    )
                 }),
         )
         .when(!unstable.is_empty(), |column| {

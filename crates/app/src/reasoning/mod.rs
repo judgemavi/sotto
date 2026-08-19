@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use gpui::Context;
 use providers::{
     AuthStatus, BackendDescriptor, BackendId, CODEX_CLI_BACKEND_ID, OPENAI_RESPONSES_BACKEND_ID,
-    Registry, RegistryError, ResolvedBackend, Role,
+    ReasoningSurface, Registry, RegistryError, ResolvedBackend,
     codex::{CodexDescriptorMode, CodexProbe, CodexProvider},
     openai::OpenAiProvider,
 };
@@ -24,11 +24,11 @@ use sotto_core::{
     ProviderError,
 };
 
-use persistence::{PersistedBackends, PersistedRoles, PersistedSettings};
+use persistence::{PersistedBackends, PersistedSettings, PersistedSurfaces};
 
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4.1-nano";
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-luna";
-const SETTINGS_VERSION: u32 = 1;
+const SETTINGS_VERSION: u32 = 2;
 const CODEX_CONSENT_VERSION: u32 = 1;
 const CODEX_NOT_CHECKED_REASON: &str = "Codex CLI readiness has not been checked yet";
 
@@ -341,7 +341,9 @@ impl ReasoningController {
     ) -> Self {
         let (settings, mut status_message) = match settings_path.as_deref() {
             Some(path) => match persistence::load(path) {
-            Ok(Some(settings)) if settings.version == SETTINGS_VERSION => (settings, None),
+            Ok(Some(settings)) if settings.version == 1 || settings.version == SETTINGS_VERSION => {
+                (settings.migrate(), None)
+            }
             Ok(Some(_)) => (
                 Self::default_settings(),
                 Some(
@@ -401,7 +403,8 @@ impl ReasoningController {
                 codex_model_id: DEFAULT_CODEX_MODEL.to_owned(),
                 codex_experimental_consent_version: None,
             },
-            roles: PersistedRoles::default(),
+            surfaces: PersistedSurfaces::default(),
+            roles: None,
         }
     }
 
@@ -456,19 +459,11 @@ impl ReasoningController {
             Err(cause) => error = Some(cause.to_string()),
         }
 
-        for role in [Role::Watcher, Role::Suggester, Role::Summarizer] {
-            let selected = Self::persisted_role(&settings.roles, role).cloned();
+        for surface in ReasoningSurface::ALL {
+            let selected = Self::persisted_surface(&settings.surfaces, surface).cloned();
             let Some(selected) = selected else {
                 continue;
             };
-            if selected == CODEX_CLI_BACKEND_ID && role != Role::Summarizer {
-                Self::set_persisted_role(&mut settings.roles, role, None);
-                error = Some(
-                    "Codex experimental is notes-only; realtime roles now use no reasoning."
-                        .to_owned(),
-                );
-                continue;
-            }
             let id = match BackendId::new(selected.clone()) {
                 Ok(id)
                     if id.as_str() == OPENAI_RESPONSES_BACKEND_ID
@@ -479,49 +474,55 @@ impl ReasoningController {
                     id
                 }
                 _ => {
-                    Self::set_persisted_role(&mut settings.roles, role, None);
+                    Self::set_persisted_surface(&mut settings.surfaces, surface, None);
                     error = Some(format!(
-                        "Stored backend {selected:?} is not selectable; {role:?} now uses no reasoning."
+                        "Stored backend {selected:?} is not selectable; {surface} now uses no provider."
                     ));
                     continue;
                 }
             };
-            if let Err(cause) = registry.select(role, Some(&id)) {
+            if let Err(cause) = registry.select(surface, Some(&id)) {
                 if id.as_str() == CODEX_CLI_BACKEND_ID {
-                    // Preserve an explicitly selected Codex role while the bounded startup
-                    // readiness probe is pending or the user needs to sign in again.
                     continue;
                 }
-                Self::set_persisted_role(&mut settings.roles, role, None);
+                Self::set_persisted_surface(&mut settings.surfaces, surface, None);
                 error = Some(cause.to_string());
             }
         }
         (registry, settings, error)
     }
 
-    fn persisted_role(roles: &PersistedRoles, role: Role) -> Option<&String> {
-        match role {
-            Role::Watcher => roles.watcher.as_ref(),
-            Role::Suggester => roles.suggester.as_ref(),
-            Role::Summarizer => roles.summarizer.as_ref(),
+    fn persisted_surface(
+        surfaces: &PersistedSurfaces,
+        surface: ReasoningSurface,
+    ) -> Option<&String> {
+        match surface {
+            ReasoningSurface::Notes => surfaces.notes.as_ref(),
+            ReasoningSurface::Ask => surfaces.ask.as_ref(),
         }
     }
 
-    fn set_persisted_role(roles: &mut PersistedRoles, role: Role, value: Option<String>) {
-        match role {
-            Role::Watcher => roles.watcher = value,
-            Role::Suggester => roles.suggester = value,
-            Role::Summarizer => roles.summarizer = value,
+    fn set_persisted_surface(
+        surfaces: &mut PersistedSurfaces,
+        surface: ReasoningSurface,
+        value: Option<String>,
+    ) {
+        match surface {
+            ReasoningSurface::Notes => surfaces.notes = value,
+            ReasoningSurface::Ask => surfaces.ask = value,
         }
     }
 
-    pub fn resolve(&self, role: Role) -> Result<Option<ResolvedBackend>, RegistryError> {
-        self.registry.resolve(role)
+    pub fn resolve(
+        &self,
+        surface: ReasoningSurface,
+    ) -> Result<Option<ResolvedBackend>, RegistryError> {
+        self.registry.resolve(surface)
     }
 
     #[must_use]
-    pub fn selected_id(&self, role: Role) -> Option<&BackendId> {
-        self.registry.selected_id(role)
+    pub fn selected_id(&self, surface: ReasoningSurface) -> Option<&BackendId> {
+        self.registry.selected_id(surface)
     }
 
     #[must_use]
@@ -580,6 +581,20 @@ impl ReasoningController {
     }
 
     #[must_use]
+    pub fn openai_selectable(&self) -> bool {
+        !matches!(
+            self.openai_readiness,
+            OpenAiReadiness::NoKey | OpenAiReadiness::CredentialStore(_)
+        )
+    }
+
+    #[must_use]
+    pub fn codex_selectable(&self) -> bool {
+        self.codex_experimental_enabled()
+            && matches!(self.codex_readiness(), CodexReadiness::Ready { .. })
+    }
+
+    #[must_use]
     pub fn status_message(&self) -> Option<&str> {
         self.status_message.as_deref()
     }
@@ -598,43 +613,40 @@ impl ReasoningController {
     fn apply_to_all_inner(&mut self, backend: Option<&str>) -> Result<(), ReasoningError> {
         self.invalidate_validation();
         let mut candidate = self.settings.clone();
-        if backend == Some(CODEX_CLI_BACKEND_ID) {
-            return Err(ReasoningError::Contract(
-                "Codex experimental is notes-only and cannot be applied to realtime roles."
-                    .to_owned(),
-            ));
-        }
-        for role in [Role::Watcher, Role::Suggester, Role::Summarizer] {
-            Self::set_persisted_role(&mut candidate.roles, role, backend.map(ToOwned::to_owned));
+        for surface in ReasoningSurface::ALL {
+            Self::set_persisted_surface(
+                &mut candidate.surfaces,
+                surface,
+                backend.map(ToOwned::to_owned),
+            );
         }
         self.commit_settings(candidate)
     }
 
-    pub fn select_role(
+    pub fn select_surface(
         &mut self,
-        role: Role,
+        surface: ReasoningSurface,
         backend: Option<&str>,
         cx: &mut Context<Self>,
     ) -> Result<(), ReasoningError> {
         let before = self.observable_state();
-        let result = self.select_role_inner(role, backend);
+        let result = self.select_surface_inner(surface, backend);
         self.notify_if_changed(before, cx);
         result
     }
 
-    fn select_role_inner(
+    fn select_surface_inner(
         &mut self,
-        role: Role,
+        surface: ReasoningSurface,
         backend: Option<&str>,
     ) -> Result<(), ReasoningError> {
         self.invalidate_validation();
-        if backend == Some(CODEX_CLI_BACKEND_ID) && role != Role::Summarizer {
-            return Err(ReasoningError::Contract(
-                "Codex experimental is available only for meeting notes.".to_owned(),
-            ));
-        }
         let mut candidate = self.settings.clone();
-        Self::set_persisted_role(&mut candidate.roles, role, backend.map(ToOwned::to_owned));
+        Self::set_persisted_surface(
+            &mut candidate.surfaces,
+            surface,
+            backend.map(ToOwned::to_owned),
+        );
         self.commit_settings(candidate)
     }
 
@@ -718,11 +730,11 @@ impl ReasoningController {
     fn disable_codex_experimental_inner(&mut self) -> Result<(), ReasoningError> {
         let mut candidate = self.settings.clone();
         candidate.backends.codex_experimental_consent_version = None;
-        for role in [Role::Watcher, Role::Suggester, Role::Summarizer] {
-            if Self::persisted_role(&candidate.roles, role)
+        for surface in ReasoningSurface::ALL {
+            if Self::persisted_surface(&candidate.surfaces, surface)
                 .is_some_and(|id| id == CODEX_CLI_BACKEND_ID)
             {
-                Self::set_persisted_role(&mut candidate.roles, role, None);
+                Self::set_persisted_surface(&mut candidate.surfaces, surface, None);
             }
         }
         self.commit_settings(candidate)
@@ -730,9 +742,8 @@ impl ReasoningController {
 
     fn commit_settings(&mut self, candidate: PersistedSettings) -> Result<(), ReasoningError> {
         for selected in [
-            candidate.roles.watcher.as_deref(),
-            candidate.roles.suggester.as_deref(),
-            candidate.roles.summarizer.as_deref(),
+            candidate.surfaces.notes.as_deref(),
+            candidate.surfaces.ask.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -756,20 +767,9 @@ impl ReasoningController {
                 )));
             }
         }
-        for role in [Role::Watcher, Role::Suggester] {
-            if Self::persisted_role(&candidate.roles, role)
-                .is_some_and(|selected| selected == CODEX_CLI_BACKEND_ID)
-            {
-                return Err(ReasoningError::Contract(
-                    "Codex experimental is notes-only and cannot be selected for realtime roles."
-                        .to_owned(),
-                ));
-            }
-        }
         let openai_is_selected = [
-            candidate.roles.watcher.as_deref(),
-            candidate.roles.suggester.as_deref(),
-            candidate.roles.summarizer.as_deref(),
+            candidate.surfaces.notes.as_deref(),
+            candidate.surfaces.ask.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -1001,18 +1001,18 @@ impl ReasoningController {
             ));
         }
         let model = descriptor.model_id().to_owned();
-        let temporary_role = Role::Summarizer;
-        let previous = self.registry.selected_id(temporary_role).cloned();
+        let temporary_surface = ReasoningSurface::Notes;
+        let previous = self.registry.selected_id(temporary_surface).cloned();
         self.registry
-            .select(temporary_role, Some(&id))
+            .select(temporary_surface, Some(&id))
             .map_err(|error| ReasoningError::Contract(error.to_string()))?;
         let resolved = self
             .registry
-            .resolve(temporary_role)
+            .resolve(temporary_surface)
             .map_err(|error| ReasoningError::Contract(error.to_string()))?
             .ok_or_else(|| ReasoningError::Contract("OpenAI did not resolve".to_owned()))?;
         self.registry
-            .select(temporary_role, previous.as_ref())
+            .select(temporary_surface, previous.as_ref())
             .map_err(|error| ReasoningError::Contract(error.to_string()))?;
         let provider = resolved.provider();
         let prior_readiness = self.openai_readiness.clone();
@@ -1353,9 +1353,13 @@ mod tests {
     #[test]
     fn cold_start_is_complete_no_reasoning_without_credentials() -> TestResult {
         let (_directory, _store, controller) = fixture()?;
-        for role in [Role::Watcher, Role::Suggester, Role::Summarizer] {
-            assert!(controller.selected_id(role).is_none());
-            assert!(controller.resolve(role).is_ok_and(|value| value.is_none()));
+        for surface in ReasoningSurface::ALL {
+            assert!(controller.selected_id(surface).is_none());
+            assert!(
+                controller
+                    .resolve(surface)
+                    .is_ok_and(|value| value.is_none())
+            );
         }
         assert_eq!(controller.openai_readiness(), &OpenAiReadiness::NoKey);
         Ok(())
@@ -1384,9 +1388,9 @@ mod tests {
         drop(stored);
         let reloaded =
             ReasoningController::load(directory.path().join(SETTINGS_FILE_NAME), store.clone());
-        for role in [Role::Watcher, Role::Suggester, Role::Summarizer] {
+        for surface in ReasoningSurface::ALL {
             assert_eq!(
-                reloaded.selected_id(role).map(BackendId::as_str),
+                reloaded.selected_id(surface).map(BackendId::as_str),
                 Some(OPENAI_RESPONSES_BACKEND_ID)
             );
         }
@@ -1448,7 +1452,7 @@ mod tests {
         ));
         assert!(matches!(
             controller.apply_to_all_inner(Some(CODEX_CLI_BACKEND_ID)),
-            Err(ReasoningError::Contract(_))
+            Err(ReasoningError::Unavailable(_))
         ));
 
         controller.enable_codex_experimental_inner()?;
@@ -1461,22 +1465,16 @@ mod tests {
                 .contains(providers::BackendCapability::JsonObjectOutput)
         }));
         controller.set_codex_model_inner("meeting-model".to_owned())?;
-        assert!(
-            controller
-                .apply_to_all_inner(Some(CODEX_CLI_BACKEND_ID))
-                .is_err()
-        );
-        assert!(
-            controller
-                .select_role_inner(Role::Watcher, Some(CODEX_CLI_BACKEND_ID))
-                .is_err()
-        );
-        controller.select_role_inner(Role::Summarizer, Some(CODEX_CLI_BACKEND_ID))?;
-        assert!(controller.selected_id(Role::Watcher).is_none());
-        assert!(controller.selected_id(Role::Suggester).is_none());
+        controller.apply_to_all_inner(Some(CODEX_CLI_BACKEND_ID))?;
         assert_eq!(
             controller
-                .selected_id(Role::Summarizer)
+                .selected_id(ReasoningSurface::Notes)
+                .map(BackendId::as_str),
+            Some(CODEX_CLI_BACKEND_ID)
+        );
+        assert_eq!(
+            controller
+                .selected_id(ReasoningSurface::Ask)
                 .map(BackendId::as_str),
             Some(CODEX_CLI_BACKEND_ID)
         );
@@ -1497,11 +1495,11 @@ mod tests {
         assert!(reloaded.codex_experimental_enabled());
         assert_eq!(
             reloaded
-                .selected_id(Role::Summarizer)
+                .selected_id(ReasoningSurface::Notes)
                 .map(BackendId::as_str),
             Some(CODEX_CLI_BACKEND_ID)
         );
-        assert!(reloaded.resolve(Role::Summarizer).is_err());
+        assert!(reloaded.resolve(ReasoningSurface::Notes).is_err());
         let ticket = reloaded.begin_codex_probe_inner()?;
         let result = ticket
             .receiver
@@ -1509,7 +1507,7 @@ mod tests {
         assert!(reloaded.finish_codex_probe_inner(result));
         assert_eq!(
             reloaded
-                .selected_id(Role::Summarizer)
+                .selected_id(ReasoningSurface::Notes)
                 .map(BackendId::as_str),
             Some(CODEX_CLI_BACKEND_ID)
         );
@@ -1526,15 +1524,15 @@ mod tests {
         assert!(reloaded.codex_experimental_enabled());
         assert_eq!(
             reloaded
-                .selected_id(Role::Summarizer)
+                .selected_id(ReasoningSurface::Notes)
                 .map(BackendId::as_str),
             Some(CODEX_CLI_BACKEND_ID)
         );
-        assert!(reloaded.resolve(Role::Summarizer).is_err());
+        assert!(reloaded.resolve(ReasoningSurface::Notes).is_err());
         reloaded.disable_codex_experimental_inner()?;
         assert!(!reloaded.codex_experimental_enabled());
-        for role in [Role::Watcher, Role::Suggester, Role::Summarizer] {
-            assert!(reloaded.selected_id(role).is_none());
+        for surface in ReasoningSurface::ALL {
+            assert!(reloaded.selected_id(surface).is_none());
         }
         Ok(())
     }
@@ -1585,10 +1583,10 @@ mod tests {
         ));
 
         controller.enable_codex_experimental_inner()?;
-        controller.select_role_inner(Role::Summarizer, Some(CODEX_CLI_BACKEND_ID))?;
+        controller.select_surface_inner(ReasoningSurface::Notes, Some(CODEX_CLI_BACKEND_ID))?;
         assert_eq!(
             controller
-                .selected_id(Role::Summarizer)
+                .selected_id(ReasoningSurface::Notes)
                 .map(BackendId::as_str),
             Some(CODEX_CLI_BACKEND_ID)
         );
@@ -1616,7 +1614,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))?;
         assert!(controller.finish_codex_probe_inner(result));
         controller.enable_codex_experimental_inner()?;
-        controller.select_role_inner(Role::Summarizer, Some(CODEX_CLI_BACKEND_ID))?;
+        controller.select_surface_inner(ReasoningSurface::Notes, Some(CODEX_CLI_BACKEND_ID))?;
         drop(controller);
 
         *store.failure.lock().map_err(lock_error)? = Some(ProviderError::CredentialStore(
@@ -1625,13 +1623,13 @@ mod tests {
         let source = Arc::new(FakeCodexProbeSource::new(ready_probe()));
         let mut reloaded =
             ReasoningController::load_with_probe_source(settings_path, store, source);
-        assert!(reloaded.resolve(Role::Summarizer).is_err());
+        assert!(reloaded.resolve(ReasoningSurface::Notes).is_err());
         let ticket = reloaded.begin_codex_probe_inner()?;
         let result = ticket
             .receiver
             .recv_timeout(std::time::Duration::from_secs(1))?;
         assert!(reloaded.finish_codex_probe_inner(result));
-        assert!(reloaded.resolve(Role::Summarizer)?.is_some());
+        assert!(reloaded.resolve(ReasoningSurface::Notes)?.is_some());
         assert_eq!(
             reloaded.openai_readiness(),
             &OpenAiReadiness::CredentialStore("OpenAI Keychain denied".to_owned())
@@ -1687,19 +1685,19 @@ mod tests {
         controller.store_openai_key_inner(SecretString::from("fake-key".to_owned()))?;
         controller.apply_to_all_inner(Some(OPENAI_RESPONSES_BACKEND_ID))?;
         let pinned = controller
-            .resolve(Role::Watcher)?
+            .resolve(ReasoningSurface::Ask)?
             .ok_or("backend should resolve")?;
         controller.set_openai_model_inner("gpt-test-next".to_owned())?;
         let next = controller
-            .resolve(Role::Watcher)?
+            .resolve(ReasoningSurface::Ask)?
             .ok_or("backend should resolve")?;
         assert_eq!(pinned.descriptor().model_id(), DEFAULT_OPENAI_MODEL);
         assert_eq!(next.descriptor().model_id(), "gpt-test-next");
         assert_ne!(pinned.cache_fingerprint(), next.cache_fingerprint());
-        controller.select_role_inner(Role::Watcher, None)?;
+        controller.select_surface_inner(ReasoningSurface::Ask, None)?;
         assert!(
             controller
-                .resolve(Role::Watcher)
+                .resolve(ReasoningSurface::Ask)
                 .is_ok_and(|value| value.is_none())
         );
         assert_eq!(pinned.descriptor().model_id(), DEFAULT_OPENAI_MODEL);

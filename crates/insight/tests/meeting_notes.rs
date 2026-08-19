@@ -15,7 +15,7 @@ mod tests {
 
     use futures_util::stream;
     use insight::{
-        MeetingNotesGenerator, NotesOverlayOperation, RecordingNotesSectionKind,
+        MeetingNotesError, MeetingNotesGenerator, NotesOverlayOperation, RecordingNotesSectionKind,
         append_notes_overlay_operation,
     };
     use providers::{AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendId};
@@ -208,6 +208,62 @@ mod tests {
             !inputs
                 .iter()
                 .any(|input| input.contains("private-user-block"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trailing_characters_after_valid_notes_json_do_not_fail_the_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (store, session_id) = store_with_utterances(&[1]).await?;
+        let output = r#"{"sections":[{"kind":"overview","blocks":[{"type":"claim","text":"Launch planning began","meeting_citations":[1]}]}]} leftover commentary from an unconstrained backend"#;
+        let provider = Arc::new(QueueProvider::new([output]));
+        let report = MeetingNotesGenerator::new(&store, provider)
+            .with_backend_fingerprint(fingerprint("test.notes.trailing-json")?)
+            .generate_grounded_with_cancellation(session_id, None, CancellationToken::new())
+            .await?;
+        assert_eq!(
+            report.artifact.sections[0].kind,
+            RecordingNotesSectionKind::Overview
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_risk_citation_is_dropped_without_failing_the_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (store, session_id) = store_with_utterances(&[1]).await?;
+        let output = r#"{"sections":[{"kind":"overview","blocks":[{"type":"claim","text":"Launch planning began","meeting_citations":[1]}]},{"kind":"risks","blocks":[{"type":"claim","text":"Invented rollout risk","meeting_citations":[536]}]}]}"#;
+        let provider = Arc::new(QueueProvider::new([output]));
+        let report = MeetingNotesGenerator::new(&store, provider)
+            .with_backend_fingerprint(fingerprint("test.notes.drop-unknown-risk")?)
+            .generate_grounded_with_cancellation(session_id, None, CancellationToken::new())
+            .await?;
+        assert_eq!(report.artifact.sections.len(), 1);
+        assert_eq!(
+            report.artifact.sections[0].kind,
+            RecordingNotesSectionKind::Overview
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn notes_that_cite_only_unknown_events_still_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (store, session_id) = store_with_utterances(&[1]).await?;
+        let output = r#"{"sections":[{"kind":"risks","blocks":[{"type":"claim","text":"Invented rollout risk","meeting_citations":[536]}]}]}"#;
+        let provider = Arc::new(QueueProvider::new([output]));
+        let result = MeetingNotesGenerator::new(&store, provider)
+            .with_backend_fingerprint(fingerprint("test.notes.unknown-risk-only")?)
+            .generate_grounded_with_cancellation(session_id, None, CancellationToken::new())
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(MeetingNotesError::UnknownCitation { field: "risks", event })
+                    if event.get() == 536
+            ),
+            "all-uncited output must keep failing closed, got {result:?}"
         );
         Ok(())
     }

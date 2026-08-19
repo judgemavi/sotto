@@ -201,6 +201,8 @@ pub enum MeetingNotesError {
     MissingCitation { field: &'static str },
     #[error("{field} item cites unknown timeline event {event:?}")]
     UnknownCitation { field: &'static str, event: EventId },
+    #[error("the model produced no claims cited to this recording")]
+    UncitedOutput,
     #[error(transparent)]
     Context(#[from] ReasoningContextError),
     #[error("{field} states a claim with no citation to support it")]
@@ -428,15 +430,21 @@ impl MeetingNotesGenerator {
             )
             .await?;
             let window_ids = window.iter().map(|event| event.id()).collect();
-            let artifact = result.value.finalize(session_id);
-            validate_recording_notes_against_ids(&artifact, session_id, &window_ids, &bundle)?;
+            let artifact = match supported_notes(result.value, session_id, &window_ids, &bundle) {
+                Ok(artifact) => artifact,
+                Err(MeetingNotesError::UncitedOutput) => continue,
+                Err(error) => return Err(error),
+            };
             add_usage(&mut usage, result.usage);
             calls = calls.saturating_add(result.calls);
             normalizations.extend(result.normalizations);
             partials.push(artifact);
         }
+        if partials.is_empty() {
+            return Err(MeetingNotesError::UncitedOutput);
+        }
         let artifact = if partials.len() == 1 {
-            partials.pop().ok_or(MeetingNotesError::EmptyTimeline)?
+            partials.pop().ok_or(MeetingNotesError::UncitedOutput)?
         } else {
             // IDs are Sotto-owned output, never provider input. Feeding finalized partials into
             // reduce made the model strip fields it should never have seen, and one echoed `id`
@@ -460,7 +468,16 @@ impl MeetingNotesGenerator {
             add_usage(&mut usage, result.usage);
             calls = calls.saturating_add(result.calls);
             normalizations.extend(result.normalizations);
-            result.value.finalize(session_id)
+            let citable = citable_event_ids(&events);
+            match supported_notes(result.value, session_id, &citable, &bundle) {
+                Ok(artifact) => artifact,
+                Err(
+                    MeetingNotesError::UnknownCitation { .. }
+                    | MeetingNotesError::UnknownExternalCitation { .. }
+                    | MeetingNotesError::UncitedOutput,
+                ) => RecordingNotesDraft::merge_finalized(&partials).finalize(session_id),
+                Err(error) => return Err(error),
+            }
         };
         validate_recording_notes(&artifact, session_id, &events, &bundle)?;
         if cancellation.is_cancelled() {
@@ -633,13 +650,52 @@ fn validate_known(
     Ok(())
 }
 
+/// Event ids the model was shown: final utterances only.
+///
+/// The prompt renders `[event:N]` for those rows. A VAD, partial, prosody, or snapshot id is
+/// session-known but not evidence the model received, so it cannot be cited. Same contract as
+/// clustering and Ask.
+fn citable_event_ids(events: &[TimelineEvent]) -> HashSet<EventId> {
+    events
+        .iter()
+        .filter_map(|event| {
+            matches!(event.payload(), EventPayload::UtteranceFinal(_)).then_some(event.id())
+        })
+        .collect()
+}
+
+fn supported_notes(
+    draft: RecordingNotesDraft,
+    session_id: SessionId,
+    meeting_ids: &HashSet<EventId>,
+    bundle: &ContextBundle,
+) -> Result<RecordingNotes, MeetingNotesError> {
+    let external_ids = bundle
+        .excerpts()
+        .iter()
+        .map(|excerpt| excerpt.evidence_id.clone())
+        .collect();
+    let supported = draft.clone().retain_supported(meeting_ids, &external_ids);
+    let artifact = supported.finalize(session_id);
+    if artifact.sections.is_empty() {
+        let original = draft.finalize(session_id);
+        if original.sections.is_empty() {
+            return Err(MeetingNotesError::UncitedOutput);
+        }
+        validate_recording_notes_against_ids(&original, session_id, meeting_ids, bundle)?;
+        return Err(MeetingNotesError::UncitedOutput);
+    }
+    validate_recording_notes_against_ids(&artifact, session_id, meeting_ids, bundle)?;
+    Ok(artifact)
+}
+
 fn validate_recording_notes(
     notes: &RecordingNotes,
     session_id: SessionId,
     events: &[TimelineEvent],
     bundle: &ContextBundle,
 ) -> Result<(), MeetingNotesError> {
-    let ids = events.iter().map(TimelineEvent::id).collect();
+    let ids = citable_event_ids(events);
     validate_recording_notes_against_ids(notes, session_id, &ids, bundle)
 }
 

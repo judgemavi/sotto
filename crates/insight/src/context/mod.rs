@@ -401,7 +401,7 @@ async fn complete_raw(
 fn parse_turn<T: DeserializeOwned>(
     output: &str,
 ) -> Result<ReasoningTurn<T>, ReasoningContextError> {
-    let value: serde_json::Value = serde_json::from_str(strip_fence(output))?;
+    let value = parse_first_json_value(output)?;
     let Some(action) = value.get("action") else {
         return Ok(ReasoningTurn::Complete(serde_json::from_value(value)?));
     };
@@ -652,10 +652,28 @@ fn add_usage(total: &mut Usage, increment: Usage) {
         .saturating_add(increment.cache_write_tokens);
 }
 
+/// Reads the first complete JSON value in a provider reply.
+///
+/// Backends that cannot guarantee JSON-object mode (Codex) often emit a valid object and then
+/// leftover prose, a second object, or a closing fence. `serde_json::from_str` rejects that as
+/// trailing characters. The first complete value is the contract; leftover text is ignored.
+/// Truncated JSON still fails closed.
+pub(crate) fn parse_first_json_value(output: &str) -> Result<serde_json::Value, serde_json::Error> {
+    let body = json_payload(output);
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    Deserialize::deserialize(&mut deserializer)
+}
+
+fn json_payload(output: &str) -> &str {
+    let trimmed = strip_fence(output);
+    trimmed.find('{').map_or(trimmed, |index| &trimmed[index..])
+}
+
 fn strip_fence(output: &str) -> &str {
     let trimmed = output.trim();
     trimmed
         .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
         .and_then(|body| body.strip_suffix("```"))
         .map(str::trim)
         .unwrap_or(trimmed)
@@ -675,7 +693,7 @@ mod tests {
 
     use providers::{
         AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendId, ReasoningProvider,
-        Registry, Role,
+        ReasoningSurface, Registry,
     };
     use screen::{
         Frame, ImageInspectionPolicy, OcrEngine, RecordingBackedScreenInspector,
@@ -916,9 +934,9 @@ mod tests {
                 inputs: Arc::new(Mutex::new(Vec::new())),
             }),
         )?;
-        registry.select(Role::Summarizer, Some(&id))?;
+        registry.select(ReasoningSurface::Notes, Some(&id))?;
         let resolved = registry
-            .resolve(Role::Summarizer)?
+            .resolve(ReasoningSurface::Notes)?
             .ok_or("notes backend must resolve")?;
         let provider = resolved.provider();
         let result = complete_with_optional_inspection::<serde_json::Value>(
@@ -947,6 +965,67 @@ mod tests {
             "json_object output"
         );
         assert_eq!(resolved.normalization_observations().len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn trailing_characters_after_a_complete_object_are_ignored()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let turn = super::parse_turn::<serde_json::Value>(
+            r#"{"answer":"done"} leftover commentary from an unconstrained backend"#,
+        )?;
+        let super::ReasoningTurn::Complete(value) = turn else {
+            return Err(
+                "trailing text must not change a completed object into an inspection".into(),
+            );
+        };
+        assert_eq!(value["answer"], "done");
+        Ok(())
+    }
+
+    #[test]
+    fn leading_prose_and_an_unclosed_fence_still_yield_the_first_object()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let turn = super::parse_turn::<serde_json::Value>(
+            "Sure.\n```json\n{\"answer\":\"done\"}\n```\nand a closing remark",
+        )?;
+        let super::ReasoningTurn::Complete(value) = turn else {
+            return Err("the first object is the contract".into());
+        };
+        assert_eq!(value["answer"], "done");
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_json_still_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+        match super::parse_turn::<serde_json::Value>(r#"{"answer":"#) {
+            Err(super::ReasoningContextError::InvalidOutput(_)) => Ok(()),
+            Err(error) => {
+                Err(format!("incomplete JSON remains a parse error, got {error:?}").into())
+            }
+            Ok(_) => Err("truncated JSON must not be recovered".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_pass_accepts_trailing_characters_from_a_downgraded_json_object_backend()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let provider = QueueProvider {
+            outputs: Mutex::new(VecDeque::from([
+                r#"{"answer":"done"} trailing characters at line 1 column 1567"#.to_owned(),
+            ])),
+            inputs: Arc::new(Mutex::new(Vec::new())),
+        };
+        let result = complete_with_optional_inspection::<serde_json::Value>(
+            &provider,
+            "Return JSON",
+            "transcript".to_owned(),
+            &[],
+            None,
+        )
+        .await?;
+        assert_eq!(result.value["answer"], "done");
+        assert_eq!(result.calls, 1);
         Ok(())
     }
 }

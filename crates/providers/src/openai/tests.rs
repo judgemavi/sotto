@@ -21,7 +21,7 @@ use tokio::{
 use super::{OpenAiProvider, OutputFormat, normalize_sdk_error};
 use crate::{
     AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendId, CODEX_CLI_BACKEND_ID,
-    Registry, Role,
+    ReasoningSurface, Registry,
 };
 use async_openai::error::{ApiError, ApiErrorResponse, OpenAIError};
 
@@ -319,9 +319,9 @@ async fn sdk_request_maps_strict_schema_and_consented_bounded_image()
     let id = descriptor.id().clone();
     let mut registry = Registry::default();
     registry.register_reasoning(descriptor, Arc::new(provider))?;
-    registry.select(Role::Summarizer, Some(&id))?;
+    registry.select(ReasoningSurface::Notes, Some(&id))?;
     let resolved = registry
-        .resolve(Role::Summarizer)?
+        .resolve(ReasoningSurface::Notes)?
         .ok_or("OpenAI backend must resolve")?;
     let mut stream = resolved
         .provider()

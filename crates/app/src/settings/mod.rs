@@ -31,8 +31,9 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, FocusHandle, IntoElement, KeyDownEvent, Pixels,
-    Render, Subscription, Timer, Window, div, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, Context, Entity, EventEmitter, FocusHandle,
+    IntoElement, KeyDownEvent, Pixels, Render, Subscription, Timer, Window, div, ease_out_quint,
+    prelude::*, px,
 };
 use gpui_component::{
     Disableable, IconName, WindowExt as _,
@@ -41,7 +42,7 @@ use gpui_component::{
 };
 
 use crate::workspace::focus::Button;
-use providers::{CODEX_CLI_BACKEND_ID, OPENAI_RESPONSES_BACKEND_ID, Role};
+use providers::{CODEX_CLI_BACKEND_ID, OPENAI_RESPONSES_BACKEND_ID};
 use secrecy::SecretString;
 use sotto_core::SessionId;
 
@@ -50,7 +51,7 @@ use crate::{
     reasoning::ReasoningController,
     session::{RecordingLibrary, RecordingLibrarySnapshot},
     workspace::{
-        confirm_delete_dialog, delete_icon_button, icon_button,
+        confirm_delete_dialog, delete_icon_button, icon_button, motion,
         tokens::{Space, TypeScale, WorkspaceTokens},
     },
 };
@@ -322,14 +323,6 @@ impl SettingsView {
         let result = self
             .reasoning
             .update(cx, |controller, cx| controller.apply_to_all(backend, cx));
-        self.action_message = result.err().map(|error| error.to_string());
-        cx.notify();
-    }
-
-    fn select_role(&mut self, role: Role, backend: Option<&str>, cx: &mut Context<Self>) {
-        let result = self.reasoning.update(cx, |controller, cx| {
-            controller.select_role(role, backend, cx)
-        });
         self.action_message = result.err().map(|error| error.to_string());
         cx.notify();
     }
@@ -790,7 +783,8 @@ impl Render for SettingsView {
                     this.dismiss(cx);
                 }
             }))
-            .child(
+            .child(motion::rise_in(
+                "settings-page-enter",
                 div()
                     .w_full()
                     .max_w(SHEET_MAX_WIDTH)
@@ -847,6 +841,11 @@ impl Render for SettingsView {
                     .when_some(action_message, |view, message| {
                         view.child(notice(message, tokens))
                     }),
+            ))
+            .with_animation(
+                "settings-scrim-fade",
+                Animation::new(Duration::from_millis(240)).with_easing(ease_out_quint()),
+                |this, delta| this.opacity(delta),
             )
     }
 }
@@ -1000,9 +999,6 @@ impl SettingsView {
     /// The reasoning backend, and every source a summary may reach.
     fn summaries_pane(&self, tokens: WorkspaceTokens, cx: &mut Context<Self>) -> AnyElement {
         let reasoning = self.reasoning.read(cx);
-        let watcher = selection_label(reasoning, Role::Watcher);
-        let suggester = selection_label(reasoning, Role::Suggester);
-        let summarizer = selection_label(reasoning, Role::Summarizer);
         let openai_status = reasoning.openai_readiness().label();
         let codex_readiness = reasoning.codex_readiness();
         let codex_status = codex_readiness.label();
@@ -1038,15 +1034,15 @@ impl SettingsView {
                 true,
             ))
             .child(pane_group(
-                "Reasoning backends",
-                "No reasoning is the default. What each backend sends is stated on its own card, \
-                 and summarised under Storage & privacy.",
+                "Providers",
+                "Add a provider here. Notes and Ask each pick from the ones that are ready. If none \
+                 are ready, those features stay off and the recording remains usable.",
                 tokens,
             ))
             .child(
                 settings_card(
-                    "Default for new work",
-                    "Current state · role-specific selections below",
+                    "Use for Notes and Ask",
+                    "Sets both surfaces to the same ready provider, or turns both off.",
                     tokens,
                 )
                 .child(
@@ -1063,6 +1059,14 @@ impl SettingsView {
                                 .label("Use OpenAI for all")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.apply_to_all(Some(OPENAI_RESPONSES_BACKEND_ID), cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("all-codex", tokens)
+                                .label("Use Codex for all")
+                                .disabled(!codex_enabled || !codex_ready)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.apply_to_all(Some(CODEX_CLI_BACKEND_ID), cx);
                                 })),
                         ),
                 ),
@@ -1090,8 +1094,8 @@ impl SettingsView {
                                     .disabled(codex_checking)
                                     .on_click(cx.listener(|this, _, _, cx| this.check_codex(cx))),
                             )
-                            // ADR-0014's acknowledgement gate: Codex cannot become a role's
-                            // backend until this button has been pressed with the disclosure
+                            // ADR-0014's acknowledgement gate: Codex cannot be picked on Notes
+                            // or Ask until this button has been pressed with the disclosure
                             // above it on screen.
                             .child(if codex_enabled {
                                 Button::new("disable-codex", tokens)
@@ -1154,29 +1158,11 @@ impl SettingsView {
                 ),
             )
             .child(pane_group(
-                "Reasoning roles",
-                "Each role shows its current backend before the available changes.",
+                "Where a provider is used",
+                "Pick OpenAI or Codex on the Notes column and in Ask. Settings only adds or \
+                 removes providers.",
                 tokens,
             ))
-            .children([
-                role_controls("watcher", "Watcher", watcher, Role::Watcher, false, cx),
-                role_controls(
-                    "suggester",
-                    "Suggester",
-                    suggester,
-                    Role::Suggester,
-                    false,
-                    cx,
-                ),
-                role_controls(
-                    "summarizer",
-                    "Summarizer",
-                    summarizer,
-                    Role::Summarizer,
-                    codex_enabled && codex_ready,
-                    cx,
-                ),
-            ])
             .child(pane_group(
                 "Sources a summary may reach",
                 "Beyond the transcript, a summary sees only sources you enabled for that meeting.",
@@ -1428,49 +1414,6 @@ fn nav_item(
 
 fn pane_column() -> gpui::Div {
     div().w_full().min_w_0().flex().flex_col().gap(Space::MD)
-}
-
-fn selection_label(controller: &ReasoningController, role: Role) -> &'static str {
-    match controller.selected_id(role).map(|id| id.as_str()) {
-        Some(OPENAI_RESPONSES_BACKEND_ID) => "OpenAI API",
-        Some(CODEX_CLI_BACKEND_ID) => "Codex experimental",
-        Some(_) => "Unavailable backend",
-        None => "No reasoning",
-    }
-}
-
-fn role_controls(
-    id: &'static str,
-    label: &'static str,
-    current: &'static str,
-    role: Role,
-    codex_selectable: bool,
-    cx: &mut Context<SettingsView>,
-) -> impl IntoElement + use<> {
-    let tokens = WorkspaceTokens::resolve(cx);
-    settings_card(label, &format!("Current state · {current}"), tokens).child(
-        action_row()
-            .child(
-                Button::new((id, 0_u32), tokens)
-                    .label("No reasoning")
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_role(role, None, cx))),
-            )
-            .child(
-                Button::new((id, 1_u32), tokens)
-                    .label("OpenAI")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_role(role, Some(OPENAI_RESPONSES_BACKEND_ID), cx);
-                    })),
-            )
-            .child(
-                Button::new((id, 2_u32), tokens)
-                    .label("Codex")
-                    .disabled(!codex_selectable)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_role(role, Some(CODEX_CLI_BACKEND_ID), cx);
-                    })),
-            ),
-    )
 }
 
 /// A group heading inside a pane.

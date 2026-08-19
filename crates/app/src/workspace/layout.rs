@@ -43,7 +43,7 @@ use crate::session::SessionLifecycle;
 use super::{
     Button, MeetingWorkspace, OpenRecording, PersistedWorkspaceState, StageTab,
     control_row::{ControlRole, ControlRow},
-    delete_icon_button, library, notes,
+    delete_icon_button, library, motion, notes,
     tokens::{Space, TypeScale, WorkspaceTokens},
     transcript,
 };
@@ -219,6 +219,16 @@ impl Render for MeetingWorkspace {
             self.mcp.read(cx).servers(),
             self.mcp.read(cx).selected_grant(),
             &citation_times,
+            notes::NotesProviderPicker {
+                ready: self.notes_ready(cx),
+                openai_ok: self.reasoning.read(cx).openai_selectable(),
+                codex_ok: self.reasoning.read(cx).codex_selectable(),
+                selected: self
+                    .reasoning
+                    .read(cx)
+                    .selected_id(providers::ReasoningSurface::Notes)
+                    .map(|id| id.as_str().to_owned()),
+            },
             cx,
         );
 
@@ -260,12 +270,9 @@ impl Render for MeetingWorkspace {
             // The capture bar follows the *lifecycle*, not the stage: ADR-0015 requires Stop to
             // stay one visible action away even while the user reads a stopped session.
             .when(lifecycle.requires_visible_control(), |view| {
-                view.child(render_capture_bar(
-                    &lifecycle,
-                    self.live_started_at,
-                    width,
-                    tokens,
-                    cx,
+                view.child(motion::fade_in(
+                    "capture-bar-enter",
+                    render_capture_bar(&lifecycle, self.live_started_at, width, tokens, cx),
                 ))
             })
             .when_some(
@@ -341,7 +348,8 @@ impl Render for MeetingWorkspace {
                     // once for a change the maintainer asked for as one, and the left edge already
                     // belongs to the rail. Closed, it occupies nothing.
                     .when(self.ask_open, |view| {
-                        view.child(
+                        view.child(motion::fade_in(
+                            "ask-panel-enter",
                             div()
                                 .h_full()
                                 .w(ASK_PANEL_WIDTH)
@@ -349,8 +357,8 @@ impl Render for MeetingWorkspace {
                                 .debug_selector(|| "ask-panel".into())
                                 .border_l_1()
                                 .border_color(tokens.line)
-                                .child(self.ask_dock.clone()),
-                        )
+                                .child(self.ask_panel.clone()),
+                        ))
                     }),
             )
             // Settings, over the workspace it configures. `occlude` is what makes it modal: without
@@ -444,9 +452,9 @@ fn render_toolbar(
                         "toggle-library",
                         IconName::PanelLeft,
                         if library_collapsed {
-                            "Show the Library"
+                            "Show recents"
                         } else {
-                            "Hide the Library"
+                            "Hide recents"
                         },
                         tokens,
                     )
@@ -517,13 +525,15 @@ fn render_stage(
         .overflow_hidden()
         .debug_selector(|| "workspace-stage".into());
     match stage {
-        // Nothing is open, so the stage is Home: the three equally weighted ways a recording
-        // begins and what the library already holds, not an empty transcript.
+        // Nothing is open, so the stage is Home: Record a call and the quieter ways a recording
+        // begins, plus what the library already holds, not an empty transcript.
         Stage::Home | Stage::Prepared => stage_root.flex().child(
             div()
                 .h_full()
                 .flex_1()
                 .min_w_0()
+                .flex()
+                .flex_col()
                 .bg(tokens.surface)
                 .debug_selector(|| "stage-home".into())
                 .child(start_choices),
@@ -619,11 +629,13 @@ fn render_capture_bar(
     ControlRow::for_width(width)
         .child(
             ControlRole::Essential,
-            div()
-                .size(px(9.0))
-                .rounded_full()
-                .bg(tokens.live)
-                .debug_selector(|| "capture-record-dot".into()),
+            motion::live_pulse(
+                div()
+                    .size(px(9.0))
+                    .rounded_full()
+                    .bg(tokens.live)
+                    .debug_selector(|| "capture-record-dot".into()),
+            ),
         )
         .child(
             ControlRole::Essential,
@@ -644,15 +656,12 @@ fn render_capture_bar(
         .child(
             ControlRole::Expendable,
             div()
-                .flex()
-                .items_center()
-                .gap(Space::XS)
+                .min_w_0()
+                .text_size(TypeScale::BODY)
+                .text_color(tokens.muted)
+                .whitespace_nowrap()
                 .debug_selector(|| "capture-scope-chips".into())
-                .children(
-                    scope_chips(target)
-                        .into_iter()
-                        .map(|chip| scope_chip(chip, tokens)),
-                ),
+                .child(scope_sentence(target)),
         )
         .child(
             ControlRole::Essential,
@@ -1110,53 +1119,32 @@ fn capture_target_name(target: &sotto_core::CaptureTarget) -> String {
     }
 }
 
-/// The scope claims shown while recording, in the mock's vocabulary and never overstated.
+/// One sentence for the capture bar: what is in the recording, never overstated.
 ///
 /// This renders only inside `render_capture_bar`, which only ever draws for a live
 /// `SessionLifecycle::Running`/`Stopping`/`ProvisioningModel` state — an import never reaches it,
 /// since it has no live capture to show a bar for. The `Imported` arm below exists anyway, and is
 /// handled rather than matched away with `_`, because the alternative — falling through to the
 /// scoped-audio match below — would put a live capture-scope claim on a target that never had one.
-fn scope_chips(target: &sotto_core::CaptureTarget) -> Vec<String> {
+fn scope_sentence(target: &sotto_core::CaptureTarget) -> String {
     if target.is_microphone_only() {
-        return vec!["your mic only".to_owned(), "stays on this Mac".to_owned()];
+        return "This Mac’s microphone".to_owned();
     }
     if target.is_imported() {
-        return vec!["imported".to_owned(), "stays on this Mac".to_owned()];
+        return "A file on this Mac".to_owned();
     }
     let audio = if target.audio_scoped {
         match target.kind {
-            TargetKind::Application | TargetKind::Window => "app audio",
-            TargetKind::Display => "target audio",
+            TargetKind::Application | TargetKind::Window => "this app’s audio",
+            TargetKind::Display => "this display’s audio",
             TargetKind::Microphone | TargetKind::Imported => {
                 unreachable!("handled above")
             }
         }
     } else {
-        "system audio"
+        "this Mac’s audio"
     };
-    vec![
-        audio.to_owned(),
-        "screen".to_owned(),
-        "your mic".to_owned(),
-        "stays on this Mac".to_owned(),
-    ]
-}
-
-fn scope_chip(label: String, tokens: WorkspaceTokens) -> AnyElement {
-    div()
-        .flex_none()
-        .px(Space::SM)
-        .py(px(2.0))
-        .rounded_full()
-        .border_1()
-        .border_color(tokens.live_line)
-        .bg(tokens.surface)
-        .text_size(TypeScale::CHIP)
-        .text_color(tokens.muted)
-        .whitespace_nowrap()
-        .child(label)
-        .into_any_element()
+    format!("{audio} · screen · this Mac’s microphone")
 }
 
 fn view_meta(session: &SessionSummary, recording: Option<&OpenRecording>) -> String {
@@ -1762,6 +1750,32 @@ mod tests {
             visual.debug_bounds("start-choices").is_some(),
             "the three ways a session begins must be mounted, not merely built"
         );
+        let capture = visual
+            .debug_bounds("start-choice-capture")
+            .ok_or_else(|| std::io::Error::other("Record a call must be a real control on Home"))?;
+        assert!(
+            capture.size.width >= px(400.0),
+            "Record a call must span the home column the way the mock does, not hug its label; got {}",
+            capture.size.width
+        );
+        let room = visual
+            .debug_bounds("start-choice-microphone")
+            .ok_or_else(|| std::io::Error::other("Just this room must be on Home"))?;
+        let file = visual
+            .debug_bounds("start-choice-import")
+            .ok_or_else(|| std::io::Error::other("Add a file must be on Home"))?;
+        assert!(
+            room.size.width >= px(180.0) && file.size.width >= px(180.0),
+            "the quieter actions share the home column, not a shrink-wrapped label row"
+        );
+        let prepare = visual
+            .debug_bounds("prepare-entry-card")
+            .ok_or_else(|| std::io::Error::other("Name this entry must sit on Home"))?;
+        assert!(
+            prepare.size.width >= px(400.0),
+            "the name field must fill the column beside Save for later; got {}",
+            prepare.size.width
+        );
         assert!(
             visual.debug_bounds("home-model-setup").is_some(),
             "Home must offer a model choice before any transcription action is available"
@@ -2206,7 +2220,7 @@ mod tests {
         );
         assert_eq!(
             measured.claim(),
-            "1 entry · 1 recording · no retained media — all on this Mac.",
+            "1 entry · 1 recording · no media kept — all of it stays here.",
             "Home must report what the store actually holds, never an invented figure"
         );
         Ok(())

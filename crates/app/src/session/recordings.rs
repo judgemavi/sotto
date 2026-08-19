@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use asr::{Config as AsrConfig, LaggedRecordingTranscriber, RecordingConfig};
+use capture::macos::probe_recording;
 use rag::{QuarantineRecovery, RecordingReference, RecordingUsage, Store};
-use sotto_core::types::{RecordingMissingReason, SessionRecording};
+use sotto_core::types::{
+    MediaTimeMapping, RecordingContainer, RecordingMissingReason, SessionRecording,
+};
 use sotto_core::{RagError, RecordingStatus, RecordingTranscriber, SessionId, TranscriptUpdate};
 
 use crate::persistence_runtime::block_on;
@@ -127,14 +130,24 @@ impl RecordingLibrary {
                 return Err("This meeting's recording is no longer retained.".to_owned());
             }
             RecordingReference::Growing {
-                finalization_error: Some(error),
-                ..
-            } => return Err(format!("This recording did not finalize: {error}")),
-            RecordingReference::Growing { .. } => {
-                return Err(
-                    "Wait for this meeting's recording to finish before re-transcribing."
-                        .to_owned(),
-                );
+                session_id: growing_id,
+                path,
+                finalization_error,
+            } => {
+                // Stop can time out while Swift is still remuxing. The MP4 often becomes
+                // playable afterwards; refuse only if this file still is not.
+                if !block_on(settle_if_playable(&store, growing_id, &path))
+                    .map_err(|error| error.to_string())?
+                {
+                    return Err(match finalization_error {
+                        Some(error) => format!("This recording did not finalize: {error}"),
+                        None => {
+                            "Wait for this meeting's recording to finish before re-transcribing."
+                                .to_owned()
+                        }
+                    });
+                }
+                path
             }
         };
         let model = model_path
@@ -164,25 +177,63 @@ impl RecordingLibrary {
         &self.directory
     }
 
-    /// Resolves any `.{session_id}.deleting` tombstone a crash left behind mid-delete.
+    /// Resolves launch-time recording rows that the stop path left inconsistent.
     ///
-    /// `Store::enforce_recording_budget` already calls `Store::recover_quarantined_media` first,
-    /// but its only callers today are "after a recording settles" and "when the retention budget
-    /// changes" — neither runs at application launch. Without this, a crash mid-delete leaves a
-    /// recording's row claiming available media that is actually sitting under a tombstone name
-    /// until the user happens to start another recording: the library lists it, and opening it to
-    /// play fails, for however long that takes.
+    /// Two cases:
     ///
-    /// The caller decides how to treat a failure; this only wraps the store call with the directory
-    /// the way every other method here does, and never touches a row itself.
+    /// - A `.{session_id}.deleting` tombstone a crash left behind mid-delete.
+    ///   `Store::enforce_recording_budget` already calls `Store::recover_quarantined_media` first,
+    ///   but its only other callers are "after a recording settles" and "when the retention budget
+    ///   changes" — neither runs at application launch.
+    /// - A `growing` row whose MP4 later became playable. Stop used to wait only five seconds for
+    ///   remux, then stamp `finalization_error` and refuse Re-transcribe forever even after the
+    ///   file landed. Settling those rows makes the meeting playable and re-transcribable again.
+    ///
+    /// The caller decides how to treat a failure; this never blocks review of meetings that are
+    /// already consistent.
     pub fn recover_at_launch(&self) -> Result<Vec<QuarantineRecovery>, RagError> {
         block_on(async {
-            Store::open(&self.database)
-                .await?
-                .recover_quarantined_media(&self.directory)
-                .await
+            let store = Store::open(&self.database).await?;
+            let resolved = store.recover_quarantined_media(&self.directory).await?;
+            settle_playable_growing_recordings(&store).await?;
+            Ok(resolved)
         })
     }
+}
+
+async fn settle_playable_growing_recordings(store: &Store) -> Result<(), RagError> {
+    for reference in store.list_recording_references().await? {
+        let RecordingReference::Growing {
+            session_id, path, ..
+        } = reference
+        else {
+            continue;
+        };
+        settle_if_playable(store, session_id, &path).await?;
+    }
+    Ok(())
+}
+
+/// Promotes a stranded growing row to available when `probe_recording` can read the file.
+async fn settle_if_playable(
+    store: &Store,
+    session_id: SessionId,
+    path: &str,
+) -> Result<bool, RagError> {
+    let Ok(probe) = probe_recording(Path::new(path)) else {
+        return Ok(false);
+    };
+    store
+        .save_recording(&SessionRecording::Available {
+            session_id,
+            path: path.to_owned(),
+            container: RecordingContainer::Mp4,
+            duration: probe.duration,
+            byte_size: probe.byte_size,
+            time_mapping: MediaTimeMapping::IDENTITY,
+        })
+        .await?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -386,6 +437,67 @@ mod tests {
             library.snapshot()?.usage.used_bytes,
             0,
             "deleting an imported recording must immediately free its accounted bytes"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recover_at_launch_leaves_unplayable_growing_rows_in_place()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("sotto.sqlite3");
+        let recordings = directory.path().join("recordings");
+        std::fs::create_dir_all(&recordings)?;
+        let store = Store::open(&database).await?;
+        let session_id = SessionId::new(71);
+        store
+            .save_session(&Session::new(
+                session_id,
+                CaptureTarget {
+                    bundle_id: Some("us.zoom.xos".to_owned()),
+                    display_name: "Zoom".to_owned(),
+                    window_title: Some("Stranded mux".to_owned()),
+                    kind: TargetKind::Window,
+                    audio_scoped: true,
+                },
+                1_000,
+            ))
+            .await?;
+        let path = recordings.join("71.mp4");
+        std::fs::write(&path, vec![9_u8; 16])?;
+        store.save_growing_recording(session_id, &path).await?;
+        store
+            .mark_recording_finalization_failed(
+                session_id,
+                "Recording finalization failed: The local recording did not finish within five seconds.",
+            )
+            .await?;
+        let library = RecordingLibrary::new(&database, &recordings);
+
+        library.recover_at_launch()?;
+
+        assert!(
+            matches!(
+                Store::open(&database)
+                    .await?
+                    .load_recording_reference(session_id)
+                    .await?,
+                Some(RecordingReference::Growing {
+                    finalization_error: Some(reason),
+                    ..
+                }) if reason.contains("did not finish within five seconds")
+            ),
+            "junk bytes must not be promoted to an available recording"
+        );
+        let result = library.retranscribe(session_id, Path::new("/nonexistent-whisper-model"));
+        assert!(
+            result.as_ref().is_err(),
+            "unplayable growing media must still refuse re-transcribe"
+        );
+        let error = result.err().unwrap_or_default();
+        assert!(
+            error.contains("did not finalize"),
+            "re-transcribe must keep the original finalization reason when the file is unplayable, got {error}"
         );
         Ok(())
     }

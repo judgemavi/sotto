@@ -1,9 +1,9 @@
-//! The recording library rail, Home, and the three equally weighted ways a session begins.
+//! The recording library rail, Home, and the three ways a session begins.
 //!
 //! ADR-0019 makes a session a *recording of something*, so the rail is a **Library** rather than a
-//! list of meetings, and starting one is not a single button. Capturing an app, recording only the
-//! microphone, and importing a file are three first-class beginnings; the home surface must not
-//! rank them by promoting one to a button and demoting the others to links.
+//! list of meetings. Home's job is still to start one: **Record a call** is the obvious action,
+//! with Just this room and Add a file sitting beside it as quieter peers. The three beginnings
+//! stay first-class in the rail and in tests; Home just stops presenting them as equal cards.
 //!
 //! T078 makes **Home the rail's first entry** rather than a separate navigation surface. The rail
 //! is already the only navigator in the shell, so the way back to the entry points belongs in it,
@@ -26,7 +26,7 @@ use crate::session::{
 use chrono::Datelike as _;
 use gpui::{
     AnyElement, Context, Entity, FontWeight, Global, MouseButton, Pixels, Rgba, Subscription,
-    Timer, Window, div, prelude::*, px,
+    Timer, Window, div, prelude::*, px, relative,
 };
 use gpui_component::{
     Disableable as _, Sizable as _,
@@ -47,6 +47,7 @@ use super::{
     control_row::{ControlRole, ControlRow},
     icons,
     layout::format_bytes,
+    motion,
     tokens::{Space, TypeScale, WorkspaceTokens},
 };
 use crate::session::RecordingLibrary;
@@ -145,7 +146,7 @@ impl LibraryFootprint {
     /// The Home rail entry's second line. Short, because the rail is narrow.
     fn meta(self) -> String {
         if self.entries == 0 {
-            return "no entries yet".to_owned();
+            return "nothing yet".to_owned();
         }
         if self.retained_bytes == 0 {
             return format!("{} · no retained media", self.count());
@@ -156,7 +157,7 @@ impl LibraryFootprint {
     /// The one storage claim the home surface makes, in ADR-0019's vocabulary.
     pub(crate) fn claim(self) -> String {
         if self.entries == 0 {
-            return "No entries yet — Sotto is storing nothing on this Mac.".to_owned();
+            return "Nothing stored on this Mac yet.".to_owned();
         }
         let recordings = if self.recordings == 1 {
             "1 recording".to_owned()
@@ -165,12 +166,12 @@ impl LibraryFootprint {
         };
         if self.retained_bytes == 0 {
             return format!(
-                "{} · {recordings} · no retained media — all on this Mac.",
+                "{} · {recordings} · no media kept — all of it stays here.",
                 self.count()
             );
         }
         format!(
-            "{} · {recordings} · {} retained — all on this Mac.",
+            "{} · {recordings} · {} — all of it stays here.",
             self.count(),
             format_bytes(self.retained_bytes)
         )
@@ -778,12 +779,7 @@ fn commit_entry_rename(workspace: &mut MeetingWorkspace, cx: &mut Context<Meetin
         .err()
         .map(|error| format!("Could not rename this entry: {error}"));
     workspace.rebuild_library_index(cx);
-    workspace.sync_ask_scope(
-        workspace
-            .reasoning_backend(cx)
-            .is_ok_and(|backend| backend.is_some()),
-        cx,
-    );
+    workspace.sync_ask_scope(workspace.ask_ready(cx), cx);
     cx.notify();
 }
 
@@ -838,14 +834,13 @@ fn render_head(total: usize, tokens: WorkspaceTokens) -> AnyElement {
                 .text_size(TypeScale::META)
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(tokens.faint)
-                .child("LIBRARY"),
+                .child("Recents"),
         )
         .spacer()
         .child(
             ControlRole::Essential,
             div()
                 .debug_selector(|| "library-count".into())
-                .font_family("Menlo")
                 .text_size(TypeScale::META)
                 .text_color(tokens.faint)
                 .child(total.to_string()),
@@ -927,7 +922,6 @@ fn rail_face(face: RailFace, tokens: WorkspaceTokens) -> impl IntoElement {
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
-                        .font_family("Menlo")
                         .text_size(TypeScale::META)
                         .text_color(meta_color)
                         .child(meta),
@@ -967,9 +961,7 @@ fn render_home_row(
                 .when(!selected, |view| {
                     view.hover(move |view| view.bg(tokens.surface_2))
                 })
-                .tooltip(|window, cx| {
-                    Tooltip::new("Home — the ways a recording begins").build(window, cx)
-                })
+                .tooltip(|window, cx| Tooltip::new("Home — start a recording").build(window, cx))
                 .on_click(cx.listener(|this, _, _, cx| this.show_home(cx)))
                 .child(rail_face(
                     RailFace {
@@ -1213,9 +1205,7 @@ fn commit_rename(workspace: &mut MeetingWorkspace, cx: &mut Context<MeetingWorks
             if workspace.message.is_none() {
                 workspace.rebuild_library_index(cx);
             }
-            let ready = workspace
-                .reasoning_backend(cx)
-                .is_ok_and(|backend| backend.is_some());
+            let ready = workspace.ask_ready(cx);
             workspace.sync_ask_scope(ready, cx);
         }
         Err(error) => {
@@ -1272,7 +1262,7 @@ fn render_rename_row(
         .into_any_element()
 }
 
-/// One of the three equally weighted ways a session begins.
+/// One of the three ways a session begins.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartChoice {
     /// Screen and audio from one picked application. Wired today.
@@ -1284,7 +1274,9 @@ pub(crate) enum StartChoice {
     Import,
 }
 
-/// Presentation order. All three carry identical weight — same card, same chrome, same type.
+/// Presentation order. Tests pin that all three remain first-class even though Home
+/// visually ranks Record a call.
+#[cfg(test)]
 pub(crate) const START_CHOICES: [StartChoice; 3] = [
     StartChoice::CaptureApp,
     StartChoice::Microphone,
@@ -1292,6 +1284,7 @@ pub(crate) const START_CHOICES: [StartChoice; 3] = [
 ];
 
 impl StartChoice {
+    #[cfg(test)]
     pub(crate) const fn icon(self) -> &'static str {
         match self {
             Self::CaptureApp => icons::CAPTURED,
@@ -1302,18 +1295,19 @@ impl StartChoice {
 
     pub(crate) const fn title(self) -> &'static str {
         match self {
-            Self::CaptureApp => "Capture an app",
-            Self::Microphone => "Record just your microphone",
-            Self::Import => "Import audio or video",
+            Self::CaptureApp => "Record a call",
+            Self::Microphone => "Just this room",
+            Self::Import => "Add a file",
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn description(self) -> &'static str {
         match self {
-            Self::CaptureApp => "Screen and audio from one app — nothing else is heard.",
+            Self::CaptureApp => "Pick the window. Sotto hears that call and nothing else.",
             Self::Microphone => "A voice note, an interview in the room, thinking out loud.",
             Self::Import => {
-                "A file becomes a session — same transcript, same notes, same retention."
+                "A recording you already have. Same transcript, same notes, stays here."
             }
         }
     }
@@ -1431,114 +1425,181 @@ pub(crate) fn render_start_choices(
         .min_w_0()
         .overflow_hidden()
         .flex()
-        .items_center()
+        .flex_col()
         .justify_center()
-        .p(px(24.0))
+        .px(px(32.0))
+        .py(px(40.0))
         .child(
             div()
                 .w_full()
-                .max_w(px(430.0))
                 .min_w_0()
                 .flex()
-                .flex_col()
-                .child(
+                .justify_center()
+                .child(motion::fade_in_fill(
+                    "home-enter",
                     div()
-                        .text_size(px(19.0))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(tokens.ink)
-                        .child("Start with an entry."),
-                )
-                .child(
-                    div()
-                        .mt(Space::SM)
-                        .mb(px(20.0))
-                        .text_size(px(13.0))
-                        .text_color(tokens.muted)
+                        .w(px(440.0))
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
                         .child(
-                            "Prepare before a call, capture straight into a new entry, or import a \
-                             file. Each entry keeps its recordings and one notes document on this \
-                             Mac.",
-                        ),
-                )
-                .child(
-                    div()
-                        .mb(px(14.0))
-                        .p(px(12.0))
-                        .rounded(px(10.0))
-                        .border_1()
-                        .border_color(tokens.line)
-                        .bg(tokens.surface)
-                        .debug_selector(|| "prepare-entry-card".into())
-                        .child(Input::new(entry_title).small())
+                            div()
+                                .mb(Space::SM)
+                                .text_size(TypeScale::META)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(tokens.accent_ink)
+                                .child("On this Mac"),
+                        )
                         .child(
-                            div().mt(Space::SM).child(
-                                Button::new("prepare-entry", tokens)
-                                    .label("Prepare an entry")
-                                    .primary()
-                                    .with_size(gpui_component::Size::Small)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.create_prepared_entry(window, cx);
-                                    })),
-                            ),
+                            div()
+                                .font_family(TypeScale::READING)
+                                .text_size(TypeScale::DISPLAY)
+                                .font_weight(FontWeight::MEDIUM)
+                                .line_height(relative(1.15))
+                                .text_color(tokens.ink)
+                                .child("Ready when the call is."),
+                        )
+                        .child(
+                            div()
+                                .mt(Space::MD)
+                                .mb(px(28.0))
+                                .text_size(TypeScale::LEDE)
+                                .line_height(relative(1.5))
+                                .text_color(tokens.muted)
+                                .child(
+                                    "Pick the window. Sotto hears that call, writes it down here, \
+                                     and keeps it on this computer.",
+                                ),
+                        )
+                        .when(recording_in_flight, |view| {
+                            view.child(
+                                div()
+                                    .debug_selector(|| "home-live-note".into())
+                                    .w_full()
+                                    .mb(px(16.0))
+                                    .px(px(12.0))
+                                    .py(px(10.0))
+                                    .rounded(px(10.0))
+                                    .border_1()
+                                    .border_color(tokens.live_line)
+                                    .bg(tokens.live_wash)
+                                    .text_size(TypeScale::META)
+                                    .text_color(tokens.live_ink)
+                                    .child("A recording is running. Stop is in the bar above."),
+                            )
+                        })
+                        .when(show_model_setup, |view| {
+                            view.child(render_model_setup(
+                                selected_model,
+                                model_availability,
+                                tokens,
+                                cx,
+                            ))
+                        })
+                        .child(render_start_control(
+                            StartChoice::CaptureApp,
+                            StartControlKind::Primary,
+                            can_start,
+                            transcription_unavailability.clone(),
+                            tokens,
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .w_full()
+                                .mt(px(10.0))
+                                .flex()
+                                .gap(Space::SM)
+                                .child(render_start_control(
+                                    StartChoice::Microphone,
+                                    StartControlKind::Quiet,
+                                    can_start,
+                                    transcription_unavailability.clone(),
+                                    tokens,
+                                    cx,
+                                ))
+                                .child(render_start_control(
+                                    StartChoice::Import,
+                                    StartControlKind::Quiet,
+                                    can_start,
+                                    transcription_unavailability,
+                                    tokens,
+                                    cx,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .mt(px(16.0))
+                                .flex()
+                                .items_center()
+                                .gap(Space::SM)
+                                .debug_selector(|| "prepare-entry-card".into())
+                                .child(
+                                    div().flex_1().min_w_0().child(
+                                        Input::new(entry_title)
+                                            .w_full()
+                                            .h(px(40.0))
+                                            .rounded(px(12.0))
+                                            .border_color(tokens.line),
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .id("prepare-entry")
+                                        .h(px(40.0))
+                                        .px(px(12.0))
+                                        .rounded(px(12.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .flex_none()
+                                        .text_size(TypeScale::CONTROL)
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(tokens.muted)
+                                        .cursor_pointer()
+                                        .hover(|view| {
+                                            view.bg(tokens.surface_2).text_color(tokens.ink)
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.create_prepared_entry(window, cx);
+                                        }))
+                                        .child("Save for later"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "home-footprint".into())
+                                .w_full()
+                                .mt(px(22.0))
+                                .text_size(px(13.0))
+                                .text_color(tokens.faint)
+                                .child(footprint.claim()),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .mt(Space::XS)
+                                .text_size(px(13.0))
+                                .text_color(tokens.faint)
+                                .child(
+                                    "Audio never leaves this Mac. Notes only leave if you turn \
+                                     that on.",
+                                ),
                         ),
-                )
-                .when(recording_in_flight, |view| {
-                    view.child(
-                        div()
-                            .debug_selector(|| "home-live-note".into())
-                            .mb(px(16.0))
-                            .px(px(12.0))
-                            .py(px(10.0))
-                            .rounded(px(10.0))
-                            .border_1()
-                            .border_color(tokens.live_line)
-                            .bg(tokens.live_wash)
-                            .text_size(px(12.0))
-                            .text_color(tokens.live_ink)
-                            .child(
-                                "A recording is running. Stop is in the bar above, and the \
-                                 recording itself is in the Library under Now.",
-                            ),
-                    )
-                })
-                .when(show_model_setup, |view| {
-                    view.child(render_model_setup(
-                        selected_model,
-                        model_availability,
-                        tokens,
-                        cx,
-                    ))
-                })
-                .children(START_CHOICES.into_iter().map(|choice| {
-                    render_start_card(
-                        choice,
-                        can_start,
-                        transcription_unavailability.clone(),
-                        tokens,
-                        cx,
-                    )
-                }))
-                .child(
-                    div()
-                        .debug_selector(|| "home-footprint".into())
-                        .mt(px(14.0))
-                        .text_size(px(11.5))
-                        .text_color(tokens.faint)
-                        .child(footprint.claim()),
-                )
-                .child(
-                    div()
-                        .mt(px(2.0))
-                        .text_size(px(11.5))
-                        .text_color(tokens.faint)
-                        .child("Recordings are transcribed on this Mac and never uploaded."),
-                ),
+                )),
         )
         .into_any_element()
 }
 
-fn render_start_card(
+enum StartControlKind {
+    Primary,
+    Quiet,
+}
+
+fn render_start_control(
     choice: StartChoice,
+    kind: StartControlKind,
     can_start: bool,
     model_blocked: Option<String>,
     tokens: WorkspaceTokens,
@@ -1551,72 +1612,57 @@ fn render_start_card(
             Some("A recording is already running — stop it first.".to_owned())
         }
     });
-    let card = div()
+    let primary = matches!(kind, StartControlKind::Primary);
+    let control = div()
         .debug_selector(move || choice.element_id().into())
         .id(choice.element_id())
         .w_full()
+        .h(if primary { px(48.0) } else { px(40.0) })
+        .rounded(if primary { px(14.0) } else { px(12.0) })
         .flex()
         .items_center()
-        .gap(Space::MD)
-        .px(px(14.0))
-        .py(px(13.0))
-        .mb(Space::SM)
-        .rounded(px(11.0))
-        .border_1()
-        .border_color(tokens.line)
-        .bg(tokens.surface)
-        .child(
-            div()
-                .size(px(34.0))
-                .flex_none()
-                .rounded(px(9.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .border_1()
-                .border_color(tokens.accent_line)
-                .bg(tokens.accent_wash)
-                .text_size(px(16.0))
-                .text_color(tokens.accent)
-                .child(icons::marker(choice.icon())),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .overflow_hidden()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .text_size(px(13.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(tokens.ink)
-                        .child(choice.title()),
-                )
-                .child(
-                    div()
-                        .mt(px(1.0))
-                        .text_size(px(12.0))
-                        .text_color(tokens.muted)
-                        .child(choice.description()),
-                )
-                .when_some(blocked.clone(), |view, note| {
-                    view.child(
-                        div()
-                            .mt(Space::XS)
-                            .text_size(px(11.5))
-                            .text_color(tokens.warn)
-                            .child(note),
-                    )
-                }),
-        );
-    if blocked.is_some() {
-        return card.cursor_default().into_any_element();
-    }
-    card.cursor_pointer()
-        .hover(move |view| view.bg(tokens.surface_2).border_color(tokens.accent_line))
-        .on_click(cx.listener(move |this, _, _, cx| choice.begin(this, cx)))
+        .justify_center()
+        .px(Space::MD)
+        .text_size(if primary {
+            TypeScale::LEDE
+        } else {
+            TypeScale::CONTROL
+        })
+        .font_weight(FontWeight::SEMIBOLD)
+        .when(primary, |view| {
+            view.bg(tokens.ink).text_color(tokens.accent_on)
+        })
+        .when(!primary, |view| view.text_color(tokens.muted))
+        .child(choice.title());
+    let control = if blocked.is_some() {
+        control.opacity(0.55).cursor_default()
+    } else {
+        control
+            .cursor_pointer()
+            .hover(move |view| {
+                if primary {
+                    view.opacity(0.92)
+                } else {
+                    view.bg(tokens.surface_2).text_color(tokens.ink)
+                }
+            })
+            .on_click(cx.listener(move |this, _, _, cx| choice.begin(this, cx)))
+    };
+    div()
+        .w_full()
+        .when(!primary, |view| view.flex_1().min_w_0())
+        .flex()
+        .flex_col()
+        .child(control)
+        .when_some(blocked, |view, note| {
+            view.child(
+                div()
+                    .mt(Space::XS)
+                    .text_size(TypeScale::META)
+                    .text_color(tokens.warn)
+                    .child(note),
+            )
+        })
         .into_any_element()
 }
 
@@ -1627,6 +1673,13 @@ fn render_model_setup(
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
     let provisioning = matches!(availability, ModelAvailability::Provisioning(_));
+    let download_fraction = match &availability {
+        ModelAvailability::Provisioning(progress) if progress.total > 0 => {
+            Some(progress.downloaded as f32 / progress.total as f32)
+        }
+        ModelAvailability::Provisioning(_) => Some(0.0),
+        _ => None,
+    };
     let status = match availability {
         ModelAvailability::Checking => "Checking the selected model on this Mac…".to_owned(),
         ModelAvailability::Missing => format!(
@@ -1653,7 +1706,7 @@ fn render_model_setup(
                 .text_size(px(13.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(tokens.ink)
-                .child("Choose your local transcription model"),
+                .child("Get ready to transcribe"),
         )
         .child(
             div()
@@ -1662,6 +1715,13 @@ fn render_model_setup(
                 .text_color(tokens.muted)
                 .child(status),
         )
+        .when_some(download_fraction, |view, fraction| {
+            view.child(
+                div()
+                    .mt(Space::SM)
+                    .child(motion::measured_progress(fraction, tokens)),
+            )
+        })
         .children(MODEL_CHOICES.into_iter().enumerate().map(|(index, size)| {
             let description = match size {
                 asr::ModelSize::BaseEn => "Smallest download and lightest runtime cost.",
@@ -2235,7 +2295,7 @@ mod tests {
     fn home_states_the_measured_footprint_and_nothing_else() {
         assert_eq!(
             LibraryFootprint::default().claim(),
-            "No entries yet — Sotto is storing nothing on this Mac.",
+            "Nothing stored on this Mac yet.",
             "an empty library says it is storing nothing rather than showing 0 B"
         );
         let transcripts_only = LibraryFootprint {
@@ -2245,7 +2305,7 @@ mod tests {
         };
         assert_eq!(
             transcripts_only.claim(),
-            "3 entries · 3 recordings · no retained media — all on this Mac.",
+            "3 entries · 3 recordings · no media kept — all of it stays here.",
             "recordings whose media is gone must say so, not report zero bytes"
         );
         assert_eq!(
@@ -2260,7 +2320,7 @@ mod tests {
         };
         assert_eq!(
             retained.claim(),
-            "1 entry · 1 recording · 2.1 GB retained — all on this Mac.",
+            "1 entry · 1 recording · 2.1 GB — all of it stays here.",
             "one recording is singular and its size is the shell's own byte formatting"
         );
         assert_eq!(

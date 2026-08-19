@@ -219,7 +219,7 @@ async fn main() -> Result<()> {
             let resolved = cli::reasoning::resolve_keychain_backend(
                 choice,
                 model.as_deref(),
-                providers::Role::Summarizer,
+                providers::ReasoningSurface::Notes,
             )?;
             let Some(resolved) = resolved else {
                 println!(r#"{{"status":"reasoning_disabled"}}"#);
@@ -240,7 +240,7 @@ async fn main() -> Result<()> {
             let resolved = cli::reasoning::resolve_keychain_backend(
                 choice,
                 model.as_deref(),
-                providers::Role::Summarizer,
+                providers::ReasoningSurface::Notes,
             )?;
             let Some(resolved) = resolved else {
                 println!(r#"{{"status":"reasoning_disabled"}}"#);

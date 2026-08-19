@@ -496,7 +496,8 @@ mod tests {
     use futures_util::stream;
     use providers::backend::{ObservedRequestNormalization, RequestNormalization, SamplingControl};
     use providers::{
-        AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendId, Registry, Role,
+        AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendId, ReasoningSurface,
+        Registry,
     };
     use rag::Store;
     use sotto_core::{
@@ -648,9 +649,9 @@ mod tests {
         )?;
         let mut registry = Registry::default();
         registry.register(descriptor, Arc::new(ReplayProvider(AtomicBool::new(false))))?;
-        registry.select(Role::Summarizer, Some(&backend_id))?;
+        registry.select(ReasoningSurface::Notes, Some(&backend_id))?;
         let backend = registry
-            .resolve(Role::Summarizer)?
+            .resolve(ReasoningSurface::Notes)?
             .ok_or("summarizer resolution missing")?;
         let fresh =
             MeetingNotesGenerator::new(&store, Arc::new(ReplayProvider(AtomicBool::new(false))))
@@ -965,7 +966,7 @@ mod tests {
 
         use providers::{
             AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendId,
-            ReasoningProvider, Registry, ResolvedBackend, Role,
+            ReasoningProvider, ReasoningSurface, Registry, ResolvedBackend,
         };
         use rag::Store;
         use screen::{
@@ -1220,9 +1221,9 @@ mod tests {
             )?;
             let mut registry = Registry::default();
             registry.register_reasoning(descriptor, provider)?;
-            registry.select(Role::Summarizer, Some(&id))?;
+            registry.select(ReasoningSurface::Notes, Some(&id))?;
             registry
-                .resolve(Role::Summarizer)?
+                .resolve(ReasoningSurface::Notes)?
                 .ok_or_else(|| "the test backend must resolve".into())
         }
 

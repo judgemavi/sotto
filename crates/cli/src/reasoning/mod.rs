@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use insight::{ClusterReport, Clusterer, Summarizer, SummaryReport};
 use providers::openai::OpenAiProvider;
-use providers::{BackendCapability, Registry, ResolvedBackend, Role};
+use providers::{BackendCapability, ReasoningSurface, Registry, ResolvedBackend};
 use rag::Store;
 use screen::ScreenInspectionSource;
 use sotto_core::SessionId;
@@ -31,18 +31,18 @@ impl BackendChoice {
     }
 }
 
-/// Builds the same open registry used by product settings and pins one role for this call.
+/// Builds the same open registry used by product settings and pins Notes for this call.
 pub fn resolve_keychain_backend(
     choice: BackendChoice,
     model: Option<&str>,
-    role: Role,
+    surface: ReasoningSurface,
 ) -> Result<Option<ResolvedBackend>> {
     match choice {
         BackendChoice::None => Ok(None),
         BackendChoice::OpenAi => {
             let model = required_model(model)?;
             let provider = Arc::new(OpenAiProvider::from_keychain(model)?);
-            resolve_registered(provider, role)
+            resolve_registered(provider, surface)
         }
         BackendChoice::CodexUnavailable => bail!(
             "Codex reasoning is unavailable: T030 isolation failed; no executable or credential probe was attempted"
@@ -53,14 +53,14 @@ pub fn resolve_keychain_backend(
 /// Registers a concrete OpenAI provider without Keychain access, used by credential-free evals.
 pub fn resolve_registered(
     provider: Arc<OpenAiProvider>,
-    role: Role,
+    surface: ReasoningSurface,
 ) -> Result<Option<ResolvedBackend>> {
     let descriptor = provider.descriptor()?;
     let id = descriptor.id().clone();
     let mut registry = Registry::default();
     registry.register_reasoning(descriptor, provider)?;
-    registry.select(role, Some(&id))?;
-    registry.resolve(role).map_err(Into::into)
+    registry.select(surface, Some(&id))?;
+    registry.resolve(surface).map_err(Into::into)
 }
 
 pub async fn summarize(
@@ -227,16 +227,19 @@ mod tests {
     use std::time::Duration;
 
     use super::{BackendChoice, latency_report, resolve_keychain_backend};
-    use providers::Role;
+    use providers::ReasoningSurface;
 
     #[test]
     fn no_reasoning_is_normal_and_codex_is_unavailable() -> Result<(), Box<dyn std::error::Error>> {
         assert!(
-            resolve_keychain_backend(BackendChoice::None, None, Role::Summarizer)?.is_none(),
+            resolve_keychain_backend(BackendChoice::None, None, ReasoningSurface::Notes)?.is_none(),
             "no reasoning must not touch credentials or construct a provider"
         );
-        let codex =
-            resolve_keychain_backend(BackendChoice::CodexUnavailable, None, Role::Summarizer);
+        let codex = resolve_keychain_backend(
+            BackendChoice::CodexUnavailable,
+            None,
+            ReasoningSurface::Notes,
+        );
         assert!(
             codex
                 .as_ref()

@@ -18,7 +18,7 @@ mod tests {
     use futures_util::{StreamExt, stream};
     use providers::{
         AuthKind, AuthStatus, BackendCapabilities, BackendCapability, BackendDescriptor, BackendId,
-        ReasoningProvider, Registry, Role, openai::OpenAiProvider,
+        ReasoningProvider, ReasoningSurface, Registry, openai::OpenAiProvider,
     };
     use screen::{ImageInspectionPolicy, OcrEngine, RetainedScreenInspector, ScreenError};
     use serde_json::{Value, json};
@@ -146,7 +146,7 @@ mod tests {
             OpenAiProvider::new("mock-model", Some("ci-only-key".to_owned().into()))
                 .with_api_base(api_base),
         );
-        cli::reasoning::resolve_registered(provider, Role::Summarizer)?
+        cli::reasoning::resolve_registered(provider, ReasoningSurface::Notes)?
             .ok_or_else(|| "OpenAI backend was not selected".into())
     }
 
@@ -523,9 +523,9 @@ mod tests {
         let backend_id = descriptor.id().clone();
         let mut registry = Registry::default();
         registry.register_reasoning(descriptor, provider)?;
-        registry.select(Role::Summarizer, Some(&backend_id))?;
+        registry.select(ReasoningSurface::Notes, Some(&backend_id))?;
         registry
-            .resolve(Role::Summarizer)?
+            .resolve(ReasoningSurface::Notes)?
             .ok_or_else(|| "fixture backend unresolved".into())
     }
 
@@ -559,9 +559,9 @@ mod tests {
         let backend_id = descriptor.id().clone();
         let mut registry = Registry::default();
         registry.register_reasoning(descriptor, provider)?;
-        registry.select(Role::Summarizer, Some(&backend_id))?;
+        registry.select(ReasoningSurface::Notes, Some(&backend_id))?;
         registry
-            .resolve(Role::Summarizer)?
+            .resolve(ReasoningSurface::Notes)?
             .ok_or_else(|| "fixture backend unresolved".into())
     }
 
@@ -873,7 +873,7 @@ mod tests {
         let backend = cli::reasoning::resolve_keychain_backend(
             cli::reasoning::BackendChoice::OpenAi,
             Some(&model),
-            Role::Summarizer,
+            ReasoningSurface::Notes,
         )?
         .ok_or("OpenAI not selected")?;
         let summary = cli::reasoning::summarize(&store, session_id, &backend).await?;
@@ -893,7 +893,7 @@ mod tests {
             let measured_backend = cli::reasoning::resolve_keychain_backend(
                 cli::reasoning::BackendChoice::OpenAi,
                 Some(&model),
-                Role::Summarizer,
+                ReasoningSurface::Notes,
             )?
             .ok_or("OpenAI not selected during latency sample")?;
             startup.push(startup_begin.elapsed());
