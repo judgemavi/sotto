@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 
-use gpui::{App, Context, ElementId, Entity, Rgba, WeakEntity, Window, div, prelude::*};
+use gpui::{App, Context, ElementId, Entity, Rgba, WeakEntity, Window, div, prelude::*, px};
 use gpui_component::{
     Disableable, Selectable as _, Sizable as _,
     button::ButtonVariants as _,
@@ -34,8 +34,7 @@ use gpui_component::{
 };
 use insight::{
     NotesBlockProvenance, NotesOverlayOperation, OverlayTarget, PresentedNotesBlock,
-    PresentedNotesBlockId, PresentedNotesDocument, RecordingNotesSectionKind, ScreenConsultation,
-    SourceStatus,
+    PresentedNotesDocument, RecordingNotesSectionKind, ScreenConsultation, SourceStatus,
 };
 #[cfg(test)]
 use insight::{RecordingNotes, RecordingNotesBlock, RecordingNotesSection};
@@ -47,7 +46,13 @@ use sotto_core::{EventId, EventPayload, MarkKind, TimelineEvent, replay_lenient}
 
 use crate::{
     mcp::{ConfiguredServer, GrantReceiptState, SessionGrantView},
-    notes::NotesState,
+    notes::{
+        NotesState,
+        document_edit::{
+            diff_notes_document, overlay_target, render_notes_markdown, section_is_prose,
+            section_title,
+        },
+    },
 };
 
 use super::{
@@ -86,6 +91,8 @@ pub(crate) fn render_with_citation_times(
     latest_anchor: Option<EventId>,
     selected_anchor: Option<EventId>,
     annotation_input: &Entity<InputState>,
+    notes_document_input: &Entity<InputState>,
+    editing_notes_document: bool,
     servers: Vec<ConfiguredServer>,
     selected_grant: Option<SessionGrantView>,
     citation_times: &CitationTimes,
@@ -100,7 +107,14 @@ pub(crate) fn render_with_citation_times(
         .flex()
         .flex_col()
         .debug_selector(|| "notes-column".into())
-        .child(render_head(&summary, live, generation_running, picker, cx))
+        .child(render_head(
+            &summary,
+            live,
+            generation_running,
+            editing_notes_document,
+            picker,
+            cx,
+        ))
         .child(
             div()
                 .flex_1()
@@ -113,10 +127,15 @@ pub(crate) fn render_with_citation_times(
                 .children(
                     (!live).then(|| render_completed_annotations(annotations, citation_times, cx)),
                 )
-                .child(SummaryBody {
-                    summary,
-                    citation_times: citation_times.clone(),
-                    workspace: cx.weak_entity(),
+                .child(if editing_notes_document {
+                    render_document_editor(notes_document_input, tokens)
+                } else {
+                    SummaryBody {
+                        summary,
+                        citation_times: citation_times.clone(),
+                        workspace: cx.weak_entity(),
+                    }
+                    .into_any_element()
                 })
                 .child(render_source_context(servers, selected_grant, cx)),
         )
@@ -141,7 +160,7 @@ pub(crate) fn render_with_citation_times(
                         .child(
                             ControlRole::Essential,
                             Button::new("append-note", tokens)
-                                .label(if live { "Add" } else { "Save block" })
+                                .label("Add")
                                 .small()
                                 .disabled(
                                     live && selected_anchor.is_none() && latest_anchor.is_none(),
@@ -213,10 +232,23 @@ fn render_completed_annotations(
         .into_any_element()
 }
 
+fn render_document_editor(
+    notes_document_input: &Entity<InputState>,
+    tokens: WorkspaceTokens,
+) -> gpui::AnyElement {
+    div()
+        .debug_selector(|| "notes-document-editor".into())
+        .min_h(px(240.0))
+        .child(Input::new(notes_document_input))
+        .text_color(tokens.ink)
+        .into_any_element()
+}
+
 fn render_head(
     summary: &SummaryView,
     live: bool,
     generation_running: bool,
+    editing_notes_document: bool,
     picker: NotesProviderPicker,
     cx: &mut Context<MeetingWorkspace>,
 ) -> gpui::AnyElement {
@@ -278,10 +310,47 @@ fn render_head(
                 "Write notes again"
             })
             .small()
-            .disabled(live || generation_running || !notes_ready)
+            .disabled(live || generation_running || !notes_ready || editing_notes_document)
             .debug_selector(|| "summarize-control".into())
             .on_click(cx.listener(|this, _, _, cx| this.generate_notes(cx))),
     );
+    if editing_notes_document {
+        row = row
+            .child(
+                ControlRole::Essential,
+                Button::new("notes-document-save", tokens)
+                    .label("Save")
+                    .small()
+                    .debug_selector(|| "notes-document-save".into())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.save_notes_document(window, cx);
+                    })),
+            )
+            .child(
+                ControlRole::Essential,
+                Button::new("notes-document-cancel", tokens)
+                    .label("Cancel")
+                    .ghost()
+                    .small()
+                    .debug_selector(|| "notes-document-cancel".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.cancel_notes_document_edit(cx);
+                    })),
+            );
+    } else if !live && !summary.sections.is_empty() {
+        row = row.child(
+            ControlRole::Essential,
+            Button::new("notes-document-edit", tokens)
+                .label("Edit")
+                .ghost()
+                .small()
+                .disabled(generation_running)
+                .debug_selector(|| "notes-document-edit".into())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.begin_notes_document_edit(window, cx);
+                })),
+        );
+    }
     div()
         .px_4()
         .py_2()
@@ -301,12 +370,6 @@ pub(crate) struct AnnotationView {
     pub(crate) anchor: EventId,
     pub(crate) text: String,
     pub(crate) mark: MarkKind,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct EditingNotesBlock {
-    target: OverlayTarget,
-    action: bool,
 }
 
 /// Returns the active append-only annotation versions in event order.
@@ -657,26 +720,7 @@ impl MeetingWorkspace {
         cx.notify();
     }
 
-    /// Whether the shared composer is editing the notes document rather than typing a note.
-    ///
-    /// One composer serves both, and Return has to mean different things in each: a block's
-    /// verbatim text and an action's Owner and Due lines are multi-line, so Return must insert a
-    /// newline there, while a typed note is a single line that Return has always submitted. The
-    /// predicate is shared with [`Self::submit_annotation`] so the key and the button cannot drift
-    /// into disagreeing about which of the two the composer is holding.
-    pub(crate) fn composer_edits_notes_document(&self, cx: &App) -> bool {
-        !self.transcript_live
-            && matches!(
-                self.notes.read(cx).snapshot().state,
-                NotesState::Ready { .. } | NotesState::Stale { .. }
-            )
-    }
-
     pub(crate) fn submit_annotation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composer_edits_notes_document(cx) {
-            self.submit_notes_block(window, cx);
-            return;
-        }
         let Some(id) = self.transcript_session else {
             self.message = Some("No recording is selected for this typed note.".to_owned());
             cx.notify();
@@ -791,34 +835,84 @@ impl MeetingWorkspace {
         cx.notify();
     }
 
-    fn begin_notes_block_edit(
-        &mut self,
-        target: OverlayTarget,
-        text: String,
-        owner: Option<String>,
-        due_date: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let action = target.action;
-        let editable = if action {
-            format!(
-                "{text}\nOwner: {}\nDue: {}",
-                owner.unwrap_or_default(),
-                due_date.unwrap_or_default()
-            )
-        } else {
-            text
+    fn begin_notes_document_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(blocks) = self.presented_note_blocks(cx) else {
+            self.message = Some("Generate a summary before editing it.".to_owned());
+            cx.notify();
+            return;
         };
-        self.annotation_input
-            .update(cx, |input, cx| input.set_value(editable, window, cx));
-        self.editing_notes_block = Some(EditingNotesBlock { target, action });
-        self.message = Some(if action {
-            "Editing block. Its Owner and Due lines are part of this verbatim edit.".to_owned()
-        } else {
-            "Editing block; save keeps your wording verbatim.".to_owned()
-        });
+        let markdown = render_notes_markdown(&blocks);
+        self.notes_document_input
+            .update(cx, |input, cx| input.set_value(markdown, window, cx));
+        self.editing_notes_document = true;
+        self.message = Some(
+            "Editing the note. Citations stay on each paragraph and return when you save."
+                .to_owned(),
+        );
         cx.notify();
+    }
+
+    fn cancel_notes_document_edit(&mut self, cx: &mut Context<Self>) {
+        self.editing_notes_document = false;
+        self.message = None;
+        cx.notify();
+    }
+
+    fn save_notes_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(blocks) = self.presented_note_blocks(cx) else {
+            self.message = Some("Generate a summary before editing it.".to_owned());
+            cx.notify();
+            return;
+        };
+        let edited = self.notes_document_input.read(cx).value().to_string();
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+            });
+        match diff_notes_document(&blocks, &edited, seed) {
+            Ok(operations) if operations.is_empty() => {
+                self.editing_notes_document = false;
+                self.message = None;
+            }
+            Ok(operations) => {
+                let mut saved = 0_usize;
+                let mut error = None;
+                for (offset, operation) in operations.into_iter().enumerate() {
+                    let created_at = seed.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
+                    if let Err(message) = self.notes.update(cx, |notes, _| {
+                        notes.append_overlay_operation(&operation, created_at)
+                    }) {
+                        error = Some(message);
+                        break;
+                    }
+                    saved = saved.saturating_add(1);
+                }
+                self.message = error.as_ref().map(|message| {
+                    if saved == 0 {
+                        message.clone()
+                    } else {
+                        format!("Saved {saved} change(s), then stopped: {message}")
+                    }
+                });
+                if error.is_none() {
+                    self.editing_notes_document = false;
+                    self.notes_document_input
+                        .update(cx, |input, cx| input.set_value("", window, cx));
+                }
+            }
+            Err(error) => self.message = Some(error.to_string()),
+        }
+        cx.notify();
+    }
+
+    fn presented_note_blocks(&self, cx: &App) -> Option<Vec<PresentedNotesBlock>> {
+        match self.notes.read(cx).snapshot().state {
+            NotesState::Ready { document, .. } | NotesState::Stale { document, .. } => {
+                Some(document.blocks)
+            }
+            _ => None,
+        }
     }
 
     fn apply_notes_operation(&mut self, operation: NotesOverlayOperation, cx: &mut Context<Self>) {
@@ -832,74 +926,9 @@ impl MeetingWorkspace {
                     notes.append_overlay_operation(&operation, created_at)
                 })
             });
-        self.message = Some(match result {
-            Ok(()) => "Notes document saved. The generated artifact is unchanged.".to_owned(),
-            Err(error) => error,
-        });
+        self.message = result.err();
         cx.notify();
     }
-
-    fn submit_notes_block(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = self.annotation_input.read(cx).value().to_string();
-        if input.trim().is_empty() {
-            self.message = Some("Type a block before saving it.".to_owned());
-            cx.notify();
-            return;
-        }
-        let operation = if let Some(editing) = self.editing_notes_block.take() {
-            let (text, owner, due_date) = parse_editable_block(&input, editing.action);
-            NotesOverlayOperation::Reword {
-                target: editing.target,
-                text,
-                owner,
-                due_date,
-            }
-        } else {
-            let id = format!(
-                "user-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |duration| duration.as_nanos())
-            );
-            NotesOverlayOperation::Add {
-                user_block_id: id,
-                section: RecordingNotesSectionKind::Overview,
-                text: input,
-                action: false,
-                owner: None,
-                due_date: None,
-            }
-        };
-        self.apply_notes_operation(operation, cx);
-        self.annotation_input
-            .update(cx, |input, cx| input.set_value("", window, cx));
-    }
-}
-
-fn parse_editable_block(input: &str, action: bool) -> (String, Option<String>, Option<String>) {
-    if !action {
-        return (input.to_owned(), None, None);
-    }
-    let mut lines = input.lines().collect::<Vec<_>>();
-    let due_date = lines
-        .last()
-        .and_then(|line| line.strip_prefix("Due:"))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned);
-    if lines.last().is_some_and(|line| line.starts_with("Due:")) {
-        lines.pop();
-    }
-    let owner = lines
-        .last()
-        .and_then(|line| line.strip_prefix("Owner:"))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned);
-    if lines.last().is_some_and(|line| line.starts_with("Owner:")) {
-        lines.pop();
-    }
-    (lines.join("\n"), owner, due_date)
 }
 
 #[must_use]
@@ -1125,16 +1154,7 @@ fn document_sections(document: PresentedNotesDocument) -> Vec<SummarySection> {
 }
 
 fn presented_claim(block: PresentedNotesBlock) -> Claim {
-    let target = Some(OverlayTarget {
-        block_id: match &block.id {
-            PresentedNotesBlockId::Generated(block_id) => block_id.as_str().to_owned(),
-            PresentedNotesBlockId::User(block_id) => block_id.clone(),
-        },
-        section: block.section,
-        action: block.action,
-        meeting_citations: block.meeting_citations.clone(),
-        external_citations: block.external_citations.clone(),
-    });
+    let target = Some(overlay_target(&block));
     Claim {
         lead: block.owner.clone(),
         text: block.text,
@@ -1164,17 +1184,12 @@ fn summary_section(section: RecordingNotesSection) -> SummarySection {
 /// Where each recording-supported section kind lands in the column: its heading, in the voice of
 /// `docs/design/workspace-v2-mock.html`, and whether it reads as prose or discrete points.
 const fn section_heading(kind: RecordingNotesSectionKind) -> (&'static str, SectionShape) {
-    match kind {
-        RecordingNotesSectionKind::Overview => ("Overview", SectionShape::Prose),
-        RecordingNotesSectionKind::Topics => ("Topics", SectionShape::Points),
-        RecordingNotesSectionKind::Explanations => ("Explanations", SectionShape::Points),
-        RecordingNotesSectionKind::Findings => ("Findings", SectionShape::Points),
-        RecordingNotesSectionKind::Decisions => ("Decisions", SectionShape::Points),
-        RecordingNotesSectionKind::ActionItems => ("Action items", SectionShape::Points),
-        RecordingNotesSectionKind::OpenQuestions => ("Open questions", SectionShape::Points),
-        RecordingNotesSectionKind::Risks => ("Risks", SectionShape::Points),
-        RecordingNotesSectionKind::FollowUps => ("Follow-ups", SectionShape::Points),
-    }
+    let shape = if section_is_prose(kind) {
+        SectionShape::Prose
+    } else {
+        SectionShape::Points
+    };
+    (section_title(kind), shape)
 }
 
 #[cfg(test)]
@@ -1763,9 +1778,6 @@ fn render_claim(
     context: &ClaimContext<'_>,
 ) -> gpui::AnyElement {
     let tokens = context.tokens;
-    let raw_text = claim.text.clone();
-    let owner = claim.owner.clone();
-    let due_date = claim.due_date.clone();
     let checked = claim.checked;
     let target = claim.target.clone();
     let mut text = claim.text;
@@ -1775,52 +1787,43 @@ fn render_claim(
     if let Some(detail) = claim.detail {
         text = format!("{text} ({detail})");
     }
-    if claim.checked {
-        text = format!("✓ {text}");
-    }
-    let provenance = match claim.provenance {
-        NotesBlockProvenance::Generated => "Generated",
-        NotesBlockProvenance::EditedFromDraft => "Edited from draft",
-        NotesBlockProvenance::UserAuthored => "Your words",
-    };
-    let provenance_line = div()
-        .text_xs()
-        .text_color(if claim.orphaned {
-            tokens.warn
+
+    let header = if claim.action {
+        if let Some(check_target) = target {
+            let check_workspace = context.workspace.clone();
+            let button = Button::new(("notes-check", ordinal), tokens)
+                .label(if checked { "☑" } else { "☐" })
+                .ghost()
+                .small()
+                .on_click(move |_, _, cx| {
+                    let operation = NotesOverlayOperation::SetChecked {
+                        target: check_target.clone(),
+                        checked: !checked,
+                    };
+                    let _ = check_workspace.update(cx, |this, cx| {
+                        this.apply_notes_operation(operation, cx);
+                    });
+                });
+            #[cfg(test)]
+            let button = button.debug_selector(move || format!("notes-check-{ordinal}"));
+
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(button)
+                .child(
+                    div()
+                        .min_w_0()
+                        .debug_selector(move || format!("summary-claim-{ordinal}"))
+                        .child(SelectableText {
+                            id: ("summary-claim", ordinal).into(),
+                            text,
+                            color: tokens.ink_2,
+                        }),
+                )
+                .into_any_element()
         } else {
-            tokens.faint
-        })
-        .child(if claim.orphaned {
-            format!(
-                "{provenance} · the regenerated summary no longer contains the block you edited"
-            )
-        } else {
-            provenance.to_owned()
-        });
-    #[cfg(test)]
-    let provenance_line = provenance_line.debug_selector(move || {
-        if claim.orphaned {
-            format!("summary-provenance-orphaned-{ordinal}")
-        } else {
-            format!(
-                "summary-provenance-{}-{ordinal}",
-                match claim.provenance {
-                    NotesBlockProvenance::Generated => "generated",
-                    NotesBlockProvenance::EditedFromDraft => "edited",
-                    NotesBlockProvenance::UserAuthored => "user",
-                }
-            )
-        }
-    });
-    let hover_group = format!("notes-block-{ordinal}");
-    div()
-        .group(hover_group.clone())
-        .mb_2()
-        .min_w_0()
-        .when(!prose, |item| {
-            item.pl_3().border_l_2().border_color(tokens.line)
-        })
-        .child(
             div()
                 .min_w_0()
                 .debug_selector(move || format!("summary-claim-{ordinal}"))
@@ -1828,83 +1831,28 @@ fn render_claim(
                     id: ("summary-claim", ordinal).into(),
                     text,
                     color: tokens.ink_2,
-                }),
-        )
-        .children(target.map(|target| {
-            let check_target = target.clone();
-            let edit_target = target.clone();
-            let hide_target = target;
-            let edit_text = raw_text.clone();
-            let edit_owner = owner.clone();
-            let edit_due_date = due_date.clone();
-            let check_workspace = context.workspace.clone();
-            let edit_workspace = context.workspace.clone();
-            let hide_workspace = context.workspace.clone();
-            ControlRow::new()
-                .child(ControlRole::Ellipsizing, div())
-                .child_when(claim.action, ControlRole::Essential, || {
-                    let label = if checked { "Uncheck" } else { "Check" };
-                    let button = Button::new(("notes-check", ordinal), tokens)
-                        .label(label)
-                        .ghost()
-                        .xsmall()
-                        .on_click(move |_, _, cx| {
-                            let operation = NotesOverlayOperation::SetChecked {
-                                target: check_target.clone(),
-                                checked: !checked,
-                            };
-                            let _ = check_workspace.update(cx, |this, cx| {
-                                this.apply_notes_operation(operation, cx);
-                            });
-                        });
-                    #[cfg(test)]
-                    let button = button.debug_selector(move || format!("notes-check-{ordinal}"));
-                    button.into_any_element()
                 })
-                .child(ControlRole::Essential, {
-                    let button = Button::new(("notes-edit", ordinal), tokens)
-                        .label("Edit")
-                        .ghost()
-                        .xsmall()
-                        .on_click(move |_, window, cx| {
-                            let _ = edit_workspace.update(cx, |this, cx| {
-                                this.begin_notes_block_edit(
-                                    edit_target.clone(),
-                                    edit_text.clone(),
-                                    edit_owner.clone(),
-                                    edit_due_date.clone(),
-                                    window,
-                                    cx,
-                                );
-                            });
-                        });
-                    #[cfg(test)]
-                    let button = button.debug_selector(move || format!("notes-edit-{ordinal}"));
-                    button
-                })
-                .child(ControlRole::Essential, {
-                    let button = Button::new(("notes-hide", ordinal), tokens)
-                        .label("Hide")
-                        .ghost()
-                        .xsmall()
-                        .on_click(move |_, _, cx| {
-                            let operation = NotesOverlayOperation::Hide {
-                                target: hide_target.clone(),
-                            };
-                            let _ = hide_workspace.update(cx, |this, cx| {
-                                this.apply_notes_operation(operation, cx);
-                            });
-                        });
-                    #[cfg(test)]
-                    let button = button.debug_selector(move || format!("notes-hide-{ordinal}"));
-                    button
-                })
-                .finish()
-                .gap_1()
-                .opacity(0.0)
-                .group_hover(hover_group, |style| style.opacity(1.0))
-        }))
-        .child(provenance_line)
+                .into_any_element()
+        }
+    } else {
+        div()
+            .min_w_0()
+            .debug_selector(move || format!("summary-claim-{ordinal}"))
+            .child(SelectableText {
+                id: ("summary-claim", ordinal).into(),
+                text,
+                color: tokens.ink_2,
+            })
+            .into_any_element()
+    };
+
+    div()
+        .mb_2()
+        .min_w_0()
+        .when(!prose, |item| {
+            item.pl_3().border_l_2().border_color(tokens.line)
+        })
+        .child(header)
         .child(render_evidence(
             claim.meeting,
             claim.external,
@@ -2798,6 +2746,7 @@ mod tests {
         use insight::{
             MeetingNotesGenerator, NotesBlockProvenance, NotesOverlayOperation, OverlayTarget,
             RecordingNotesSectionKind, append_notes_overlay_operation, load_latest_grounded_notes,
+            load_notes_overlay,
         };
         use providers::{
             AuthKind, AuthStatus, BackendCapabilities, BackendDescriptor, BackendFingerprint,
@@ -3047,6 +2996,20 @@ mod tests {
             Ok(())
         }
 
+        fn replace_document_text(
+            visual: &mut gpui::VisualTestContext,
+            workspace: &Entity<crate::workspace::MeetingWorkspace>,
+            value: &str,
+        ) {
+            let value = value.to_owned();
+            visual.update(|window, cx| {
+                workspace.update(cx, |this, cx| {
+                    this.notes_document_input
+                        .update(cx, |input, cx| input.set_value(value.clone(), window, cx));
+                });
+            });
+        }
+
         fn replace_composer_text(
             visual: &mut gpui::VisualTestContext,
             workspace: &Entity<crate::workspace::MeetingWorkspace>,
@@ -3127,6 +3090,7 @@ mod tests {
                     "summary-claim-0",
                     "summary-claim-1",
                     "summary-claim-2",
+                    "notes-document-edit",
                     // No MCP source is configured in this fixture, so the block is one quiet line.
                     "source-context-quiet",
                 ],
@@ -3151,6 +3115,8 @@ mod tests {
                 "summary-evidence-0",
                 "summary-evidence-1",
                 "summary-evidence-2",
+                "notes-edit-0",
+                "notes-hide-0",
             ] {
                 assert!(
                     visual.debug_bounds(absent).is_none(),
@@ -3196,7 +3162,8 @@ mod tests {
             let _ = recording_with_summary(&database).await?;
 
             let mut cx = TestAppContext::single();
-            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
+            let (workspace, visual) =
+                open_summarized_workspace(&mut cx, dir.path(), database.clone());
             visual.simulate_resize(size(px(900.0), px(820.0)));
             visual.update(|_, cx| {
                 workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
@@ -3214,19 +3181,18 @@ mod tests {
                 Ok(serde_json::to_vec(&notes)?)
             })?;
 
-            // Reword a generated claim through Edit -> composer -> Save.
-            let claim = visual
-                .debug_bounds("summary-claim-0")
-                .ok_or_else(|| std::io::Error::other("the generated overview must render"))?;
-            visual.simulate_mouse_move(claim.center(), None, Modifiers::none());
-            visual.run_until_parked();
-            click_control(visual, "notes-edit-0")?;
+            // Reword, add, and hide through the full-document surface.
+            click_control(visual, "notes-document-edit")?;
             assert!(
-                visual.update(|_, cx| workspace.read(cx).editing_notes_block.is_some()),
-                "Edit must put the mounted composer into block-edit mode"
+                visual.update(|_, cx| workspace.read(cx).editing_notes_document),
+                "Edit must open the notes markdown surface"
             );
-            replace_composer_text(visual, &workspace, "User's exact overview wording.");
-            click_control(visual, "append-note-control")?;
+            replace_document_text(
+                visual,
+                &workspace,
+                "## Action items\n\n- [ ] Retry rollout checklist, reviewed by Thursday. | owner: Dana | due: Thursday\n\n## Overview\n\nSprint 41 is scoped to payment retries and the user's exact overview wording.\n\nA note written entirely by the user.\n",
+            );
+            click_control(visual, "notes-document-save")?;
 
             let composed_reword = visual.update(|_, cx| {
                 let notes = workspace.read(cx).notes.clone();
@@ -3235,42 +3201,38 @@ mod tests {
                         std::io::Error::other("reworded notes must remain ready").into(),
                     );
                 };
-                Ok(document.blocks[0].text.clone())
+                document
+                    .blocks
+                    .iter()
+                    .find(|block| block.text.contains("user's exact overview wording"))
+                    .map(|block| block.text.clone())
+                    .ok_or_else(|| {
+                        std::io::Error::other("the reworded overview must remain composed").into()
+                    })
             })?;
             assert_eq!(
-                composed_reword, "User's exact overview wording.",
+                composed_reword,
+                "Sprint 41 is scoped to payment retries and the user's exact overview wording.",
                 "Save must apply the edit to the composed document before it renders"
             );
-            let copied = copy_claim(visual, "summary-claim-0")?;
+            let copied = copy_claim(visual, "summary-claim-1")?;
             assert!(
-                copied.contains("User's exact overview wording."),
+                copied.contains("user's exact overview wording"),
                 "the reworded user's text must replace the generated text on screen, got {copied:?}"
             );
 
             // Check is its own mounted control and changes the presented action, not the artifact.
-            click_control(visual, "notes-check-2")?;
+            click_control(visual, "notes-check-0")?;
 
-            // With no edit active the same composer adds a user-authored overview block.
-            replace_composer_text(visual, &workspace, "A note written entirely by the user.");
-            click_control(visual, "append-note-control")?;
-
-            assert_in_column(
-                visual,
-                &[
-                    "summary-provenance-edited-0",
-                    "summary-provenance-generated-1",
-                    "summary-provenance-user-3",
-                    "summary-claim-3",
-                ],
-            )?;
-            let copied = copy_claim(visual, "summary-claim-3")?;
+            assert_in_column(visual, &["summary-claim-2"])?;
+            let copied = copy_claim(visual, "summary-claim-2")?;
             assert!(
                 copied.contains("A note written entirely by the user."),
                 "the newly added user's words must reach the screen, got {copied:?}"
             );
             click_control(visual, "summary-evidence-toggle")?;
             assert!(
-                visual.debug_bounds("summary-citation-3-0").is_none(),
+                visual.debug_bounds("summary-citation-2-0").is_none(),
                 "the user block must never draw a citation chip or imply model evidence"
             );
 
@@ -3292,9 +3254,16 @@ mod tests {
             let edited = document
                 .blocks
                 .iter()
-                .find(|block| block.text == "User's exact overview wording.")
+                .find(|block| {
+                    block.text
+                        == "Sprint 41 is scoped to payment retries and the user's exact overview wording."
+                })
                 .ok_or_else(|| std::io::Error::other("the reworded claim must remain composed"))?;
             assert_eq!(edited.provenance, NotesBlockProvenance::EditedFromDraft);
+            assert!(
+                !edited.meeting_citations.is_empty(),
+                "a reworded generated block must keep its citations"
+            );
             let action = document
                 .blocks
                 .iter()
@@ -3309,38 +3278,55 @@ mod tests {
             assert_eq!(added.provenance, NotesBlockProvenance::UserAuthored);
             assert!(added.meeting_citations.is_empty());
             assert!(added.external_citations.is_empty());
-
-            // Bounds persist across frames in this harness, so hiding is asserted against the
-            // freshly composed state rather than through a misleading disappearance assertion.
-            let decision = visual
-                .debug_bounds("summary-claim-1")
-                .ok_or_else(|| std::io::Error::other("the generated decision must render"))?;
-            visual.simulate_mouse_move(decision.center(), None, Modifiers::none());
-            visual.run_until_parked();
-            click_control(visual, "notes-hide-1")?;
-            let state = visual.update(|_, cx| {
-                let notes = workspace.read(cx).notes.clone();
-                notes.read(cx).snapshot().state
-            });
-            let NotesState::Ready { document, .. } = state else {
-                return Err(std::io::Error::other("hidden notes must remain ready").into());
-            };
             assert!(
                 document
                     .blocks
                     .iter()
                     .all(|block| block.text != "The search rewrite is deferred to sprint 42."),
-                "Hide must remove the selected generated decision from the composed document"
+                "deleting a paragraph must Hide it from the composed document"
+            );
+
+            let store = Store::open(&database).await?;
+            let entry_id = store.entry_for_session(SessionId::new(41)).await?;
+            let overlay = load_notes_overlay(&store, entry_id).await?;
+            let operations = overlay
+                .iter()
+                .map(|applied| &applied.operation)
+                .collect::<Vec<_>>();
+            assert!(
+                operations.iter().any(|operation| matches!(
+                    operation,
+                    NotesOverlayOperation::Reword { text, .. }
+                        if text
+                            == "Sprint 41 is scoped to payment retries and the user's exact overview wording."
+                )),
+                "the stored overlay must contain the reword, got {operations:?}"
+            );
+            assert!(
+                operations.iter().any(|operation| matches!(
+                    operation,
+                    NotesOverlayOperation::Add { text, .. }
+                        if text == "A note written entirely by the user."
+                )),
+                "the stored overlay must contain the add, got {operations:?}"
+            );
+            assert!(
+                operations
+                    .iter()
+                    .any(|operation| matches!(operation, NotesOverlayOperation::Hide { .. })),
+                "the stored overlay must contain the hide, got {operations:?}"
+            );
+            assert!(
+                operations
+                    .iter()
+                    .any(|operation| matches!(operation, NotesOverlayOperation::Reorder { .. })),
+                "moving paragraphs must emit Reorder, got {operations:?}"
             );
             Ok(())
         }
 
-        /// Return still submits a typed note where the composer is not editing the document.
-        ///
-        /// Making the composer multi-line gave Return a second meaning, and a newline is the wrong
-        /// one on a stopped recording that has no summary: there is no block to edit, so the only
-        /// thing the composer can be holding is a note. Pinned because nothing else would notice
-        /// Return quietly turning into a line break on that surface.
+        /// Return still submits a typed note. The notes document has its own surface, so the
+        /// composer is only ever a typed note — including on a stopped recording with no summary.
         #[tokio::test(flavor = "multi_thread")]
         async fn return_still_appends_a_typed_note_when_no_summary_owns_the_composer()
         -> Result<(), Box<dyn std::error::Error>> {
@@ -3358,10 +3344,6 @@ mod tests {
             visual.refresh()?;
             visual.run_until_parked();
 
-            assert!(
-                !visual.update(|_, cx| workspace.read(cx).composer_edits_notes_document(cx)),
-                "a recording with no summary has no document for the composer to edit"
-            );
             replace_composer_text(visual, &workspace, "Chase the staging outage postmortem.");
             // The composer's own key handling belongs to `gpui-component` and is unchanged; what
             // this pins is the subscription that decides what plain Return means here. Focusing the
@@ -3411,31 +3393,26 @@ mod tests {
             visual.refresh()?;
             visual.run_until_parked();
 
-            let action = visual
-                .debug_bounds("summary-claim-2")
-                .ok_or_else(|| std::io::Error::other("the generated action must render"))?;
-            visual.simulate_mouse_move(action.center(), None, Modifiers::none());
-            visual.run_until_parked();
-            click_control(visual, "notes-edit-2")?;
+            click_control(visual, "notes-document-edit")?;
             let editable = visual.update(|_, cx| {
                 workspace
                     .read(cx)
-                    .annotation_input
+                    .notes_document_input
                     .read(cx)
                     .value()
                     .to_string()
             });
             assert!(
-                editable.contains("\nOwner:") && editable.contains("\nDue:"),
-                "an action edit must reach a newline-safe composer with owner and due fields"
+                editable.contains("| owner: Dana") && editable.contains("| due: Thursday"),
+                "an action must render owner and due as trailing fields, got {editable:?}"
             );
 
-            replace_composer_text(
+            replace_document_text(
                 visual,
                 &workspace,
-                "Ship the revised rollout checklist.\nOwner: Priya\nDue: Friday",
+                "## Overview\n\nSprint 41 is scoped to payment retries and audit fixes after the staging outage pushed the retry work into the following sprint.\n\n## Decisions\n\n- The search rewrite is deferred to sprint 42.\n\n## Action items\n\n- [ ] Ship the revised rollout checklist. | owner: Priya | due: Friday\n",
             );
-            click_control(visual, "append-note-control")?;
+            click_control(visual, "notes-document-save")?;
 
             let state = visual.update(|_, cx| {
                 let notes = workspace.read(cx).notes.clone();
@@ -3451,6 +3428,94 @@ mod tests {
                 .ok_or_else(|| std::io::Error::other("the edited action must remain composed"))?;
             assert_eq!(action.owner.as_deref(), Some("Priya"));
             assert_eq!(action.due_date.as_deref(), Some("Friday"));
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_ambiguous_document_edit_fails_visibly_without_writing_the_overlay()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let dir = tempfile::tempdir()?;
+            let database = dir.path().join("sotto.sqlite3");
+            let _ = recording_with_summary(&database).await?;
+            let store = Store::open(&database).await?;
+            let artifact = load_latest_grounded_notes(&store, SessionId::new(41))
+                .await?
+                .ok_or_else(|| std::io::Error::other("the summary artifact must persist"))?;
+            let entry_id = store.entry_for_session(SessionId::new(41)).await?;
+            for (sequence, (id, text)) in [
+                ("user-alice-demo", "Alice presents the demo today."),
+                ("user-alice-plan", "Alice presents the plan today."),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                append_notes_overlay_operation(
+                    &store,
+                    entry_id,
+                    &artifact.artifact,
+                    &NotesOverlayOperation::Add {
+                        user_block_id: id.to_owned(),
+                        section: RecordingNotesSectionKind::Overview,
+                        text: text.to_owned(),
+                        action: false,
+                        owner: None,
+                        due_date: None,
+                    },
+                    u64::try_from(sequence).unwrap_or(0).saturating_add(1),
+                )
+                .await?;
+            }
+            drop(store);
+
+            let mut cx = TestAppContext::single();
+            let (workspace, visual) =
+                open_summarized_workspace(&mut cx, dir.path(), database.clone());
+            visual.simulate_resize(size(px(900.0), px(820.0)));
+            visual.update(|_, cx| {
+                workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
+            });
+            visual.refresh()?;
+            visual.run_until_parked();
+
+            click_control(visual, "notes-document-edit")?;
+            let markdown = visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .notes_document_input
+                    .read(cx)
+                    .value()
+                    .to_string()
+            });
+            let edited = markdown
+                .replace(
+                    "Alice presents the demo today.",
+                    "Alice presents the plan tomorrow.",
+                )
+                .replace(
+                    "Alice presents the plan today.",
+                    "Alice presents the demo tomorrow.",
+                );
+            replace_document_text(visual, &workspace, &edited);
+            click_control(visual, "notes-document-save")?;
+
+            let message = visual.update(|_, cx| workspace.read(cx).message.clone());
+            assert!(
+                message
+                    .as_deref()
+                    .is_some_and(|text| text.contains("ambiguous")),
+                "an ambiguous save must tell the person why it refused, got {message:?}"
+            );
+            assert!(
+                visual.update(|_, cx| workspace.read(cx).editing_notes_document),
+                "a refused save must leave the editor open"
+            );
+            let store = Store::open(&database).await?;
+            let overlay = load_notes_overlay(&store, entry_id).await?;
+            assert_eq!(
+                overlay.len(),
+                2,
+                "a refused save must not append further overlay operations, got {overlay:?}"
+            );
             Ok(())
         }
 
@@ -3495,10 +3560,7 @@ mod tests {
             visual.refresh()?;
             visual.run_until_parked();
 
-            assert_in_column(
-                visual,
-                &["summary-claim-3", "summary-provenance-orphaned-3"],
-            )?;
+            assert_in_column(visual, &["summary-claim-3"])?;
             let copied = copy_claim(visual, "summary-claim-3")?;
             assert!(
                 copied.contains("The user's preserved orphaned wording."),

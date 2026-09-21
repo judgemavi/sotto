@@ -140,6 +140,7 @@ impl Render for MeetingWorkspace {
         let session = self.session.read(cx);
         let transcription_unavailability = session.transcription_unavailability();
         let transcription_home_reason = session.transcription_home_reason();
+        let screen_permission_note = session.screen_permission_note();
         let transcription_model = session.transcription_model().clone();
         let can_start = lifecycle.can_start();
         let tokens = WorkspaceTokens::resolve(cx);
@@ -176,6 +177,7 @@ impl Render for MeetingWorkspace {
                     selected_model: transcription_model.selected(),
                     model_availability: transcription_model.availability().clone(),
                     transcription_unavailability: transcription_home_reason,
+                    screen_permission_note,
                 },
                 &self.entry_title_input,
                 cx,
@@ -216,6 +218,8 @@ impl Render for MeetingWorkspace {
             frame.latest_anchor,
             self.focused_event,
             &self.annotation_input,
+            &self.notes_document_input,
+            self.editing_notes_document,
             self.mcp.read(cx).servers(),
             self.mcp.read(cx).selected_grant(),
             &citation_times,
@@ -525,7 +529,7 @@ fn render_stage(
         .overflow_hidden()
         .debug_selector(|| "workspace-stage".into());
     match stage {
-        // Nothing is open, so the stage is Home: Record a call and the quieter ways a recording
+        // Nothing is open, so the stage is Home: Capture and the quieter ways a recording
         // begins, plus what the library already holds, not an empty transcript.
         Stage::Home | Stage::Prepared => stage_root.flex().child(
             div()
@@ -766,9 +770,9 @@ fn render_prepared_entry(
                         })),
                 )
                 .child(
-                    div().debug_selector(|| "record-into-entry".into()).child(
-                        Button::new("record-into-entry-button", tokens)
-                            .label("Record into this entry")
+                    div().debug_selector(|| "capture-into-entry".into()).child(
+                        Button::new("capture-into-entry-button", tokens)
+                            .label("Capture into this entry")
                             .primary()
                             .with_size(Size::Small)
                             .disabled(!can_start)
@@ -848,9 +852,13 @@ fn render_entry_view_bar(
         })
         .child(
             ControlRole::Essential,
-            div().debug_selector(|| "record-again".into()).child(
-                Button::new("record-again-button", tokens)
-                    .label(if count == 0 { "Record" } else { "Record again" })
+            div().debug_selector(|| "capture-again".into()).child(
+                Button::new("capture-again-button", tokens)
+                    .label(if count == 0 {
+                        "Capture"
+                    } else {
+                        "Capture again"
+                    })
                     .with_size(Size::Small)
                     .on_click(cx.listener(|this, _, _, cx| this.start_scoped_session(cx))),
             ),
@@ -1752,15 +1760,15 @@ mod tests {
         );
         let capture = visual
             .debug_bounds("start-choice-capture")
-            .ok_or_else(|| std::io::Error::other("Record a call must be a real control on Home"))?;
+            .ok_or_else(|| std::io::Error::other("Capture must be a real control on Home"))?;
         assert!(
             capture.size.width >= px(400.0),
-            "Record a call must span the home column the way the mock does, not hug its label; got {}",
+            "Capture must span the home column the way the mock does, not hug its label; got {}",
             capture.size.width
         );
         let room = visual
-            .debug_bounds("start-choice-microphone")
-            .ok_or_else(|| std::io::Error::other("Just this room must be on Home"))?;
+            .debug_bounds("start-choice-audio-note")
+            .ok_or_else(|| std::io::Error::other("Audio note must be on Home"))?;
         let file = visual
             .debug_bounds("start-choice-import")
             .ok_or_else(|| std::io::Error::other("Add a file must be on Home"))?;
@@ -1896,7 +1904,7 @@ mod tests {
         let stage = visual
             .debug_bounds("prepared-entry")
             .ok_or_else(|| std::io::Error::other("prepared entry must render"))?;
-        for selector in ["prepared-note-block", "record-into-entry"] {
+        for selector in ["prepared-note-block", "capture-into-entry"] {
             let bounds = visual
                 .debug_bounds(selector)
                 .ok_or_else(|| std::io::Error::other(format!("{selector} must render")))?;
@@ -1929,7 +1937,7 @@ mod tests {
         visual.run_until_parked();
 
         assert!(visual.debug_bounds("entry-sessions-strip").is_some());
-        assert!(visual.debug_bounds("record-again").is_some());
+        assert!(visual.debug_bounds("capture-again").is_some());
         assert_eq!(
             visual.update(|_, cx| workspace.read(cx).transcript_session),
             Some(second),
@@ -1992,13 +2000,13 @@ mod tests {
         visual.run_until_parked();
 
         let record_again = visual
-            .debug_bounds("record-again")
-            .ok_or_else(|| std::io::Error::other("Record again must render"))?;
+            .debug_bounds("capture-again")
+            .ok_or_else(|| std::io::Error::other("Capture again must render"))?;
         visual.simulate_click(record_again.center(), Modifiers::none());
         assert_eq!(
             visual.update(|_, cx| session.read(cx).pending_entry_for_test()),
             Some(entry_id),
-            "the real Record again control must scope the pending picker result to this entry"
+            "the real Capture again control must scope the pending picker result to this entry"
         );
         Ok(())
     }

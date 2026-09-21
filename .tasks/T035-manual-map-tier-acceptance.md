@@ -127,3 +127,37 @@ real signed app and a real capture, not code.
 Session rail titles preserve their beginning and clip at the end with no visible ellipsis character.
 Deferred deliberately after three attempts; root cause and fix are recorded in T055. Judge it under
 the readability rubric as a known cosmetic divergence rather than filing it as a new defect.
+
+## Inherited from the 2026-09-02 prune
+
+Thirty `done` task files were pruned per the board's standing rule that accepted files leave the
+directory and live in git history. Every outstanding `NOT RUN` they carried is recorded here rather
+than lost with the file, because T035 is where the manual gate collects. Each remains the
+maintainer's eye-and-hand judgment on a signed build; none is an automatable check that was skipped.
+
+| From | The manual check that never ran |
+|---|---|
+| T066 | No live reasoning backend was ever configured on this machine, so no real model has chosen to issue `inspect_screen` over a real meeting. Whether the prompt elicits an inspection at a *useful* moment is unmeasured. |
+| T069 | Settings and Ask acceptance on a signed build. |
+| T070 | The app-owned half of the adaptive artifact: rendering adaptive section kinds directly, and observing a real downgrade. |
+| T072 | Signed-app launch on real capture. Automated evidence builds and clicks a real GPUI render tree in both themes; nothing was launched. |
+| T074 | The citation flash's visible state and its 1.4-second decay are not asserted. Attribution over a recording with a silent channel stays here, where it was already deferred. |
+| T075 | A signed-app visual pass over a real summary; whether a cached or stale report can disclose its staleness. |
+| T077 | Nobody has dragged across a real transcript in a signed app. Drag/paste judgment and long-lived `TextView` measurement both unrun. |
+| T078 | Home's presentation was never checked in a running app; the crate did not hold still during that task. |
+| T079 | No real signed capture, so pause has never been exercised through the picker on live audio. |
+| T080 | No signed-app visual check of the settings sheet. Colour, spacing and dark-mode balance come from layout assertions, not from looking. |
+| T081 | The gear, the `◐` toggle, the `🗑` glyph and the in-window scrim are proven mounted and in-bounds by `debug_bounds` only — never seen rendered. |
+| T100 | Visual confirmation of the focus ring — black at 20% alpha in light — passed to T101, which owns the ring and is in review. |
+
+Two residuals from that set are **settled rather than inherited**, and are recorded as closed so
+they are not re-run: T076's keyboard residual (Tab highlighted nothing anywhere in the app) was the
+defect T100 and T101 were filed to fix, and T074's older "no caller, no automated anchor assertion"
+statements were overtaken by the mounted citation test.
+
+## Inherited from T102 and T103 — 2026-09-02
+
+| From | The manual check that never ran |
+|---|---|
+| T102 | Keyboard activation of the evidence control. The mounted harness roots its window in `MeetingWorkspace` rather than `gpui_component::Root`, so a simulated keystroke panics inside the component's root lookup before reaching any listener, and mouse events there never move focus onto a button. Both are properties of the mount, not the control; the pointer path is covered. |
+| T103 | Both stated screen-permission outcomes. Verifying them requires driving macOS TCC into denied and not-determined states against a signed identity, which no automated test on this machine can arrange. The lifecycle transitions are asserted; what a person actually sees on Home when permission is refused is not. |

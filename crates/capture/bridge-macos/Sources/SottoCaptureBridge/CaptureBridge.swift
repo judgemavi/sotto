@@ -1840,14 +1840,31 @@ public func sottoRecordingAppendPTSProbe(
     return true
 }
 
+/// Persists whether this app identity has ever asked the user for Screen & System Audio
+/// Recording access. `CGPreflightScreenCaptureAccess()` alone cannot distinguish "never asked"
+/// from "asked and refused" — both read as `false` — and there is no direct macOS query for
+/// TCC's not-determined state for this permission. The asymmetry we can observe is behavioral:
+/// macOS asks once. Requesting again after a real denial is a silent no-op (no UI, status
+/// unchanged); requesting for the first time puts the system prompt on screen. So the bridge
+/// remembers, across relaunches (a grant only takes effect for a newly launched process, so a
+/// relaunch is already required either way), whether `sotto_capture_request_permission` has ever
+/// been called. Preflight false plus "never asked" is not-determined; preflight false plus
+/// "asked before" is a stated denial.
+private let screenCaptureRequestIssuedKey = "com.sotto.screenCapture.requestIssued"
+
 @_cdecl("sotto_capture_permission_status")
 public func sottoCapturePermissionStatus() -> Int32 {
-    CGPreflightScreenCaptureAccess() ? 1 : 2
+    if CGPreflightScreenCaptureAccess() {
+        return 1
+    }
+    let everRequested = UserDefaults.standard.bool(forKey: screenCaptureRequestIssuedKey)
+    return everRequested ? 2 : 3
 }
 
 @_cdecl("sotto_capture_request_permission")
 public func sottoCaptureRequestPermission() -> Bool {
-    CGRequestScreenCaptureAccess()
+    UserDefaults.standard.set(true, forKey: screenCaptureRequestIssuedKey)
+    return CGRequestScreenCaptureAccess()
 }
 
 @_cdecl("sotto_capture_pump_main_loop")

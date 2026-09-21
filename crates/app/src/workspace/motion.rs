@@ -44,7 +44,7 @@ pub(crate) fn fade_in(id: impl Into<ElementId>, child: impl IntoElement) -> AnyE
 /// Fade in a block that already carries its own width (`w_full`, a cap, or both).
 ///
 /// Animating the block itself avoids a `flex_none` wrapper, which would shrink-wrap Home to its
-/// labels and leave Record a call the width of the words.
+/// labels and leave Capture the width of the words.
 pub(crate) fn fade_in_fill(id: impl Into<ElementId>, child: Div) -> impl IntoElement {
     child.with_animation(
         id,

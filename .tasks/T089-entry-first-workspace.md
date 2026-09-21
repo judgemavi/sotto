@@ -1,6 +1,6 @@
 # T089 — The workspace speaks in entries
 
-**Status:** in-review
+**Status:** done
 
 **Wave:** N8 — entry workspace
 
@@ -121,3 +121,6 @@ Automated evidence, 2026-08-16:
 
 The task is in review pending owner inspection against the v3 mock; no signed-app or browser gate
 was claimed by this implementation pass.
+
+Closed by the maintainer on 2026-08-18. Workspace file ownership is released; T102 may edit
+`crates/app/src/workspace/notes.rs`.

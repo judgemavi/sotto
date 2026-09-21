@@ -1,8 +1,8 @@
 //! The recording library rail, Home, and the three ways a session begins.
 //!
 //! ADR-0019 makes a session a *recording of something*, so the rail is a **Library** rather than a
-//! list of meetings. Home's job is still to start one: **Record a call** is the obvious action,
-//! with Just this room and Add a file sitting beside it as quieter peers. The three beginnings
+//! list of meetings. Home's job is still to start one: **Capture** is the obvious action,
+//! with Audio note and Add a file sitting beside it as quieter peers. The three beginnings
 //! stay first-class in the rail and in tests; Home just stops presenting them as equal cards.
 //!
 //! T078 makes **Home the rail's first entry** rather than a separate navigation surface. The rail
@@ -21,8 +21,10 @@ use std::{
 };
 
 use crate::session::{
-    MODEL_CHOICES, ModelAvailability, SessionController, download_size_label, model_label,
+    MODEL_CHOICES, ModelAvailability, ScreenPermissionNote, SessionController, download_size_label,
+    model_label,
 };
+use capture::macos::MacCapture;
 use chrono::Datelike as _;
 use gpui::{
     AnyElement, Context, Entity, FontWeight, Global, MouseButton, Pixels, Rgba, Subscription,
@@ -1268,18 +1270,18 @@ pub(crate) enum StartChoice {
     /// Screen and audio from one picked application. Wired today.
     CaptureApp,
     /// Microphone only: no picker, no screen, no application audio. Wired by T050.
-    Microphone,
+    AudioNote,
     /// A file the user already has becomes a session. Wired through
     /// `SessionController::start_import`.
     Import,
 }
 
 /// Presentation order. Tests pin that all three remain first-class even though Home
-/// visually ranks Record a call.
+/// visually ranks Capture.
 #[cfg(test)]
 pub(crate) const START_CHOICES: [StartChoice; 3] = [
     StartChoice::CaptureApp,
-    StartChoice::Microphone,
+    StartChoice::AudioNote,
     StartChoice::Import,
 ];
 
@@ -1288,15 +1290,15 @@ impl StartChoice {
     pub(crate) const fn icon(self) -> &'static str {
         match self {
             Self::CaptureApp => icons::CAPTURED,
-            Self::Microphone => icons::MICROPHONE,
+            Self::AudioNote => icons::MICROPHONE,
             Self::Import => icons::IMPORT,
         }
     }
 
     pub(crate) const fn title(self) -> &'static str {
         match self {
-            Self::CaptureApp => "Record a call",
-            Self::Microphone => "Just this room",
+            Self::CaptureApp => "Capture",
+            Self::AudioNote => "Audio note",
             Self::Import => "Add a file",
         }
     }
@@ -1305,7 +1307,7 @@ impl StartChoice {
     pub(crate) const fn description(self) -> &'static str {
         match self {
             Self::CaptureApp => "Pick the window. Sotto hears that call and nothing else.",
-            Self::Microphone => "A voice note, an interview in the room, thinking out loud.",
+            Self::AudioNote => "A voice note, an interview in the room, thinking out loud.",
             Self::Import => {
                 "A recording you already have. Same transcript, same notes, stays here."
             }
@@ -1324,7 +1326,7 @@ impl StartChoice {
     const fn element_id(self) -> &'static str {
         match self {
             Self::CaptureApp => "start-choice-capture",
-            Self::Microphone => "start-choice-microphone",
+            Self::AudioNote => "start-choice-audio-note",
             Self::Import => "start-choice-import",
         }
     }
@@ -1332,7 +1334,7 @@ impl StartChoice {
     fn begin(self, workspace: &mut MeetingWorkspace, cx: &mut Context<MeetingWorkspace>) {
         match self {
             Self::CaptureApp => workspace.start_scoped_session(cx),
-            Self::Microphone => workspace.start_microphone_session(cx),
+            Self::AudioNote => workspace.start_microphone_session(cx),
             Self::Import => begin_import(workspace, cx),
         }
     }
@@ -1396,6 +1398,9 @@ pub(crate) struct StartChoicesState {
     pub(crate) selected_model: asr::ModelSize,
     pub(crate) model_availability: ModelAvailability,
     pub(crate) transcription_unavailability: Option<String>,
+    /// A stated Screen & System Audio Recording outcome from the last picker attempt. Blocks
+    /// only Capture — Audio note never queries this permission at all.
+    pub(crate) screen_permission_note: Option<ScreenPermissionNote>,
 }
 
 pub(crate) fn render_start_choices(
@@ -1410,6 +1415,7 @@ pub(crate) fn render_start_choices(
         selected_model,
         model_availability,
         transcription_unavailability,
+        screen_permission_note,
     } = state;
     let tokens = WorkspaceTokens::resolve(cx);
     let show_model_setup = matches!(
@@ -1501,6 +1507,7 @@ pub(crate) fn render_start_choices(
                             StartControlKind::Primary,
                             can_start,
                             transcription_unavailability.clone(),
+                            screen_permission_note,
                             tokens,
                             cx,
                         ))
@@ -1511,10 +1518,11 @@ pub(crate) fn render_start_choices(
                                 .flex()
                                 .gap(Space::SM)
                                 .child(render_start_control(
-                                    StartChoice::Microphone,
+                                    StartChoice::AudioNote,
                                     StartControlKind::Quiet,
                                     can_start,
                                     transcription_unavailability.clone(),
+                                    None,
                                     tokens,
                                     cx,
                                 ))
@@ -1523,6 +1531,7 @@ pub(crate) fn render_start_choices(
                                     StartControlKind::Quiet,
                                     can_start,
                                     transcription_unavailability,
+                                    None,
                                     tokens,
                                     cx,
                                 )),
@@ -1602,16 +1611,23 @@ fn render_start_control(
     kind: StartControlKind,
     can_start: bool,
     model_blocked: Option<String>,
+    permission_note: Option<ScreenPermissionNote>,
     tokens: WorkspaceTokens,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
-    let blocked = choice.unavailability().map(str::to_owned).or_else(|| {
-        if can_start {
-            model_blocked
-        } else {
-            Some("A recording is already running — stop it first.".to_owned())
-        }
-    });
+    let open_settings = permission_note
+        .as_ref()
+        .is_some_and(|note| note.open_settings);
+    let blocked = permission_note
+        .map(|note| note.message)
+        .or_else(|| choice.unavailability().map(str::to_owned))
+        .or_else(|| {
+            if can_start {
+                model_blocked
+            } else {
+                Some("A recording is already running — stop it first.".to_owned())
+            }
+        });
     let primary = matches!(kind, StartControlKind::Primary);
     let control = div()
         .debug_selector(move || choice.element_id().into())
@@ -1662,6 +1678,20 @@ fn render_start_control(
                     .text_color(tokens.warn)
                     .child(note),
             )
+            .when(open_settings, |view| {
+                view.child(
+                    div().mt(Space::XS).child(
+                        Button::new("open-screen-recording-settings", tokens)
+                            .label("Open Settings")
+                            .ghost()
+                            .xsmall()
+                            .debug_selector(|| "home-open-permission-settings".into())
+                            .on_click(|_, _, _| {
+                                let _ = MacCapture::open_permission_settings();
+                            }),
+                    ),
+                )
+            })
         })
         .into_any_element()
 }
@@ -2338,7 +2368,7 @@ mod tests {
             "capturing an app is wired today"
         );
         assert_eq!(
-            StartChoice::Microphone.unavailability(),
+            StartChoice::AudioNote.unavailability(),
             None,
             "microphone-only capture is wired through SessionController::start_microphone_only"
         );

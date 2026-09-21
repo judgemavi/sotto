@@ -20,7 +20,9 @@ use asr::{
     Config as AsrConfig, LiveRecordingTranscriber, ModelSize, RecordingConfig,
     model::{ModelProvisionError, ModelProvisioner, ProvisionPhase, ProvisionProgress},
 };
-use capture::macos::{CaptureStatus, MacCapture, PickedMacCapture, PickedTarget, probe_recording};
+use capture::macos::{
+    CaptureStatus, MacCapture, PickOutcome, PickedMacCapture, PickedTarget, probe_recording,
+};
 use futures_util::FutureExt;
 use gpui::{Context, PathPromptOptions, Timer};
 use rag::{Store, TimelinePersistence};
@@ -174,6 +176,16 @@ impl SessionLifecycle {
     }
 }
 
+/// The Screen & System Audio Recording outcome Home must state next to Capture.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScreenPermissionNote {
+    pub message: String,
+    /// Whether an Open Settings action belongs beside the note. Only a stated denial has
+    /// somewhere for that action to send the person; not-determined already has the system
+    /// prompt on screen.
+    pub open_settings: bool,
+}
+
 /// Non-disableable, truthful capture-scope indicator data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordingIndicator {
@@ -226,6 +238,11 @@ pub enum SessionFailureKind {
     InvalidOverride,
     ModelSetup,
     Capture,
+    /// Screen & System Audio Recording has never been decided; the system prompt was just
+    /// requested and is on screen, unanswered.
+    ScreenPermissionNotDetermined,
+    /// Screen & System Audio Recording was refused; macOS will not prompt again.
+    ScreenPermissionDenied,
     Recording,
     Timeline,
     Persistence,
@@ -282,6 +299,12 @@ impl SessionFailure {
             }
             SessionFailureKind::Capture => {
                 "Check capture and microphone permissions, then retry target selection."
+            }
+            SessionFailureKind::ScreenPermissionNotDetermined => {
+                "Approve the system prompt, then quit and reopen Sotto — the grant only takes effect for a newly launched process."
+            }
+            SessionFailureKind::ScreenPermissionDenied => {
+                "If a system prompt just appeared, approve it. If not, macOS has already been asked and will not ask again — open Settings to grant Screen & System Audio Recording. Either way, quit and reopen Sotto afterwards."
             }
             SessionFailureKind::Recording => {
                 "Check available storage and retry. If this repeats, restart Sotto and report the recording detail shown above."
@@ -437,6 +460,38 @@ impl LifecycleModel {
                     "Target selection cancelled. No session or model setup was started.".to_owned(),
                 ),
             };
+        }
+    }
+
+    /// Screen & System Audio Recording has never been decided. The prompt was just requested as
+    /// a side effect of the picker attempt and is now on screen; this must not read as an idle
+    /// cancellation, because nothing was cancelled — a decision is pending.
+    fn permission_not_determined(&mut self, generation: u64) {
+        self.enter_permission_failure(
+            generation,
+            SessionFailureKind::ScreenPermissionNotDetermined,
+            "Screen & System Audio Recording has not been decided yet.",
+        );
+    }
+
+    /// Screen & System Audio Recording was refused. macOS will not prompt again for this app
+    /// identity, so the only way forward is Settings plus a relaunch.
+    fn permission_denied(&mut self, generation: u64) {
+        self.enter_permission_failure(
+            generation,
+            SessionFailureKind::ScreenPermissionDenied,
+            "Screen & System Audio Recording is off for Sotto.",
+        );
+    }
+
+    fn enter_permission_failure(
+        &mut self,
+        generation: u64,
+        kind: SessionFailureKind,
+        message: &str,
+    ) {
+        if generation == self.generation && matches!(self.state, SessionLifecycle::ChoosingTarget) {
+            self.state = SessionLifecycle::Error(SessionFailure::new(kind, message));
         }
     }
 
@@ -700,6 +755,27 @@ impl SessionController {
         self.transcription_model.home_card_reason()
     }
 
+    /// The stated Screen & System Audio Recording outcome, when the last picker attempt could not
+    /// even present the picker. `None` covers every other lifecycle, including a quiet picker
+    /// cancellation — the one case that is correctly silent.
+    #[must_use]
+    pub fn screen_permission_note(&self) -> Option<ScreenPermissionNote> {
+        let SessionLifecycle::Error(failure) = &self.model.state else {
+            return None;
+        };
+        match failure.kind {
+            SessionFailureKind::ScreenPermissionNotDetermined => Some(ScreenPermissionNote {
+                message: failure.actionable_message(),
+                open_settings: false,
+            }),
+            SessionFailureKind::ScreenPermissionDenied => Some(ScreenPermissionNote {
+                message: failure.actionable_message(),
+                open_settings: true,
+            }),
+            _ => None,
+        }
+    }
+
     /// Verifies the persisted choice away from GPUI's launch thread and never contacts a server.
     pub fn begin_launch_model_check(&mut self, cx: &mut Context<Self>) {
         self.model_operation_generation = self.model_operation_generation.saturating_add(1);
@@ -911,14 +987,24 @@ impl SessionController {
         };
         let controller = cx.entity();
         cx.spawn(async move |_, cx| {
-            let picked = MacCapture::pick_target().await;
-            let _ = controller.update(cx, |controller, cx| match picked {
-                Some(target) => {
+            let outcome = MacCapture::pick_target().await;
+            let _ = controller.update(cx, |controller, cx| match outcome {
+                PickOutcome::Picked(target) => {
                     controller.begin_worker(generation, CaptureSelection::Scoped(target), cx)
                 }
-                None => {
+                PickOutcome::Cancelled => {
                     controller.next_entry_id = None;
                     controller.model.picker_cancelled(generation);
+                    cx.notify();
+                }
+                PickOutcome::NotDetermined => {
+                    controller.next_entry_id = None;
+                    controller.model.permission_not_determined(generation);
+                    cx.notify();
+                }
+                PickOutcome::Denied => {
+                    controller.next_entry_id = None;
+                    controller.model.permission_denied(generation);
                     cx.notify();
                 }
             });
@@ -2494,6 +2580,79 @@ mod tests {
     }
 
     #[test]
+    fn screen_permission_denied_blocks_start_with_a_stated_reason() {
+        let mut model = LifecycleModel::default();
+        let generation = model.begin();
+        assert!(generation.is_some(), "idle lifecycle must accept Start");
+        let Some(generation) = generation else {
+            return;
+        };
+        model.permission_denied(generation);
+
+        assert!(
+            matches!(model.state, SessionLifecycle::Error(_)),
+            "denied permission must land in Error, not Idle: {:?}",
+            model.state
+        );
+        let SessionLifecycle::Error(failure) = &model.state else {
+            return;
+        };
+        assert_eq!(failure.kind, SessionFailureKind::ScreenPermissionDenied);
+        assert!(
+            model
+                .state
+                .status_message()
+                .contains("Screen & System Audio Recording is off"),
+            "the denial must be stated, not merely categorized"
+        );
+        assert!(
+            model.state.status_message().contains("Settings"),
+            "a denial macOS will never re-prompt for must point at Settings"
+        );
+        assert!(
+            model.state.can_start(),
+            "a stated denial must still allow trying again after Settings + relaunch"
+        );
+    }
+
+    #[test]
+    fn screen_permission_not_determined_does_not_silently_return_to_idle() {
+        let mut model = LifecycleModel::default();
+        let generation = model.begin();
+        assert!(generation.is_some(), "idle lifecycle must accept Start");
+        let Some(generation) = generation else {
+            return;
+        };
+        model.permission_not_determined(generation);
+
+        assert!(
+            !matches!(model.state, SessionLifecycle::Idle { .. }),
+            "an unanswered permission prompt is not the same as a quiet cancellation"
+        );
+        assert!(
+            matches!(model.state, SessionLifecycle::Error(_)),
+            "not-determined permission must land in Error: {:?}",
+            model.state
+        );
+        let SessionLifecycle::Error(failure) = &model.state else {
+            return;
+        };
+        assert_eq!(
+            failure.kind,
+            SessionFailureKind::ScreenPermissionNotDetermined
+        );
+        let message = model.state.status_message();
+        assert!(
+            message.contains("Approve the system prompt"),
+            "the message must say what to do with the prompt now on screen"
+        );
+        assert!(
+            message.contains("relaunch") || message.contains("newly launched"),
+            "the message must say a relaunch is required, since a grant needs a new process"
+        );
+    }
+
+    #[test]
     fn stop_cancels_provisioning_and_never_claims_recording() {
         let mut model = LifecycleModel::default();
         let generation = model.begin();
@@ -2715,6 +2874,33 @@ mod tests {
                 assert!(
                     !controller.is_importing(),
                     "missing weights must stop before the import picker"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn microphone_only_start_never_touches_screen_permission() {
+        let mut cx = TestAppContext::single();
+        let (ingress, _receiver) = test_ingress(4);
+        let controller = cx.new(|_| SessionController::new(ingress));
+        cx.update(|cx| {
+            controller.update(cx, |controller, cx| {
+                controller
+                    .transcription_model
+                    .set_ready(std::path::PathBuf::from("model.bin"));
+                controller.start_microphone_only(cx);
+                assert!(
+                    matches!(
+                        controller.lifecycle(),
+                        SessionLifecycle::ProvisioningModel { .. }
+                    ),
+                    "microphone-only must skip the picker lifecycle entirely: {:?}",
+                    controller.lifecycle()
+                );
+                assert!(
+                    controller.screen_permission_note().is_none(),
+                    "a path that never queries screen permission must never carry its note"
                 );
             });
         });

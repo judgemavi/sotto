@@ -456,9 +456,10 @@ pub struct MeetingWorkspace {
     library_filter: Entity<InputState>,
     entry_title_input: Entity<InputState>,
     annotation_input: Entity<InputState>,
+    notes_document_input: Entity<InputState>,
     prepared_notes: Vec<String>,
     editing_annotation: Option<notes::AnnotationView>,
-    editing_notes_block: Option<notes::EditingNotesBlock>,
+    editing_notes_document: bool,
     library_index: BTreeMap<SessionId, String>,
     entry_library_index: BTreeMap<EntryId, String>,
     library_footprint: library::LibraryFootprint,
@@ -501,10 +502,12 @@ impl MeetingWorkspace {
             cx.new(|cx| InputState::new(window, cx).placeholder("Search entries and notes"));
         let entry_title_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Name this entry"));
-        let annotation_input = cx.new(|cx| {
+        let annotation_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Add a note to this recording"));
+        let notes_document_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .auto_grow(1, 4)
-                .placeholder("Add a note to this recording")
+                .auto_grow(8, 40)
+                .placeholder("Edit the note as markdown")
         });
         let persisted = layout::load_workspace_state(&database);
         let ask_open = persisted.ask_open;
@@ -583,8 +586,7 @@ impl MeetingWorkspace {
                         return;
                     }
                     if matches!(event, InputEvent::PressEnter { secondary: true })
-                        || (matches!(event, InputEvent::PressEnter { secondary: false })
-                            && !this.composer_edits_notes_document(cx))
+                        || matches!(event, InputEvent::PressEnter { secondary: false })
                     {
                         this.submit_annotation(window, cx);
                     }
@@ -640,9 +642,10 @@ impl MeetingWorkspace {
             library_filter,
             entry_title_input,
             annotation_input,
+            notes_document_input,
             prepared_notes: Vec::new(),
             editing_annotation: None,
-            editing_notes_block: None,
+            editing_notes_document: false,
             library_index: BTreeMap::new(),
             entry_library_index: BTreeMap::new(),
             library_footprint: library::LibraryFootprint::default(),
@@ -798,11 +801,13 @@ impl MeetingWorkspace {
                 })
             })
             .err();
+        self.editing_notes_document = false;
         cx.notify();
     }
 
     pub(crate) fn select_meeting(&mut self, id: SessionId, cx: &mut Context<Self>) {
         self.cancel_pending_ask();
+        self.editing_notes_document = false;
         if self.session.read(cx).active_session_id() == Some(id) {
             self.show_live_transcript(id, cx);
             cx.notify();

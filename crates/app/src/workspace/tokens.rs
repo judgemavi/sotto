@@ -190,7 +190,7 @@ impl TypeScale {
     /// Buttons, Ask copy, and other chrome that should share one size.
     pub(crate) const CONTROL: Pixels = px(14.0);
     pub(crate) const BODY: Pixels = px(15.0);
-    /// Home lede and the primary Record a call label.
+    /// Home lede and the primary Capture label.
     pub(crate) const LEDE: Pixels = px(16.0);
     /// The open session's title in the view bar.
     pub(crate) const TITLE: Pixels = px(17.0);

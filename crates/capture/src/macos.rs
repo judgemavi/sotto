@@ -124,6 +124,28 @@ impl Drop for PickedTarget {
 
 struct TargetCallbackState(Option<oneshot::Sender<Option<PickedTarget>>>);
 
+/// What presenting the system content picker actually produced.
+///
+/// A bare `Option<PickedTarget>` cannot say why nothing was picked, and "the user cancelled the
+/// picker" is the only one of those reasons that should stay silent — permission that was never
+/// decided, or was refused outright, must reach the person who clicked Start.
+#[derive(Debug)]
+pub enum PickOutcome {
+    /// The user chose a target; capture may proceed with it.
+    Picked(PickedTarget),
+    /// The picker was presented — permission was already granted — and the user dismissed it
+    /// without choosing anything. The only outcome that is correctly silent.
+    Cancelled,
+    /// Screen & System Audio Recording has never been decided for this process identity. Calling
+    /// this just triggered the system prompt; it is now on screen, pending an answer. The grant
+    /// only takes effect for a newly launched process, so approving it still requires relaunching
+    /// Sotto.
+    NotDetermined,
+    /// Screen & System Audio Recording was refused. macOS asks only once — the picker was never
+    /// presented, and asking again will not either. Re-grant it from Settings and relaunch.
+    Denied,
+}
+
 /// An owned BGRA frame copied out of the callback-scoped CoreVideo buffer.
 #[derive(Debug)]
 pub struct RawFrame {
@@ -346,23 +368,25 @@ impl MacCapture {
         self.dropped_frames.load(Ordering::Relaxed)
     }
 
-    /// Presents the system content picker. Cancellation returns `None` and does
-    /// not alter capture lifecycle state.
+    /// Presents the system content picker, or reports why it could not be presented.
     ///
     /// The picker is presented on the main queue, so this is only usable from a
     /// process that already runs an AppKit event loop — the GPUI app does.
     /// Anything else must use [`MacCapture::pick_target_blocking`]; awaiting this
     /// on a runtime that owns the main thread deadlocks, because the thread that
     /// would deliver the choice is the thread that is waiting for it.
-    pub async fn pick_target() -> Option<PickedTarget> {
-        if !Self::ensure_permission() {
-            return None;
+    pub async fn pick_target() -> PickOutcome {
+        if let Some(outcome) = Self::gate_permission() {
+            return outcome;
         }
         let (sender, receiver) = oneshot::channel();
         let state = Box::into_raw(Box::new(TargetCallbackState(Some(sender))));
         // SAFETY: the callback reclaims `state`; the bridge invokes it exactly once.
         unsafe { sotto_capture_pick_target(target_callback, state.cast()) };
-        receiver.await.ok().flatten()
+        match receiver.await.ok().flatten() {
+            Some(target) => PickOutcome::Picked(target),
+            None => PickOutcome::Cancelled,
+        }
     }
 
     /// Presents the picker and drives the main run loop until the user chooses or
@@ -371,9 +395,9 @@ impl MacCapture {
     /// Must be called on the main thread. Blocks until the picker resolves; there
     /// is no timeout, because waiting on a person is not a stall.
     #[must_use]
-    pub fn pick_target_blocking() -> Option<PickedTarget> {
-        if !Self::ensure_permission() {
-            return None;
+    pub fn pick_target_blocking() -> PickOutcome {
+        if let Some(outcome) = Self::gate_permission() {
+            return outcome;
         }
         let (sender, mut receiver) = oneshot::channel();
         let state = Box::into_raw(Box::new(TargetCallbackState(Some(sender))));
@@ -383,9 +407,41 @@ impl MacCapture {
             // SAFETY: called on the main thread; the bridge takes no pointers.
             unsafe { sotto_capture_pump_main_loop(0.05) };
             match receiver.try_recv() {
-                Ok(picked) => return picked,
+                Ok(Some(target)) => return PickOutcome::Picked(target),
+                Ok(None) | Err(oneshot::error::TryRecvError::Closed) => {
+                    return PickOutcome::Cancelled;
+                }
                 Err(oneshot::error::TryRecvError::Empty) => {}
-                Err(oneshot::error::TryRecvError::Closed) => return None,
+            }
+        }
+    }
+
+    /// Checks Screen & System Audio Recording permission ahead of presenting the picker.
+    ///
+    /// Returns `None` when the picker should proceed (permission is granted). Returns
+    /// `Some(outcome)` when it must not: not-determined permission triggers the one-time system
+    /// prompt as a side effect and reports that it is now pending; a stated denial reports itself
+    /// without touching the OS again, since macOS will not prompt a second time.
+    fn gate_permission() -> Option<PickOutcome> {
+        match Self::permission_status() {
+            PermissionStatus::Authorized => None,
+            PermissionStatus::NotDetermined => {
+                let _ = Self::request_permission();
+                Some(PickOutcome::NotDetermined)
+            }
+            PermissionStatus::Denied | PermissionStatus::Restricted => {
+                // The bridge's persisted "already asked" flag can outlive the TCC record it
+                // describes. Turning the permission off in Settings, `tccutil reset`, and — for
+                // an ad-hoc signed build — every rebuild, each return TCC to not-determined
+                // while the flag stays set, so a stale flag would report a denial macOS would
+                // in fact still prompt for. Asking again is a silent no-op against a real
+                // denial, so issue the request regardless rather than trusting the flag to
+                // suppress it, and re-read afterwards in case this process was already granted.
+                let _ = Self::request_permission();
+                match Self::permission_status() {
+                    PermissionStatus::Authorized => None,
+                    _ => Some(PickOutcome::Denied),
+                }
             }
         }
     }
@@ -396,19 +452,19 @@ impl MacCapture {
         // SAFETY: no arguments or retained pointers cross this C ABI call.
         match unsafe { sotto_capture_permission_status() } {
             1 => PermissionStatus::Authorized,
+            3 => PermissionStatus::NotDetermined,
+            // 2, or any code this build does not yet know: treat as a stated denial rather than
+            // silently proceeding as if permission were settled.
             _ => PermissionStatus::Denied,
         }
     }
 
-    /// Prompts for Screen & System Audio Recording access.
+    /// Prompts for Screen & System Audio Recording access. macOS shows the system prompt at most
+    /// once per app identity; calling this after a denial is a silent no-op.
     #[must_use]
     pub fn request_permission() -> bool {
         // SAFETY: no arguments or retained pointers cross this C ABI call.
         unsafe { sotto_capture_request_permission() }
-    }
-
-    fn ensure_permission() -> bool {
-        Self::permission_status() == PermissionStatus::Authorized || Self::request_permission()
     }
 
     /// Opens the Screen & System Audio Recording pane for re-grant after denial/revocation.

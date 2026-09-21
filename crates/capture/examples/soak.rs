@@ -12,7 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use capture::macos::{CaptureStatus, FrameReceiver, MacCapture, RawFrame, probe_recording};
+use capture::macos::{
+    CaptureStatus, FrameReceiver, MacCapture, PickOutcome, RawFrame, probe_recording,
+};
 use sotto_core::{AudioFrame, CaptureBackend, Source};
 use tokio::sync::broadcast;
 
@@ -87,7 +89,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     // This example has no AppKit event loop, so it drives the run loop itself
     // rather than awaiting the async picker — see `pick_target_blocking`.
     println!("choose a capture target in the system picker…");
-    let target = MacCapture::pick_target_blocking().ok_or("target selection was cancelled")?;
+    let target = match MacCapture::pick_target_blocking() {
+        PickOutcome::Picked(target) => target,
+        PickOutcome::Cancelled => return Err("target selection was cancelled".into()),
+        PickOutcome::NotDetermined => {
+            return Err(
+                "Screen & System Audio Recording was just requested; approve the prompt and re-run"
+                    .into(),
+            );
+        }
+        PickOutcome::Denied => {
+            return Err(
+                "Screen & System Audio Recording permission is required; re-run after granting it"
+                    .into(),
+            );
+        }
+    };
     println!("selected capture target: {:?}", target.description());
     let mut capture = target.into_capture();
     capture.record_to(&recording_path)?;

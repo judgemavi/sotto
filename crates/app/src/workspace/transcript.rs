@@ -1,8 +1,10 @@
 //! Virtualized transcript column: rows attributed to the source that produced them.
 //!
-//! ADR-0019 renamed the two channels. A row is `captured audio` or `your microphone` — the source
-//! of the sound, not the occasion it belonged to — and a collapsing legend in the column head
-//! explains the two dots. The column is also the receiving half of a summary citation: see
+//! ADR-0019 renamed the two channels: `captured audio` and `your microphone` — the source of the
+//! sound, not the occasion it belonged to. A row carries its channel as a coloured dot only; the
+//! collapsing legend in the column head is what maps a dot to its words, so the row does not
+//! repeat them. The words still appear wherever there is no legend to lean on: the clipboard
+//! format, and the unstable row's `Listening…` strip. The column is also the receiving half of a summary citation: see
 //! [`MeetingWorkspace::reveal_citation`].
 //!
 //! # Quoting the record
@@ -725,7 +727,6 @@ pub(crate) fn render(
         match rendered_roles[index] {
             RowRole::Speech => render_committed_row(
                 row,
-                index == 0 || rendered_rows[index - 1].source != row.source,
                 pinned,
                 RowMarks {
                     anchor: focused_event,
@@ -959,15 +960,17 @@ const fn empty_message(live: bool, meeting_selected: bool) -> &'static str {
     }
 }
 
-/// `names_source` is true only where the source *changes* from the row above.
+/// A committed row carries its source as a coloured dot and nothing else.
 ///
-/// The column head carries a legend mapping each dot to its source, so repeating "captured audio"
-/// on every consecutive row spends horizontal space to say what the previous row already said. The
-/// dot stays on every row — it is the thing the legend explains — and the words return the moment
-/// the speaker changes, which is exactly where a reader needs them.
+/// The column head's legend maps each dot to its source, which is the whole reason the legend is
+/// there — so naming the source in the row too was saying it twice. It also cost alignment: the
+/// words sat inline ahead of the text, so every row that named its source started its text
+/// further right than its neighbours, and a column whose premise is stable, quiet text rows had a
+/// ragged left edge. The dot is fixed-width, so with the words gone every row's text starts in the
+/// same place. The one place the words remain on a row is the unstable row's `Listening…` strip,
+/// which is a status line above the text rather than part of it.
 fn render_committed_row(
     row: &TranscriptRow,
-    names_source: bool,
     annotations: Vec<AnnotationView>,
     marks: RowMarks<'_>,
     tokens: WorkspaceTokens,
@@ -1000,8 +1003,7 @@ fn render_committed_row(
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .text_size(TypeScale::META)
                                 .text_color(tokens.ink_2)
-                                .child(source_dot(row.source, px(6.0), tokens))
-                                .when(names_source, |chip| chip.child(source_label(row.source))),
+                                .child(source_dot(row.source, px(6.0), tokens)),
                         )
                         .child(
                             div()
@@ -1926,29 +1928,6 @@ mod tests {
     /// The column head's legend already maps each dot to its source, so repeating the words on
     /// every consecutive row spends the width the transcript needs for the transcript. The rule the
     /// renderer applies is this one, so it is asserted here rather than through a mounted frame.
-    #[test]
-    fn a_run_of_rows_from_one_source_names_it_only_where_it_changes() {
-        let sources = [
-            Source::System,
-            Source::System,
-            Source::System,
-            Source::Mic,
-            Source::Mic,
-            Source::System,
-        ];
-        let names: Vec<bool> = sources
-            .iter()
-            .enumerate()
-            .map(|(index, source)| index == 0 || sources[index - 1] != *source)
-            .collect();
-        assert_eq!(
-            names,
-            [true, false, false, true, false, true],
-            "the words return exactly where the speaker changes, and the first row always names \
-             its own source"
-        );
-    }
-
     #[test]
     fn whole_non_speech_annotations_are_recognised_and_partial_ones_are_not() {
         for text in [
