@@ -4,6 +4,7 @@
 .DS_Store
 .idea/
 .vscode/
+.cargo/
 
 # Agent harness scratch: isolated worktrees, session state, and task board files.
 # Task files are local assignment units — not product source.

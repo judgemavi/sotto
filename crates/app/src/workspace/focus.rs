@@ -1,63 +1,154 @@
-//! Workspace-wide focus presentation for interactive controls.
+//! Thin product helpers over stock Longbridge buttons.
 //!
-//! `gpui-component` gives each button the correct focus handle and tab-stop behavior, but draws
-//! its built-in ring outside the control at 20% opacity. [`Button`] keeps those mechanics and
-//! replaces the visible treatment with an opaque border painted inside the button's own bounds.
-//! Transparent ghost fills cannot expose its interior, and clipping parents cannot eat it.
+//! ADR-0025: appearance comes from the kit. This module no longer paints a Sotto focus ring or
+//! private variants. Prefer stock [`Button`] builders; use [`with_debug_selector`] when a test
+//! must click a control the kit does not tag.
 
-use gpui::{ElementId, Hsla, StyleRefinement, prelude::*};
-use gpui_component::button::Button as ComponentButton;
+use gpui_kit::component::button::{Button as KitButton, ButtonVariants as _};
+use gpui_kit::component::{Disableable as _, Selectable as _, Sizable as _, Size as KitSize};
+use gpui_kit::{
+    AnyElement, App, ClickEvent, ElementId, InteractiveElement as _, IntoElement, ParentElement,
+    SharedString, StyleRefinement, Styled, Window, div,
+};
 
-fn focused_style(style: StyleRefinement, color: Hsla) -> StyleRefinement {
-    style.border_2().border_color(color)
-}
+use super::icons::IconName;
+use super::tokens::WorkspaceTokens;
 
-/// Constructs every workspace button with Sotto's focus treatment.
+pub(crate) type Size = KitSize;
+pub(crate) type Button = ProductButton;
+
+/// Fluent builder that mirrors the previous product API onto stock kit buttons.
 ///
-/// The returned value is still `gpui-component`'s button, so its focus handle, tab stop, pointer
-/// behavior, keyboard activation, variants, and selected fill are unchanged.
-pub(crate) struct Button;
+/// `tokens` is accepted and ignored so existing `Button::new(id, tokens)` call sites compile
+/// while chrome adopts Longbridge styling.
+#[derive(IntoElement)]
+pub(crate) struct ProductButton {
+    inner: KitButton,
+    debug_selector: Option<SharedString>,
+}
 
-impl Button {
-    #[expect(
-        clippy::new_ret_no_self,
-        reason = "drop-in constructor keeps every existing Button::new call on the shared seam"
-    )]
-    pub(crate) fn new(
-        id: impl Into<ElementId>,
-        tokens: super::tokens::WorkspaceTokens,
-    ) -> ComponentButton {
-        let color = tokens.focus;
-        ComponentButton::new(id)
-            // The component's weak halo is an absolute child outside these bounds. Clip that
-            // superseded treatment at the control itself; the inset border below remains visible.
-            .overflow_hidden()
-            .focus(move |style| focused_style(style, color.into()))
+impl ProductButton {
+    pub(crate) fn new(id: impl Into<ElementId>, _tokens: WorkspaceTokens) -> Self {
+        Self {
+            inner: KitButton::new(id),
+            debug_selector: None,
+        }
+    }
+
+    pub(crate) fn label(mut self, label: impl Into<SharedString>) -> Self {
+        self.inner = self.inner.label(label);
+        self
+    }
+
+    pub(crate) fn icon(mut self, icon: impl Into<IconName>) -> Self {
+        self.inner = self.inner.icon(icon.into());
+        self
+    }
+
+    pub(crate) fn tooltip(mut self, label: impl Into<SharedString>) -> Self {
+        self.inner = self.inner.tooltip(label);
+        self
+    }
+
+    pub(crate) fn debug_selector(mut self, selector: impl FnOnce() -> SharedString) -> Self {
+        self.debug_selector = Some(selector());
+        self
+    }
+
+    pub(crate) fn disabled(mut self, disabled: bool) -> Self {
+        self.inner = self.inner.disabled(disabled);
+        self
+    }
+
+    pub(crate) fn selected(mut self, selected: bool) -> Self {
+        self.inner = self.inner.selected(selected);
+        self
+    }
+
+    pub(crate) fn with_size(mut self, size: Size) -> Self {
+        self.inner = self.inner.with_size(size);
+        self
+    }
+
+    pub(crate) fn small(self) -> Self {
+        self.with_size(KitSize::Small)
+    }
+
+    pub(crate) fn xsmall(self) -> Self {
+        self.with_size(KitSize::XSmall)
+    }
+
+    pub(crate) fn ghost(mut self) -> Self {
+        self.inner = self.inner.ghost();
+        self
+    }
+
+    pub(crate) fn primary(mut self) -> Self {
+        self.inner = self.inner.primary();
+        self
+    }
+
+    pub(crate) fn danger(mut self) -> Self {
+        self.inner = self.inner.danger();
+        self
+    }
+
+    pub(crate) fn outline(mut self) -> Self {
+        self.inner = self.inner.outline();
+        self
+    }
+
+    pub(crate) fn on_click(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.inner = self.inner.on_click(handler);
+        self
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use gpui::{StyleRefinement, px, rgb};
-
-    use super::focused_style;
-
-    #[test]
-    fn focused_controls_bind_an_opaque_inset_border_and_no_shadow() {
-        let style = focused_style(StyleRefinement::default(), rgb(0xffffff).into());
-
-        assert_eq!(style.border_color, Some(rgb(0xffffff).into()));
-        assert_eq!(style.border_widths.top, Some(px(2.0).into()));
-        assert_eq!(style.border_widths.right, Some(px(2.0).into()));
-        assert_eq!(style.border_widths.bottom, Some(px(2.0).into()));
-        assert_eq!(style.border_widths.left, Some(px(2.0).into()));
-        assert!(
-            style.box_shadow.is_none(),
-            "a transparent ghost button must have nothing painted behind its label"
-        );
-        assert!(
-            style.background.is_none(),
-            "focus must not replace the fill that distinguishes Ask's selected state"
-        );
+impl Styled for ProductButton {
+    fn style(&mut self) -> &mut StyleRefinement {
+        self.inner.style()
     }
+}
+
+impl ParentElement for ProductButton {
+    fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
+        self.inner.extend(elements);
+    }
+}
+
+impl gpui_kit::RenderOnce for ProductButton {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let button = self.inner;
+        match self.debug_selector {
+            Some(selector) => {
+                let id = selector.clone();
+                div()
+                    .id(id)
+                    .debug_selector(move || selector.to_string())
+                    .child(button)
+                    .into_any_element()
+            }
+            None => button.into_any_element(),
+        }
+    }
+}
+
+/// Wrap any stock control when a test needs a stable selector the kit does not provide.
+#[expect(
+    dead_code,
+    reason = "test selector helper retained for call sites that need it"
+)]
+pub(crate) fn with_debug_selector(
+    selector: impl Into<SharedString>,
+    child: impl IntoElement,
+) -> impl IntoElement {
+    let selector = selector.into();
+    let id = selector.clone();
+    div()
+        .id(id)
+        .debug_selector(move || selector.to_string())
+        .child(child)
 }

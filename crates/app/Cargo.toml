@@ -12,8 +12,7 @@ workspace = true
 asr = { path = "../asr" }
 capture = { path = "../capture" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-gpui = "=0.2.2"
-gpui-component = "=0.5.1"
+gpui-kit = { version = "=0.6.6", features = ["tree-sitter-markdown", "tree-sitter-markdown-inline"] }
 futures-util = "0.3.32"
 insight = { path = "../insight" }
 keyring = "4.0.0"
@@ -35,10 +34,8 @@ tokio = { version = "=1.53.1", features = ["rt", "rt-multi-thread", "sync", "tim
 vad = { path = "../vad" }
 
 [dev-dependencies]
-gpui = { version = "=0.2.2", features = ["test-support"] }
+gpui-kit = { version = "=0.6.6", features = ["test-support", "tree-sitter-markdown", "tree-sitter-markdown-inline"] }
 # The exact rasterizer GPUI uses for SVG assets, pinned to the version already in the graph.
-# Dev-only: it proves the vendored icons really draw ink through the same code path the shipped
-# binary uses, without adding a byte to that binary. `gpui::SvgRenderer` is not public, so this is
-# the only way to assert on the real answer rather than on the file's structure.
+# Dev-only: retained for any remaining custom SVG ink checks. Kit assets cover standard icons.
 resvg = { version = "=0.45.1", default-features = false }
 tempfile = "3.27.0"

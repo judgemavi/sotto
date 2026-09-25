@@ -9,23 +9,23 @@
 //!
 //! # Quoting the record
 //!
-//! A record you cannot quote is one you can only look at, so every line of spoken text is a
-//! selectable [`TextView`] and `cmd-c` copies what the reader dragged across.
+//! A record you cannot quote is one you can only look at, so every line of spoken text is
+//! selectable markdown and `cmd-c` copies what the reader dragged across.
 //!
-//! **Selection does not span rows, and the column says so.** `TextView` owns one selection per
-//! instance, and one instance per row is what keeps a row clickable, flashable and individually
-//! anchored. Rather than leave a reader to discover that a drag stops at the row boundary, the
-//! column offers the multi-row unit explicitly: `Copy` in the head takes the whole transcript, and
-//! shift-clicking a second row takes the range from the note anchor to it. Both go through
-//! [`copy_text`], which prefixes every line with its media time and its source — a quoted
+//! **Selection does not span rows, and the column says so.** Each row retains its own markdown
+//! entity (see [`super::selectable`]), which is what keeps a row clickable, flashable and
+//! individually anchored. Rather than leave a reader to discover that a drag stops at the row
+//! boundary, the column offers the multi-row unit explicitly: `Copy` in the head takes the whole
+//! transcript, and shift-clicking a second row takes the range from the note anchor to it. Both go
+//! through [`copy_text`], which prefixes every line with its media time and its source — a quoted
 //! transcript that says neither is unattributable, and pasting three rows into a ticket is exactly
 //! the case where when-and-who is the point.
 //!
 //! **The click still belongs to the note anchor.** GPUI fires `on_click` on mouse-up regardless of
-//! how far the pointer travelled, and `TextView` installs its selection handlers on the window
-//! without stopping propagation, so a drag inside a row both selects text and anchors that row.
-//! That is the deliberate resolution: the two gestures address the same row and the anchor writes
-//! nothing to the record, so selection is additive and never swallows the anchor.
+//! how far the pointer travelled, and the markdown run installs its selection handlers on the
+//! window without stopping propagation, so a drag inside a row both selects text and anchors that
+//! row. That is the deliberate resolution: the two gestures address the same row and the anchor
+//! writes nothing to the record, so selection is additive and never swallows the anchor.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -33,14 +33,10 @@ use std::{
     time::Duration,
 };
 
-use gpui::{
+use gpui_kit::component::text::TextViewStyle;
+use gpui_kit::{
     AnyElement, App, ClipboardItem, Context, Div, ElementId, Global, IntoElement, ListState,
-    Pixels, Rgba, SharedString, Stateful, Timer, WeakEntity, Window, div, list, prelude::*, px,
-    rems,
-};
-use gpui_component::{
-    scroll::{Scrollbar, ScrollbarShow},
-    text::{TextView, TextViewStyle},
+    Pixels, SharedString, Stateful, WeakEntity, Window, div, list, prelude::*, px,
 };
 use sotto_core::{EventId, EventPayload, Source, SpeechState, TimelineEvent, replay_lenient};
 
@@ -52,6 +48,7 @@ use super::{
     control_row::{ControlRole, ControlRow},
     notes,
     notes::AnnotationView,
+    selectable,
     tokens::{Space, TypeScale, WorkspaceTokens},
 };
 
@@ -74,36 +71,32 @@ fn provisional_line(text: &str) -> String {
     format!("{PROVISIONAL_MARKER} · {text}")
 }
 
-/// Escapes text for [`TextView::html`].
+/// Escapes transcript text so the markdown renderer shows it literally.
 ///
-/// `TextView` renders Markdown or HTML, and transcript text is neither. HTML is the honest carrier
-/// of the two: four substitutions round-trip exactly through html5ever's entity decoding, whereas
-/// Markdown would silently eat a speaker's `*emphasis*` and `[brackets]` on the way to the
-/// clipboard.
-fn escape_html(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for value in text.chars() {
-        match value {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            _ => escaped.push(value),
+/// Transcript text is neither Markdown nor HTML. Backslash-escaping ASCII punctuation keeps a
+/// speaker's `*emphasis*` and `[brackets]` from restyling on the way to the clipboard.
+fn as_literal_markdown(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len().saturating_mul(2));
+    for character in text.chars() {
+        if character.is_ascii_punctuation() {
+            escaped.push('\\');
         }
+        escaped.push(character);
     }
     escaped
 }
 
 /// One line of transcript text the reader can drag across and copy.
 ///
-/// It exists as a `RenderOnce` because `TextView` needs a `&mut Window` its call sites do not have:
-/// the transcript column is rendered from `layout.rs` through [`render`], whose signature belongs
-/// to another task in this wave.
+/// It exists as a `RenderOnce` because the markdown renderer needs an `App` its call sites do not
+/// have: the transcript column is rendered from `layout.rs` through [`render`].
 #[derive(IntoElement)]
 struct SelectableLine {
     id: ElementId,
     debug: SharedString,
     text: SharedString,
+    /// Override TextView foreground (e.g. the kit's paired foreground on `accent_wash`).
+    color: Option<gpui_kit::Hsla>,
 }
 
 impl SelectableLine {
@@ -114,20 +107,44 @@ impl SelectableLine {
             id: (kind, event_id.get()).into(),
             debug: SharedString::from(format!("{kind}-{}", event_id.get())),
             text: text.into(),
+            color: None,
         }
+    }
+
+    fn text_color(mut self, color: gpui_kit::Hsla) -> Self {
+        self.color = Some(color);
+        self
     }
 }
 
 impl RenderOnce for SelectableLine {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let debug = self.debug;
-        div().debug_selector(move || debug.to_string()).child(
-            TextView::html(self.id, escape_html(&self.text), window, cx)
-                .selectable(true)
-                // One transcript row is one paragraph; the inter-paragraph rhythm of a document
-                // would open a gap the row layout never asked for.
-                .style(TextViewStyle::default().paragraph_gap(rems(0.0))),
-        )
+        let style = TextViewStyle::default();
+        // Kind+id is stable across frames; hashing the text into the key would mint a new entity
+        // on every edit and drop an in-progress drag.
+        let key = {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            self.id.hash(&mut hasher);
+            hasher.finish()
+        };
+        let view = selectable::retained_markdown(key, as_literal_markdown(&self.text), style, cx);
+        // TextView paints theme foreground; Styled::text_color refines after that and wins.
+        let view = match self.color {
+            Some(color) => view.text_color(color),
+            None => view,
+        };
+        div()
+            .id(self.id)
+            .debug_selector(move || debug.to_string())
+            .on_mouse_down(gpui_kit::MouseButton::Left, move |_, _, cx| {
+                selectable::begin_leaf_press(key, cx);
+            })
+            .on_mouse_move(move |_, _, cx| {
+                selectable::suppress_if_foreign_leaf(key, cx);
+            })
+            .child(view)
     }
 }
 
@@ -665,7 +682,7 @@ fn start_citation_flash(row: EventId, cx: &mut Context<MeetingWorkspace>) {
         generation,
     });
     cx.spawn(async move |workspace: WeakEntity<MeetingWorkspace>, cx| {
-        Timer::after(CITATION_FLASH).await;
+        cx.background_executor().timer(CITATION_FLASH).await;
         let _ = workspace.update(cx, |_, cx| {
             // A later citation owns the flash now; only the one that set it may clear it.
             let ours = cx
@@ -698,6 +715,7 @@ pub(crate) fn render(
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
     let tokens = WorkspaceTokens::resolve(cx);
+    let mono = TypeScale::mono(cx);
     let flashing = flashing_row(cx);
     let empty = empty_message(live, meeting_selected);
 
@@ -734,6 +752,7 @@ pub(crate) fn render(
                     flashing,
                 },
                 tokens,
+                mono.clone(),
                 workspace.clone(),
             ),
             RowRole::NonSpeechLeader { moments, through } => render_non_speech_aside(
@@ -747,6 +766,7 @@ pub(crate) fn render(
                     flashing,
                 },
                 tokens,
+                mono.clone(),
                 workspace.clone(),
             ),
             // Already accounted for on its leader's line; the slot stays so indices do not move.
@@ -779,9 +799,9 @@ pub(crate) fn render(
                 })
                 .when(!rows.is_empty(), |container| {
                     container.relative().child(transcript_list).child(
-                        Scrollbar::vertical(list_state)
+                        gpui_kit::component::scroll::Scrollbar::vertical(list_state)
                             .id("transcript-scrollbar")
-                            .scrollbar_show(ScrollbarShow::Always),
+                            .mode(gpui_kit::component::scroll::ScrollbarMode::Always),
                     )
                 }),
         )
@@ -809,7 +829,7 @@ fn column_head(
             ControlRole::Essential,
             div()
                 .debug_selector(|| "transcript-head-label".into())
-                .text_size(TypeScale::BODY)
+                .text_size(TypeScale::body(&tokens))
                 .child(if live {
                     "Live transcript"
                 } else {
@@ -820,7 +840,7 @@ fn column_head(
             ControlRole::Essential,
             div()
                 .pl(Space::SM)
-                .text_size(TypeScale::META)
+                .text_size(TypeScale::meta(&tokens))
                 .text_color(tokens.faint)
                 .child(format!("{rows} rows")),
         )
@@ -916,13 +936,13 @@ fn legend_entry(source: Source, tokens: WorkspaceTokens) -> Div {
         .flex()
         .items_center()
         .gap(Space::XS)
-        .text_size(TypeScale::META)
+        .text_size(TypeScale::meta(&tokens))
         .text_color(tokens.faint)
         .child(source_dot(source, px(7.0), tokens))
         .child(source_label(source))
 }
 
-fn source_dot(source: Source, diameter: gpui::Pixels, tokens: WorkspaceTokens) -> Div {
+fn source_dot(source: Source, diameter: gpui_kit::Pixels, tokens: WorkspaceTokens) -> Div {
     div()
         .w(diameter)
         .h(diameter)
@@ -931,9 +951,9 @@ fn source_dot(source: Source, diameter: gpui::Pixels, tokens: WorkspaceTokens) -
         .bg(source_color(source, tokens))
 }
 
-const fn source_color(source: Source, tokens: WorkspaceTokens) -> Rgba {
+const fn source_color(source: Source, tokens: WorkspaceTokens) -> gpui_kit::Hsla {
     match source {
-        Source::Mic => tokens.warn,
+        Source::Mic => tokens.warn_line,
         Source::System => tokens.accent,
     }
 }
@@ -974,9 +994,22 @@ fn render_committed_row(
     annotations: Vec<AnnotationView>,
     marks: RowMarks<'_>,
     tokens: WorkspaceTokens,
+    mono: SharedString,
     workspace: WeakEntity<MeetingWorkspace>,
 ) -> AnyElement {
     let body_selector = format!("transcript-row-body-{}", row.event_id.get());
+    let marked = marks.of(row.event_id) != RowMark::Plain;
+    let text = if marked {
+        tokens.for_highlight()
+    } else {
+        tokens
+    };
+    let body = SelectableLine::new("transcript-row-text", row.event_id, row.text.clone());
+    let body = if marked {
+        body.text_color(tokens.ink_on_wash)
+    } else {
+        body
+    };
     row_shell(row, marks, tokens, workspace)
         .child(
             div()
@@ -985,8 +1018,8 @@ fn render_committed_row(
                 .flex()
                 .items_start()
                 .gap(Space::MD)
-                .text_size(TypeScale::BODY)
-                .child(timestamp(row.start, tokens))
+                .text_size(TypeScale::body(&tokens))
+                .child(timestamp(row.start, text, mono))
                 .child(
                     div()
                         .flex_1()
@@ -1000,9 +1033,9 @@ fn render_committed_row(
                                 .flex()
                                 .items_center()
                                 .gap(Space::XS)
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_size(TypeScale::META)
-                                .text_color(tokens.ink_2)
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .text_size(TypeScale::meta(&tokens))
+                                .text_color(text.ink_2)
                                 .child(source_dot(row.source, px(6.0), tokens)),
                         )
                         .child(
@@ -1010,20 +1043,20 @@ fn render_committed_row(
                                 .flex_1()
                                 .min_w_0()
                                 .whitespace_normal()
-                                .when(row.unfinalized, |text| {
-                                    text.child(
+                                .when(row.unfinalized, |line| {
+                                    line.child(
                                         div()
                                             .mb_1()
-                                            .text_size(TypeScale::META)
+                                            .text_size(TypeScale::meta(&tokens))
                                             .text_color(tokens.warn)
                                             .child(UNFINALIZED_NOTICE),
                                     )
                                 })
-                                .when(!row.prosody.is_empty(), |text| {
-                                    text.child(
+                                .when(!row.prosody.is_empty(), |line| {
+                                    line.child(
                                         div()
-                                            .text_size(TypeScale::META)
-                                            .text_color(tokens.faint)
+                                            .text_size(TypeScale::meta(&tokens))
+                                            .text_color(text.faint)
                                             .child(format!(
                                                 "[{}]",
                                                 row.prosody
@@ -1034,11 +1067,7 @@ fn render_committed_row(
                                             )),
                                     )
                                 })
-                                .child(SelectableLine::new(
-                                    "transcript-row-text",
-                                    row.event_id,
-                                    row.text.clone(),
-                                )),
+                                .child(body),
                         ),
                 ),
         )
@@ -1051,6 +1080,10 @@ fn render_committed_row(
 }
 
 /// One quiet line standing for a stretch of non-speech annotations on one source.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "aside projection keeps row, fold span, marks, and theme fonts explicit"
+)]
 fn render_non_speech_aside(
     row: &TranscriptRow,
     moments: usize,
@@ -1058,8 +1091,25 @@ fn render_non_speech_aside(
     annotations: Vec<AnnotationView>,
     marks: RowMarks<'_>,
     tokens: WorkspaceTokens,
+    mono: SharedString,
     workspace: WeakEntity<MeetingWorkspace>,
 ) -> AnyElement {
+    let marked = marks.of(row.event_id) != RowMark::Plain;
+    let text = if marked {
+        tokens.for_highlight()
+    } else {
+        tokens
+    };
+    let body = SelectableLine::new(
+        "transcript-aside-text",
+        row.event_id,
+        non_speech_summary(row, moments, through),
+    );
+    let body = if marked {
+        body.text_color(tokens.ink_on_wash)
+    } else {
+        body
+    };
     row_shell(row, marks, tokens, workspace)
         .child(
             div()
@@ -1067,9 +1117,9 @@ fn render_non_speech_aside(
                 .flex()
                 .items_start()
                 .gap(Space::MD)
-                .text_size(TypeScale::META)
-                .text_color(tokens.faint)
-                .child(timestamp(row.start, tokens))
+                .text_size(TypeScale::meta(&tokens))
+                .text_color(text.faint)
+                .child(timestamp(row.start, text, mono))
                 .child(
                     div()
                         .flex_1()
@@ -1078,11 +1128,7 @@ fn render_non_speech_aside(
                         .whitespace_normal()
                         // The aside is selectable for the same reason it discloses a count: a
                         // reader copying this stretch must carry away what it stands for.
-                        .child(SelectableLine::new(
-                            "transcript-aside-text",
-                            row.event_id,
-                            non_speech_summary(row, moments, through),
-                        )),
+                        .child(body),
                 ),
         )
         .children(
@@ -1148,7 +1194,7 @@ enum RowMark {
 impl RowMark {
     /// The left rule this mark draws, if any. A range shows as a wash alone: ruling every row of
     /// it would compete with the anchor for the same edge.
-    const fn rule(self, tokens: WorkspaceTokens) -> Option<Rgba> {
+    const fn rule(self, tokens: WorkspaceTokens) -> Option<gpui_kit::Hsla> {
         match self {
             Self::Flashed => Some(tokens.accent),
             Self::Anchor => Some(tokens.accent_line),
@@ -1179,7 +1225,7 @@ fn row_shell(
     let mark = marks.of(event_id);
     div()
         // The id has to name *this* row. GPUI keys per-element click state by the element id path,
-        // and `gpui::list` does not scope its items, so one shared id gave every row one shared
+        // and `gpui_kit::list` does not scope its items, so one shared id gave every row one shared
         // `pending_mouse_down`: the first row's listener runs first in the mouse-up capture phase,
         // sees the pending press was not over itself, and clears it before the row the reader
         // actually clicked is ever reached. Only the topmost row could be anchored.
@@ -1220,13 +1266,13 @@ fn row_shell(
         })
 }
 
-fn timestamp(start: Duration, tokens: WorkspaceTokens) -> Div {
+fn timestamp(start: Duration, tokens: WorkspaceTokens, mono: SharedString) -> Div {
     div()
         .w(px(46.0))
         .flex_none()
         .text_right()
-        .font_family("Menlo")
-        .text_size(TypeScale::META)
+        .font_family(mono)
+        .text_size(TypeScale::meta(&tokens))
         .text_color(tokens.faint)
         .child(format_time(start))
 }
@@ -1250,12 +1296,26 @@ fn render_unstable_strip(
             let pinned = annotations.get(&row.event_id).cloned().unwrap_or_default();
             let event_id = row.event_id;
             let row_workspace = workspace.clone();
+            let focused = focused_event == Some(row.event_id);
+            let text = if focused {
+                tokens.for_highlight()
+            } else {
+                tokens
+            };
+            let body = SelectableLine::new(
+                "unstable-transcript-text",
+                event_id,
+                provisional_line(&row.text),
+            );
+            let body = if focused {
+                body.text_color(tokens.ink_on_wash)
+            } else {
+                body
+            };
             div()
                 .id(("unstable-transcript-row", event_id.get()))
                 .when(row.source == Source::System, |line| line.mt_2())
-                .when(focused_event == Some(row.event_id), |line| {
-                    line.bg(tokens.accent_wash)
-                })
+                .when(focused, |line| line.bg(tokens.accent_wash))
                 .on_click(move |_, _, cx| {
                     let _ = row_workspace.update(cx, |workspace, cx| {
                         workspace.select_annotation_anchor(event_id, cx)
@@ -1266,8 +1326,8 @@ fn render_unstable_strip(
                         .flex()
                         .items_center()
                         .gap(Space::SM)
-                        .text_size(TypeScale::META)
-                        .text_color(tokens.faint)
+                        .text_size(TypeScale::meta(&tokens))
+                        .text_color(text.faint)
                         .child(source_dot(row.source, px(6.0), tokens))
                         .child(source_label(row.source))
                         .child("Listening…"),
@@ -1275,16 +1335,12 @@ fn render_unstable_strip(
                 .child(
                     div()
                         .mt_1()
-                        .text_color(tokens.muted)
+                        .text_color(text.muted)
                         .whitespace_normal()
                         // A hypothesis is selectable, but it never leaves the app as bare text: the
                         // clipboard has no room for the surrounding strip, so the warning that this
                         // wording is about to change is part of the line itself.
-                        .child(SelectableLine::new(
-                            "unstable-transcript-text",
-                            event_id,
-                            provisional_line(&row.text),
-                        )),
+                        .child(body),
                 )
                 .children(pinned.into_iter().map(move |annotation| {
                     notes::render_pinned_annotation_with_tokens(annotation, tokens)
@@ -1475,8 +1531,8 @@ mod tests {
     };
 
     use super::{
-        PROVISIONAL_MARKER, RowMark, RowRole, TranscriptRow, citation_index, classify_rows,
-        copy_report, copy_text, empty_message, escape_html, is_non_speech_annotation,
+        PROVISIONAL_MARKER, RowMark, RowRole, TranscriptRow, as_literal_markdown, citation_index,
+        classify_rows, copy_report, copy_text, empty_message, is_non_speech_annotation,
         non_speech_summary, presented_event, project_completed_derived_transcript,
         project_completed_transcript, project_frame, project_transcript, provisional_line,
         row_mark, screen_consultation_disclosure, source_label,
@@ -2207,13 +2263,13 @@ mod tests {
     #[test]
     fn speech_reaches_the_renderer_as_written_rather_than_as_markup() {
         assert_eq!(
-            escape_html("we shipped it (finally) & *fixed* <the retry>"),
-            "we shipped it (finally) &amp; *fixed* &lt;the retry&gt;",
+            as_literal_markdown("we shipped it (finally) & *fixed* <the retry>"),
+            "we shipped it \\(finally\\) \\& \\*fixed\\* \\<the retry\\>",
             "punctuation a speaker used is escaped, never interpreted"
         );
         assert_eq!(
-            escape_html("she said \"ship it\""),
-            "she said &quot;ship it&quot;",
+            as_literal_markdown("she said \"ship it\""),
+            "she said \\\"ship it\\\"",
             "quotes survive into the rendered line"
         );
     }
@@ -2265,7 +2321,7 @@ mod tests {
 mod mounted_tests {
     use std::{ops::Deref as _, sync::Arc, time::Duration};
 
-    use gpui::{
+    use gpui_kit::{
         AppContext as _, Bounds, Modifiers, TestAppContext, VisualTestContext, WindowBounds,
         WindowOptions, point, px, size,
     };
@@ -2280,7 +2336,7 @@ mod mounted_tests {
     use crate::workspace::{MeetingWorkspace, StageTab};
     use crate::{mcp, reasoning, session};
 
-    const WORKSPACE_WIDTH: gpui::Pixels = px(1400.0);
+    const WORKSPACE_WIDTH: gpui_kit::Pixels = px(1400.0);
 
     const FIXTURE_SESSION: SessionId = SessionId::new(1_786_625_633_040_598_000);
 
@@ -2330,7 +2386,7 @@ mod mounted_tests {
     }
 
     struct MountedShell {
-        workspace: gpui::Entity<MeetingWorkspace>,
+        workspace: gpui_kit::Entity<MeetingWorkspace>,
         ingress: crate::devwindow::TimelineIngress,
         visual: &'static mut VisualTestContext,
     }
@@ -2403,8 +2459,13 @@ mod mounted_tests {
     fn mount_at(
         cx: &mut TestAppContext,
         directory: &std::path::Path,
-        width: gpui::Pixels,
+        width: gpui_kit::Pixels,
     ) -> Result<MountedShell, Box<dyn std::error::Error>> {
+        // Selectable markdown copy needs kit Root's TextSelectionLayer (ADR-0025).
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
         let database = directory.join("sotto.sqlite3");
         let (ingress, timeline) = cx.update(|cx| crate::devwindow::attach_ingress(cx, 16));
         let session = cx.new(|_| session::SessionController::new(ingress.clone()));
@@ -2427,16 +2488,39 @@ mod mounted_tests {
                     ..WindowOptions::default()
                 },
                 |window, cx| {
-                    cx.new(|cx| {
+                    let view = cx.new(|cx| {
                         MeetingWorkspace::new(
                             database, timeline, reasoning, session, mcp, window, cx,
                         )
-                    })
+                    });
+                    let keyboard_root =
+                        cx.new(|cx| crate::workspace::KeyboardRoot::new(view, window, cx));
+                    cx.new(|cx| gpui_kit::component::Root::new(keyboard_root, window, cx))
                 },
             )
         })?;
-        let workspace = handle.root(cx)?;
+        let workspace = cx
+            .update(|cx| {
+                handle.update(cx, |root, _, cx| {
+                    root.view()
+                        .clone()
+                        .downcast::<crate::workspace::KeyboardRoot>()
+                        .ok()
+                        .and_then(|keyboard| {
+                            keyboard
+                                .read(cx)
+                                .view()
+                                .clone()
+                                .downcast::<MeetingWorkspace>()
+                                .ok()
+                        })
+                })
+            })?
+            .ok_or_else(|| {
+                std::io::Error::other("the window root must wrap KeyboardRoot → MeetingWorkspace")
+            })?;
         let visual = VisualTestContext::from_window(*handle.deref(), cx).into_mut();
+        visual.update(|window, _| window.activate_window());
         visual.run_until_parked();
         Ok(MountedShell {
             workspace,
@@ -2449,7 +2533,7 @@ mod mounted_tests {
     async fn a_reader_can_select_a_row_anchor_it_and_copy_a_range_of_it()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let ids = persist_stopped_session(&dir.path().join("sotto.sqlite3")).await?;
         let shell = mount(&mut cx, dir.path())?;
@@ -2577,22 +2661,28 @@ mod mounted_tests {
         let quoted = visual
             .debug_bounds(selector("transcript-row-text", last))
             .ok_or_else(|| std::io::Error::other("the last row must render its text"))?;
+        visual.update(|_, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(String::new()))
+        });
         visual.simulate_mouse_down(
-            gpui::point(quoted.left() + px(2.0), quoted.top() + px(4.0)),
-            gpui::MouseButton::Left,
+            gpui_kit::point(quoted.left() + px(2.0), quoted.top() + px(4.0)),
+            gpui_kit::MouseButton::Left,
             Modifiers::none(),
         );
         visual.simulate_mouse_move(
-            gpui::point(quoted.right() - px(2.0), quoted.bottom() - px(4.0)),
-            gpui::MouseButton::Left,
+            gpui_kit::point(quoted.right() - px(2.0), quoted.bottom() - px(4.0)),
+            Some(gpui_kit::MouseButton::Left),
             Modifiers::none(),
         );
         visual.simulate_mouse_up(
-            gpui::point(quoted.right() - px(2.0), quoted.bottom() - px(4.0)),
-            gpui::MouseButton::Left,
+            gpui_kit::point(quoted.right() - px(2.0), quoted.bottom() - px(4.0)),
+            gpui_kit::MouseButton::Left,
             Modifiers::none(),
         );
         visual.run_until_parked();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
         visual.simulate_keystrokes("cmd-c");
         visual.run_until_parked();
 
@@ -2601,7 +2691,8 @@ mod mounted_tests {
             .and_then(|item| item.text())
             .ok_or_else(|| std::io::Error::other("a drag then cmd-c must copy the selection"))?;
         assert_eq!(
-            selected, "and the ticket says \"ship it\" & nothing else",
+            selected.trim(),
+            "and the ticket says \"ship it\" & nothing else",
             "dragging across a row copies exactly the words in it, punctuation intact"
         );
         assert_eq!(
@@ -2617,10 +2708,10 @@ mod mounted_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_copy_control_survives_the_narrowest_supported_window()
     -> Result<(), Box<dyn std::error::Error>> {
-        const MIN_WORKSPACE_WIDTH: gpui::Pixels = px(680.0);
+        const MIN_WORKSPACE_WIDTH: gpui_kit::Pixels = px(680.0);
 
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         persist_stopped_session(&dir.path().join("sotto.sqlite3")).await?;
         let shell = mount_at(&mut cx, dir.path(), MIN_WORKSPACE_WIDTH)?;
@@ -2655,10 +2746,10 @@ mod mounted_tests {
     #[test]
     fn the_live_head_keeps_every_essential_inside_its_narrow_column()
     -> Result<(), Box<dyn std::error::Error>> {
-        const MIN_WORKSPACE_WIDTH: gpui::Pixels = px(680.0);
+        const MIN_WORKSPACE_WIDTH: gpui_kit::Pixels = px(680.0);
 
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let shell = mount_at(&mut cx, dir.path(), MIN_WORKSPACE_WIDTH)?;
         let workspace = shell.workspace;
@@ -2706,16 +2797,14 @@ mod mounted_tests {
         Ok(())
     }
 
-    /// The stated limit, held to by a test rather than left for a reader to discover.
-    ///
-    /// A drag that leaves the row it started in copies only that row. That is why `Copy` and the
-    /// shift-click range exist, and why the module documents the boundary instead of implying a
-    /// selection that spans the column.
+    /// A drag that leaves the row it started in used to be clipped to that row under the old
+    /// per-leaf selection model. Kit window-scoped `TextSelection` under `Root` can land on the
+    /// destination leaf instead; multi-row copy remains the head `Copy` control and shift-click.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_drag_past_the_row_boundary_copies_only_the_row_it_started_in()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let ids = persist_stopped_session(&dir.path().join("sotto.sqlite3")).await?;
         let shell = mount(&mut cx, dir.path())?;
@@ -2745,15 +2834,21 @@ mod mounted_tests {
             .debug_bounds(selector("transcript-row-text", second))
             .ok_or_else(|| std::io::Error::other("the second row must render its text"))?;
 
+        visual.update(|_, cx| {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(String::new()))
+        });
         visual.simulate_mouse_down(
-            gpui::point(start.left() + px(2.0), start.top() + px(4.0)),
-            gpui::MouseButton::Left,
+            gpui_kit::point(start.left() + px(2.0), start.top() + px(4.0)),
+            gpui_kit::MouseButton::Left,
             Modifiers::none(),
         );
-        let end = gpui::point(beyond.right() - px(2.0), beyond.bottom() - px(4.0));
-        visual.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
-        visual.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+        let end = gpui_kit::point(beyond.right() - px(2.0), beyond.bottom() - px(4.0));
+        visual.simulate_mouse_move(end, Some(gpui_kit::MouseButton::Left), Modifiers::none());
+        visual.simulate_mouse_up(end, gpui_kit::MouseButton::Left, Modifiers::none());
         visual.run_until_parked();
+        visual.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
         visual.simulate_keystrokes("cmd-c");
         visual.run_until_parked();
 
@@ -2761,9 +2856,11 @@ mod mounted_tests {
             .update(|_, cx| cx.read_from_clipboard())
             .and_then(|item| item.text())
             .unwrap_or_default();
+        let trimmed = copied.trim();
         assert_eq!(
-            copied, "so where did the retry land",
-            "a selection stops at the row it began in; the range gesture is the multi-row unit"
+            trimmed, "so where did the retry land",
+            "a drag across a row boundary must stay on the starting leaf's prose, not jump to the \
+             destination or become a column range; got {copied:?}"
         );
         Ok(())
     }
@@ -2777,7 +2874,7 @@ mod mounted_tests {
     async fn a_row_below_the_first_can_still_be_made_the_note_anchor()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let ids = persist_stopped_session(&dir.path().join("sotto.sqlite3")).await?;
         let shell = mount(&mut cx, dir.path())?;
@@ -2812,7 +2909,7 @@ mod mounted_tests {
     async fn a_citation_still_scrolls_and_flashes_after_the_rows_became_selectable()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let ids = persist_stopped_session(&dir.path().join("sotto.sqlite3")).await?;
         let shell = mount(&mut cx, dir.path())?;
@@ -2869,7 +2966,7 @@ mod mounted_tests {
     fn a_live_hypothesis_renders_as_a_selectable_line_that_admits_it_is_one()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let shell = mount(&mut cx, dir.path())?;
         let workspace = shell.workspace;
@@ -2904,21 +3001,20 @@ mod mounted_tests {
         );
         for event in timeline.events() {
             visual
-                .background_executor
+                .foreground_executor
                 .clone()
-                .block(ingress.send(event.clone()))
+                .block_test(ingress.send(event.clone()))
                 .map_err(|_| std::io::Error::other("the ingress seam must accept the event"))?;
         }
-        // The seam drains on a `smol::Timer`, which follows the wall clock rather than the test
-        // executor's, so this waits for real elapsed time rather than advancing a virtual one.
+        // The seam drains on the background executor's timer, which follows the test clock.
         let mut delivered = 0;
         for _ in 0..100 {
+            visual.executor().advance_clock(Duration::from_millis(20));
             visual.run_until_parked();
             delivered = visual.update(|_, cx| workspace.read(cx).timeline.read(cx).events().len());
             if delivered == 2 {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(
             delivered, 2,
@@ -2986,17 +3082,19 @@ mod mounted_tests {
 
 #[cfg(test)]
 mod layout_tests {
-    use gpui::{Context, IntoElement, Render, TestAppContext, Window, div, prelude::*, px, size};
+    use gpui_kit::{
+        Context, IntoElement, Render, TestAppContext, Window, div, prelude::*, px, size,
+    };
 
     use super::{ControlRow, Space, WorkspaceTokens, column_head, column_head_available_width};
 
     type MeasuredHead = (
-        gpui::Bounds<gpui::Pixels>,
-        Option<gpui::Bounds<gpui::Pixels>>,
+        gpui_kit::Bounds<gpui_kit::Pixels>,
+        Option<gpui_kit::Bounds<gpui_kit::Pixels>>,
     );
 
     struct HeadHarness {
-        column_width: gpui::Pixels,
+        column_width: gpui_kit::Pixels,
     }
 
     impl Render for HeadHarness {
@@ -3020,7 +3118,7 @@ mod layout_tests {
             // each width proves absence rather than mistaking the previous wide frame for the
             // current narrow one.
             let mut cx = TestAppContext::single();
-            cx.update(gpui_component::init);
+            cx.update(gpui_kit::init);
             let (_view, visual) = cx.add_window_view(move |_, _| HeadHarness {
                 column_width: width,
             });

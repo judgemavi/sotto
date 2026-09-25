@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use gpui::{Context, Timer};
+use gpui_kit::Context;
 use sotto_core::SessionId;
 
 use super::MeetingWorkspace;
@@ -21,10 +21,12 @@ pub(super) fn newly_active_session(
 
 impl MeetingWorkspace {
     pub(super) fn poll_notes(&mut self, cx: &mut Context<Self>) {
-        let workspace = cx.entity();
+        let workspace = cx.weak_entity();
         cx.spawn(async move |_, cx| {
             loop {
-                Timer::after(Duration::from_millis(50)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
                 if workspace
                     .update(cx, |workspace, cx| {
                         if workspace.notes.update(cx, |notes, _| notes.poll()) {
@@ -42,10 +44,12 @@ impl MeetingWorkspace {
     }
 
     pub(super) fn poll_ask_updates(&mut self, cx: &mut Context<Self>) {
-        let workspace = cx.entity();
+        let workspace = cx.weak_entity();
         cx.spawn(async move |_, cx| {
             loop {
-                Timer::after(Duration::from_millis(50)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
                 if workspace
                     .update(cx, |workspace, cx| {
                         if workspace.poll_ask(cx) {

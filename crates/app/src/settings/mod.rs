@@ -30,18 +30,14 @@ use std::{
     time::Duration,
 };
 
-use gpui::{
+use gpui_kit::component::input::InputState;
+use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, Context, Entity, EventEmitter, FocusHandle,
-    IntoElement, KeyDownEvent, Pixels, Render, Subscription, Timer, Window, div, ease_out_quint,
+    IntoElement, KeyDownEvent, Pixels, Render, Subscription, Window, div, ease_out_quint,
     prelude::*, px,
 };
-use gpui_component::{
-    Disableable, IconName, WindowExt as _,
-    input::{Input, InputState},
-    scroll::ScrollableElement,
-};
 
-use crate::workspace::focus::Button;
+use crate::workspace::{focus::Button, icons::IconName, input::Input};
 use providers::{CODEX_CLI_BACKEND_ID, OPENAI_RESPONSES_BACKEND_ID};
 use secrecy::SecretString;
 use sotto_core::SessionId;
@@ -51,7 +47,7 @@ use crate::{
     reasoning::ReasoningController,
     session::{RecordingLibrary, RecordingLibrarySnapshot},
     workspace::{
-        confirm_delete_dialog, delete_icon_button, icon_button, motion,
+        delete_icon_button, icon_button, motion, open_confirm_delete_dialog,
         tokens::{Space, TypeScale, WorkspaceTokens},
     },
 };
@@ -80,6 +76,17 @@ const NAV_WIDTH: Pixels = px(168.0);
 /// A 168px rail out of a 372px sheet leaves a pane too narrow for the action rows the Codex and
 /// OpenAI cards carry, and a clipped button is exactly the defect this redesign is meant to remove.
 const NAV_STACKS_BELOW: Pixels = px(640.0);
+
+fn input_state(
+    placeholder: impl Into<gpui_kit::SharedString>,
+    content: impl Into<String>,
+    window: &mut Window,
+    cx: &mut Context<InputState>,
+) -> InputState {
+    InputState::new(window, cx)
+        .placeholder(placeholder)
+        .default_value(content.into())
+}
 
 #[derive(Default)]
 struct ValidationLease(Option<sotto_core::CancellationToken>);
@@ -245,43 +252,32 @@ impl SettingsView {
         // The sheet takes focus on open so Escape reaches it before anything inside is clicked.
         // Without a focused ancestor, GPUI dispatches key events to the window root only.
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle);
+        window.focus(&focus_handle, cx);
         let mut view = Self {
             reasoning,
             _reasoning_subscription: reasoning_subscription,
-            key_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Paste OpenAI API key (write-only)")
-                    .masked(true)
-            }),
-            model_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("OpenAI Responses model id")
-                    .default_value(model)
-            }),
-            codex_model_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Codex CLI model id")
-                    .default_value(codex_model)
-            }),
+            key_input: cx
+                .new(|cx| input_state("Paste OpenAI API key (write-only)", "", window, cx)),
+            model_input: cx.new(|cx| input_state("OpenAI Responses model id", model, window, cx)),
+            codex_model_input: cx
+                .new(|cx| input_state("Codex CLI model id", codex_model, window, cx)),
             mcp,
             _mcp_subscription: mcp_subscription,
-            mcp_id_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder("source id, e.g. project.docs")),
-            mcp_name_input: cx.new(|cx| InputState::new(window, cx).placeholder("Source name")),
+            mcp_id_input: cx.new(|cx| input_state("source id, e.g. project.docs", "", window, cx)),
+            mcp_name_input: cx.new(|cx| input_state("Source name", "", window, cx)),
             mcp_endpoint_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder("https://host.example/mcp")),
-            mcp_token_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Optional bearer token (write-only)")
-                    .masked(true)
-            }),
+                .new(|cx| input_state("https://host.example/mcp", "", window, cx)),
+            mcp_token_input: cx
+                .new(|cx| input_state("Optional bearer token (write-only)", "", window, cx)),
             recording_library,
             recording_snapshot: recording_result.ok(),
             recording_budget_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Recording budget in GB")
-                    .default_value(recording_budget_gb.to_string())
+                input_state(
+                    "Recording budget in GB",
+                    recording_budget_gb.to_string(),
+                    window,
+                    cx,
+                )
             }),
             action_message,
             validation_lease: ValidationLease::default(),
@@ -309,7 +305,7 @@ impl SettingsView {
         self.pane = SettingsPane::default();
         self.action_message = None;
         self.refresh_recordings();
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -375,19 +371,22 @@ impl SettingsView {
             loop {
                 match ticket.try_recv() {
                     Ok(result) => {
-                        let _ = reasoning.update(cx, |controller, cx| {
+                        reasoning.update(cx, |controller, cx| {
                             controller.finish_codex_probe(result, cx);
                         });
                         return;
                     }
                     Err(TryRecvError::Disconnected) => {
-                        let _ = reasoning.update(cx, |controller, cx| {
+                        reasoning.update(cx, |controller, cx| {
                             controller.codex_probe_worker_disconnected(ticket.generation(), cx);
                         });
                         return;
                     }
                     Err(TryRecvError::Empty) => {
-                        let _ = Timer::after(Duration::from_millis(50)).await;
+                        let _ = cx
+                            .background_executor()
+                            .timer(Duration::from_millis(50))
+                            .await;
                     }
                 }
             }
@@ -423,18 +422,18 @@ impl SettingsView {
     /// write-only here, so nothing in the app can even show what was lost.
     fn delete_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let view = view.clone();
-            confirm_delete_dialog(
-                dialog,
-                "Delete API key",
-                DELETE_KEY_PROMPT,
-                "Delete key",
-                move |_, cx| {
-                    let _ = view.update(cx, |this, cx| this.confirm_delete_key(cx));
-                },
-            )
-        });
+        open_confirm_delete_dialog(
+            window,
+            cx,
+            "delete-api-key",
+            "Delete API key",
+            DELETE_KEY_PROMPT,
+            "Delete key",
+            move |_, cx| {
+                let _ = view.update(cx, |this, cx| this.confirm_delete_key(cx));
+            },
+        );
+        cx.notify();
     }
 
     fn confirm_delete_key(&mut self, cx: &mut Context<Self>) {
@@ -460,19 +459,21 @@ impl SettingsView {
             loop {
                 match ticket.try_recv() {
                     Ok(result) => {
-                        let _ = reasoning.update(cx, |controller, cx| {
+                        reasoning.update(cx, |controller, cx| {
                             controller.finish_openai_validation(result, cx);
                         });
                         return;
                     }
                     Err(TryRecvError::Disconnected) => {
-                        let _ = reasoning.update(cx, |controller, cx| {
+                        reasoning.update(cx, |controller, cx| {
                             controller.validation_worker_disconnected(ticket.generation(), cx);
                         });
                         return;
                     }
                     Err(TryRecvError::Empty) => {
-                        Timer::after(Duration::from_millis(50)).await;
+                        cx.background_executor()
+                            .timer(Duration::from_millis(50))
+                            .await;
                     }
                 }
             }
@@ -497,10 +498,12 @@ impl SettingsView {
     }
 
     fn poll_mcp(&self, cx: &mut Context<Self>) {
-        let mcp = self.mcp.clone();
+        let mcp = self.mcp.downgrade();
         cx.spawn(async move |_, cx| {
             loop {
-                Timer::after(Duration::from_millis(50)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
                 if mcp
                     .update(cx, |controller, cx| {
                         let _ = controller.poll(cx);
@@ -584,19 +587,18 @@ impl SettingsView {
     ) {
         let prompt = prompt.to_owned();
         let view = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let view = view.clone();
-            confirm_delete_dialog(
-                dialog,
-                "Delete recording",
-                &prompt,
-                "Delete",
-                move |_, cx| {
-                    let _ =
-                        view.update(cx, |this, cx| this.confirm_delete_recording(session_id, cx));
-                },
-            )
-        });
+        open_confirm_delete_dialog(
+            window,
+            cx,
+            "delete-settings-recording",
+            "Delete recording",
+            &prompt,
+            "Delete",
+            move |_, cx| {
+                let _ = view.update(cx, |this, cx| this.confirm_delete_recording(session_id, cx));
+            },
+        );
+        cx.notify();
     }
 
     /// Deletes exactly the recording the dialog named.
@@ -748,20 +750,21 @@ impl Render for SettingsView {
                                     .child(
                                         div()
                                             .text_size(px(15.0))
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                                             .child(pane.title()),
                                     )
                                     .child(
                                         div()
                                             .mt(Space::XS)
-                                            .text_size(TypeScale::CONTROL)
+                                            .text_size(TypeScale::control(&tokens))
                                             .text_color(tokens.muted)
                                             .child(pane.lede()),
                                     ),
                             )
                             .child(body),
                     )
-                    .overflow_y_scrollbar(),
+                    .id("settings-scroll-1")
+                    .overflow_y_scroll(),
             );
 
         div()
@@ -775,7 +778,7 @@ impl Render for SettingsView {
             .py(SHEET_INSET_Y)
             .bg(tokens.scrim)
             .text_color(tokens.ink)
-            .text_size(TypeScale::BODY)
+            .text_size(TypeScale::body(&tokens))
             .occlude()
             .debug_selector(|| "settings-scrim".into())
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -813,7 +816,7 @@ impl Render for SettingsView {
                                     .flex_1()
                                     .min_w_0()
                                     .text_size(px(15.0))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                                     .child("Settings"),
                             )
                             .child(
@@ -1383,6 +1386,13 @@ fn transcription_pane(tokens: WorkspaceTokens) -> AnyElement {
         .into_any_element()
 }
 
+/// One settings section switch.
+///
+/// Stock `Sidebar` is a docked panel with collapse/overlay behaviour, not a pane list.
+/// Stock `List` is a fixed-height `uniform_list` and cannot wrap into the stacked horizontal
+/// strip used under `STACKED_NAV_BELOW`. Stock vertical `ToggleGroup` cannot carry
+/// `settings-nav-*` selectors. Ghost + selected [`Button`] keeps those selectors, keyboard
+/// focus, and the dual-axis layout.
 fn nav_item(
     pane: SettingsPane,
     selected: SettingsPane,
@@ -1390,47 +1400,38 @@ fn nav_item(
     tokens: WorkspaceTokens,
     cx: &mut Context<SettingsView>,
 ) -> AnyElement {
-    let current = pane == selected;
-    div()
-        .id(pane.nav_selector())
-        .flex_none()
-        .px(Space::MD)
-        .py(px(6.0))
-        .rounded_md()
-        .text_size(TypeScale::CONTROL)
-        .cursor_pointer()
-        .when(!stacked, |view| view.w_full())
-        .when(current, |view| {
-            view.bg(tokens.accent_wash)
-                .text_color(tokens.accent_ink)
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-        })
-        .when(!current, |view| view.text_color(tokens.muted))
+    let button = Button::new(pane.nav_selector(), tokens)
+        .label(pane.title())
+        .ghost()
+        .selected(pane == selected)
         .debug_selector(move || pane.nav_selector().into())
-        .child(pane.title())
-        .on_click(cx.listener(move |this, _, _, cx| this.select_pane(pane, cx)))
+        .on_click(cx.listener(move |this, _, _, cx| this.select_pane(pane, cx)));
+    div()
+        .flex_none()
+        .when(!stacked, |view| view.w_full())
+        .child(button)
         .into_any_element()
 }
 
-fn pane_column() -> gpui::Div {
+fn pane_column() -> gpui_kit::Div {
     div().w_full().min_w_0().flex().flex_col().gap(Space::MD)
 }
 
 /// A group heading inside a pane.
-fn pane_group(title: &str, detail: &str, tokens: WorkspaceTokens) -> gpui::Div {
+fn pane_group(title: &str, detail: &str, tokens: WorkspaceTokens) -> gpui_kit::Div {
     div()
         .w_full()
         .min_w_0()
         .child(
             div()
-                .text_size(TypeScale::TITLE)
-                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_size(TypeScale::title(&tokens))
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                 .child(title.to_owned()),
         )
         .child(
             div()
                 .mt(Space::XS)
-                .text_size(TypeScale::CONTROL)
+                .text_size(TypeScale::control(&tokens))
                 .text_color(tokens.muted)
                 .child(detail.to_owned()),
         )
@@ -1438,54 +1439,36 @@ fn pane_group(title: &str, detail: &str, tokens: WorkspaceTokens) -> gpui::Div {
 
 /// The mock's `.claim`: a leading statement about what Sotto does with your data.
 ///
-/// `honest` paints the warn palette, which the mock reserves for a limitation stated plainly.
+/// Stock [`Alert`] owns the wash/ink contrast (ADR-0025). `honest` uses the warning variant for
+/// a limitation stated plainly.
 fn claim(
     title: &str,
     detail: &str,
     selector: &'static str,
-    tokens: WorkspaceTokens,
+    _tokens: WorkspaceTokens,
     honest: bool,
-) -> gpui::Div {
+) -> impl IntoElement {
+    use gpui_kit::component::alert::Alert;
+
+    let alert = if honest {
+        Alert::warning(selector, detail.to_owned()).title(title.to_owned())
+    } else {
+        Alert::info(selector, detail.to_owned()).title(title.to_owned())
+    };
     div()
         .w_full()
         .min_w_0()
-        .flex()
-        .flex_col()
-        .gap(Space::XS)
-        .p(Space::MD)
-        .rounded_lg()
-        .border_1()
-        .border_color(if honest {
-            tokens.warn
-        } else {
-            tokens.accent_line
-        })
-        .bg(if honest {
-            tokens.warn_wash
-        } else {
-            tokens.accent_wash
-        })
-        .debug_selector(|| "settings-claim".into())
-        .child(
-            div()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(if honest {
-                    tokens.warn
-                } else {
-                    tokens.accent_ink
-                })
-                .child(title.to_owned()),
-        )
-        .child(disclosure(detail, selector, tokens))
+        .debug_selector(move || selector.to_owned())
+        .child(alert)
 }
 
 /// A labelled statement with no control, for a fact the user cannot change — including the mock
 /// controls Sotto has not built.
-fn statement(title: &str, detail: &str, tokens: WorkspaceTokens, unbuilt: bool) -> gpui::Div {
+fn statement(title: &str, detail: &str, tokens: WorkspaceTokens, unbuilt: bool) -> gpui_kit::Div {
     settings_card_with_tone(title, detail, tokens, unbuilt)
 }
 
-fn settings_card(title: &str, state: &str, tokens: WorkspaceTokens) -> gpui::Div {
+fn settings_card(title: &str, state: &str, tokens: WorkspaceTokens) -> gpui_kit::Div {
     settings_card_with_tone(title, state, tokens, false)
 }
 
@@ -1494,7 +1477,7 @@ fn settings_card_with_tone(
     state: &str,
     tokens: WorkspaceTokens,
     warning: bool,
-) -> gpui::Div {
+) -> gpui_kit::Div {
     div()
         .w_full()
         .min_w_0()
@@ -1504,7 +1487,11 @@ fn settings_card_with_tone(
         .p(Space::LG)
         .rounded_lg()
         .border_1()
-        .border_color(if warning { tokens.warn } else { tokens.line })
+        .border_color(if warning {
+            tokens.warn_line
+        } else {
+            tokens.line
+        })
         .bg(if warning {
             tokens.warn_wash
         } else {
@@ -1513,13 +1500,13 @@ fn settings_card_with_tone(
         .debug_selector(|| "settings-card".into())
         .child(
             div()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                 .child(title.to_owned()),
         )
         .when(!state.is_empty(), |view| {
             view.child(
                 div()
-                    .text_size(TypeScale::CONTROL)
+                    .text_size(TypeScale::control(&tokens))
                     .text_color(if warning { tokens.warn } else { tokens.muted })
                     .child(state.to_owned()),
             )
@@ -1527,17 +1514,17 @@ fn settings_card_with_tone(
 }
 
 /// One pinned privacy statement, carrying its own debug selector so a test can find it on a pane.
-fn disclosure(detail: &str, selector: &'static str, tokens: WorkspaceTokens) -> gpui::Div {
+fn disclosure(detail: &str, selector: &'static str, tokens: WorkspaceTokens) -> gpui_kit::Div {
     div()
         .w_full()
         .min_w_0()
-        .text_size(TypeScale::CONTROL)
+        .text_size(TypeScale::control(&tokens))
         .text_color(tokens.ink_2)
         .debug_selector(move || selector.to_owned())
         .child(detail.to_owned())
 }
 
-fn action_row() -> gpui::Div {
+fn action_row() -> gpui_kit::Div {
     div()
         .w_full()
         .min_w_0()
@@ -1548,7 +1535,7 @@ fn action_row() -> gpui::Div {
         .debug_selector(|| "settings-action-row".into())
 }
 
-fn notice(message: String, tokens: WorkspaceTokens) -> gpui::Div {
+fn notice(message: String, tokens: WorkspaceTokens) -> gpui_kit::Div {
     div()
         .flex_none()
         .w_full()
@@ -1557,7 +1544,7 @@ fn notice(message: String, tokens: WorkspaceTokens) -> gpui::Div {
         .border_t_1()
         .border_color(tokens.line_soft)
         .bg(tokens.warn_wash)
-        .text_size(TypeScale::CONTROL)
+        .text_size(TypeScale::control(&tokens))
         .text_color(tokens.warn)
         .debug_selector(|| "settings-notice".into())
         .child(message)
@@ -1639,10 +1626,9 @@ mod tests {
         },
         session::RecordingLibrary,
     };
-    use gpui::{
+    use gpui_kit::{
         AppContext as _, Entity, Modifiers, TestAppContext, VisualTestContext, prelude::*, px, size,
     };
-    use gpui_component::WindowExt as _;
     use mcp::{HttpEndpoint, ServerId};
     use providers::{AuthStatus, codex::CodexProbe};
     use secrecy::SecretString;
@@ -1714,32 +1700,35 @@ mod tests {
 
     /// Stands in for the workspace that mounts the sheet in the product.
     ///
-    /// It exists for one reason the sheet cannot supply itself: `gpui_component::Root` stores the
-    /// open dialogs but draws nothing, so the view it wraps has to render the dialog layer. In the
-    /// product that view is `MeetingWorkspace`, which renders the sheet and the layer together;
-    /// here it is this.
+    /// Confirm dialogs open via kit `Root` (`window.open_dialog`). This host exists so the test
+    /// window has the same Root layer the product uses, with the sheet as its child.
     struct SheetHost {
         settings: Entity<SettingsView>,
     }
 
-    impl gpui::Render for SheetHost {
+    impl gpui_kit::Render for SheetHost {
         fn render(
             &mut self,
-            window: &mut gpui::Window,
-            cx: &mut gpui::Context<Self>,
-        ) -> impl gpui::IntoElement {
-            gpui::div()
+            window: &mut gpui_kit::Window,
+            cx: &mut gpui_kit::Context<Self>,
+        ) -> impl gpui_kit::IntoElement {
+            // Same contract as KeyboardRoot: Root owns dialog state; this host paints the layer.
+            let dialogs = gpui_kit::component::Root::render_dialog_layer(window, cx);
+            gpui_kit::div()
                 .size_full()
                 .child(self.settings.clone())
-                .children(gpui_component::Root::render_dialog_layer(window, cx))
+                .children(dialogs)
         }
     }
 
     fn mount(
         cx: &mut TestAppContext,
-        width: gpui::Pixels,
+        width: gpui_kit::Pixels,
     ) -> Result<MountedSheet<'_>, Box<dyn std::error::Error>> {
-        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
         let directory = tempfile::tempdir()?;
         let reasoning_path = directory.path().join("reasoning.json");
         let mcp_path = directory.path().join("mcp.json");
@@ -1756,12 +1745,12 @@ mod tests {
         let mcp = cx.new(|_| McpController::load(Some(mcp_path), Arc::new(NoMcpCredentials)));
         let library = RecordingLibrary::new(&database, recordings);
         let handle = cx.update(|cx| {
-            cx.open_window(gpui::WindowOptions::default(), move |window, cx| {
+            cx.open_window(gpui_kit::WindowOptions::default(), move |window, cx| {
                 let settings = cx.new(|cx| {
                     SettingsView::new_with_recording_library(window, reasoning, mcp, library, cx)
                 });
                 let host = cx.new(|_| SheetHost { settings });
-                cx.new(|cx| gpui_component::Root::new(host, window, cx))
+                cx.new(|cx| gpui_kit::component::Root::new(host, window, cx))
             })
         })?;
         let settings = cx
@@ -1770,10 +1759,11 @@ mod tests {
                     root.view()
                         .clone()
                         .downcast::<SheetHost>()
+                        .ok()
                         .map(|host| host.read(cx).settings.clone())
                 })
             })?
-            .map_err(|_| std::io::Error::other("the window root must wrap the settings sheet"))?;
+            .ok_or_else(|| std::io::Error::other("the window root must wrap the settings sheet"))?;
         let visual = VisualTestContext::from_window(*handle.deref(), cx).into_mut();
         visual.update(|window, _| window.activate_window());
         visual.simulate_resize(size(width, px(720.0)));
@@ -1797,7 +1787,7 @@ mod tests {
         visual: &mut VisualTestContext,
         pane: &'static str,
         selector: &'static str,
-    ) -> Result<gpui::Bounds<gpui::Pixels>, Box<dyn std::error::Error>> {
+    ) -> Result<gpui_kit::Bounds<gpui_kit::Pixels>, Box<dyn std::error::Error>> {
         for _ in 0..40_u8 {
             let page = visual
                 .debug_bounds("settings-page")
@@ -1813,16 +1803,16 @@ mod tests {
             let area = visual
                 .debug_bounds(pane)
                 .ok_or_else(|| std::io::Error::other("the selected pane must render"))?;
-            let over = gpui::point(
+            let over = gpui_kit::point(
                 page.center().x,
                 area.center().y.min(page.bottom() - px(80.0)),
             );
             visual.simulate_mouse_move(over, None, Modifiers::none());
-            visual.simulate_event(gpui::ScrollWheelEvent {
+            visual.simulate_event(gpui_kit::ScrollWheelEvent {
                 position: over,
-                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-90.0))),
+                delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.0), px(-90.0))),
                 modifiers: Modifiers::none(),
-                touch_phase: gpui::TouchPhase::Moved,
+                touch_phase: gpui_kit::TouchPhase::Moved,
             });
             visual.refresh()?;
             visual.run_until_parked();
@@ -2173,11 +2163,13 @@ mod tests {
             DELETE_RECORDING_SELECTOR,
         )?;
         visual.simulate_click(delete.center(), Modifiers::none());
-        visual.refresh()?;
         visual.run_until_parked();
+        crate::workspace::test_support::settle_root_overlays(visual);
 
         assert!(
-            visual.update(|window, cx| window.has_active_dialog(cx)),
+            visual
+                .debug_bounds(crate::workspace::CONFIRM_OK_SELECTOR)
+                .is_some(),
             "the row's trash icon must ask before it removes a file"
         );
         assert!(
@@ -2189,10 +2181,12 @@ mod tests {
             .debug_bounds(crate::workspace::CONFIRM_CANCEL_SELECTOR)
             .ok_or_else(|| std::io::Error::other("a destructive confirmation must offer Cancel"))?;
         visual.simulate_click(cancel.center(), Modifiers::none());
-        visual.refresh()?;
         visual.run_until_parked();
+        crate::workspace::test_support::settle_root_overlays(visual);
         assert!(
-            !visual.update(|window, cx| window.has_active_dialog(cx)),
+            visual
+                .debug_bounds(crate::workspace::CONFIRM_OK_SELECTOR)
+                .is_none(),
             "Cancel must dismiss the dialog"
         );
         assert!(media.exists(), "Cancel must leave the recording on disk");
@@ -2203,13 +2197,15 @@ mod tests {
 
         // Escape is the keyboard's Cancel, and it must be just as harmless.
         visual.simulate_click(delete.center(), Modifiers::none());
-        visual.refresh()?;
         visual.run_until_parked();
+        crate::workspace::test_support::settle_root_overlays(visual);
         visual.simulate_keystrokes("escape");
-        visual.refresh()?;
         visual.run_until_parked();
+        crate::workspace::test_support::settle_root_overlays(visual);
         assert!(
-            !visual.update(|window, cx| window.has_active_dialog(cx)),
+            visual
+                .debug_bounds(crate::workspace::CONFIRM_OK_SELECTOR)
+                .is_none(),
             "Escape must cancel the dialog"
         );
         assert!(media.exists(), "Escape must leave the recording on disk");
@@ -2237,17 +2233,19 @@ mod tests {
             DELETE_RECORDING_SELECTOR,
         )?;
         visual.simulate_click(delete.center(), Modifiers::none());
-        visual.refresh()?;
         visual.run_until_parked();
+        crate::workspace::test_support::settle_root_overlays(visual);
         let ok = visual
             .debug_bounds(crate::workspace::CONFIRM_OK_SELECTOR)
             .ok_or_else(|| std::io::Error::other("a destructive confirmation must offer OK"))?;
         visual.simulate_click(ok.center(), Modifiers::none());
-        visual.refresh()?;
         visual.run_until_parked();
+        crate::workspace::test_support::settle_root_overlays(visual);
 
         assert!(
-            !visual.update(|window, cx| window.has_active_dialog(cx)),
+            visual
+                .debug_bounds(crate::workspace::CONFIRM_OK_SELECTOR)
+                .is_none(),
             "confirming must close the dialog"
         );
         assert!(!media.exists(), "confirming must remove the media file");
@@ -2290,18 +2288,22 @@ mod tests {
             DELETE_OPENAI_KEY_SELECTOR,
         )?;
         visual.simulate_click(delete.center(), Modifiers::none());
-        visual.refresh()?;
         visual.run_until_parked();
+        crate::workspace::test_support::settle_root_overlays(visual);
         assert!(
-            visual.update(|window, cx| window.has_active_dialog(cx)),
+            visual
+                .debug_bounds(crate::workspace::CONFIRM_OK_SELECTOR)
+                .is_some(),
             "removing a credential from the Keychain must be confirmed, not assumed"
         );
 
         visual.simulate_keystrokes("escape");
-        visual.refresh()?;
         visual.run_until_parked();
+        crate::workspace::test_support::settle_root_overlays(visual);
         assert!(
-            !visual.update(|window, cx| window.has_active_dialog(cx)),
+            visual
+                .debug_bounds(crate::workspace::CONFIRM_OK_SELECTOR)
+                .is_none(),
             "Escape must cancel the key deletion"
         );
         assert_eq!(

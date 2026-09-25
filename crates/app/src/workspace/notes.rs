@@ -20,18 +20,16 @@
 
 use std::{
     collections::BTreeMap,
-    hash::{Hash as _, Hasher as _},
+    hash::{Hash, Hasher},
     time::Duration,
 };
 
-use gpui::{App, Context, ElementId, Entity, Rgba, WeakEntity, Window, div, prelude::*, px};
-use gpui_component::{
-    Disableable, Selectable as _, Sizable as _,
-    button::ButtonVariants as _,
-    input::{Input, InputState},
-    scroll::ScrollableElement,
-    text::TextView,
-};
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::Size;
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::InputState;
+use gpui_kit::component::text::TextViewStyle;
+use gpui_kit::{App, Context, ElementId, Entity, WeakEntity, Window, div, prelude::*, px};
 use insight::{
     NotesBlockProvenance, NotesOverlayOperation, OverlayTarget, PresentedNotesBlock,
     PresentedNotesDocument, RecordingNotesSectionKind, ScreenConsultation, SourceStatus,
@@ -58,7 +56,8 @@ use crate::{
 use super::{
     Button, MeetingWorkspace,
     control_row::{ControlRole, ControlRow},
-    motion,
+    input::Input,
+    motion, selectable,
     tokens::{TypeScale, WorkspaceTokens},
 };
 
@@ -91,14 +90,14 @@ pub(crate) fn render_with_citation_times(
     latest_anchor: Option<EventId>,
     selected_anchor: Option<EventId>,
     annotation_input: &Entity<InputState>,
-    notes_document_input: &Entity<InputState>,
+    notes_document_input: &Entity<gpui_kit::component::input::EditorState>,
     editing_notes_document: bool,
     servers: Vec<ConfiguredServer>,
     selected_grant: Option<SessionGrantView>,
     citation_times: &CitationTimes,
     picker: NotesProviderPicker,
     cx: &mut Context<MeetingWorkspace>,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let tokens = WorkspaceTokens::resolve(cx);
     let summary = SummaryView::resolve(state, live);
     div()
@@ -117,10 +116,12 @@ pub(crate) fn render_with_citation_times(
         ))
         .child(
             div()
+                .id("notes-column-scroll")
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
-                .overflow_y_scrollbar()
+                .id("notes-scroll-1")
+                .overflow_y_scroll()
                 .px_4()
                 .py_3()
                 .children(live.then(|| render_your_notes(annotations, citation_times, cx)))
@@ -161,7 +162,7 @@ pub(crate) fn render_with_citation_times(
                             ControlRole::Essential,
                             Button::new("append-note", tokens)
                                 .label("Add")
-                                .small()
+                                .with_size(Size::Small)
                                 .disabled(
                                     live && selected_anchor.is_none() && latest_anchor.is_none(),
                                 )
@@ -194,7 +195,7 @@ fn render_completed_annotations(
     annotations: &[AnnotationView],
     citation_times: &CitationTimes,
     cx: &mut Context<MeetingWorkspace>,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let tokens = WorkspaceTokens::resolve(cx);
     div()
         .children((!annotations.is_empty()).then(|| {
@@ -232,15 +233,29 @@ fn render_completed_annotations(
         .into_any_element()
 }
 
+/// Full-document Markdown source editor for a composed notes artifact.
+///
+/// Uses Longbridge [`Editor`] / [`EditorState`] with `language("markdown")` (tree-sitter
+/// highlighting), soft wrap, and no line numbers — a reading-sized source surface, not a code
+/// IDE. Save/cancel and citation-preserving `diff_notes_document` stay on this field; editing
+/// never mutates the factual timeline — only overlay operations.
 fn render_document_editor(
-    notes_document_input: &Entity<InputState>,
+    notes_document_input: &Entity<gpui_kit::component::input::EditorState>,
     tokens: WorkspaceTokens,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
+    use gpui_kit::component::input::Editor;
+
     div()
         .debug_selector(|| "notes-document-editor".into())
         .min_h(px(240.0))
-        .child(Input::new(notes_document_input))
-        .text_color(tokens.ink)
+        .w_full()
+        .child(
+            Editor::new(notes_document_input)
+                .h(px(240.0))
+                .bordered(false)
+                .appearance(false)
+                .text_color(tokens.ink),
+        )
         .into_any_element()
 }
 
@@ -251,7 +266,7 @@ fn render_head(
     editing_notes_document: bool,
     picker: NotesProviderPicker,
     cx: &mut Context<MeetingWorkspace>,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let tokens = WorkspaceTokens::resolve(cx);
     let notes_ready = picker.ready;
     let selected = picker.selected;
@@ -275,7 +290,7 @@ fn render_head(
             ControlRole::Essential,
             Button::new("notes-provider-openai", tokens)
                 .label("OpenAI")
-                .small()
+                .with_size(Size::Small)
                 .selected(selected_openai)
                 .disabled(live || generation_running)
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -293,7 +308,7 @@ fn render_head(
             ControlRole::Essential,
             Button::new("notes-provider-codex", tokens)
                 .label("Codex")
-                .small()
+                .with_size(Size::Small)
                 .selected(selected_codex)
                 .disabled(live || generation_running)
                 .on_click(cx.listener(|this, _, _, cx| {
@@ -309,7 +324,7 @@ fn render_head(
             } else {
                 "Write notes again"
             })
-            .small()
+            .with_size(Size::Small)
             .disabled(live || generation_running || !notes_ready || editing_notes_document)
             .debug_selector(|| "summarize-control".into())
             .on_click(cx.listener(|this, _, _, cx| this.generate_notes(cx))),
@@ -320,7 +335,7 @@ fn render_head(
                 ControlRole::Essential,
                 Button::new("notes-document-save", tokens)
                     .label("Save")
-                    .small()
+                    .with_size(Size::Small)
                     .debug_selector(|| "notes-document-save".into())
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.save_notes_document(window, cx);
@@ -331,7 +346,7 @@ fn render_head(
                 Button::new("notes-document-cancel", tokens)
                     .label("Cancel")
                     .ghost()
-                    .small()
+                    .with_size(Size::Small)
                     .debug_selector(|| "notes-document-cancel".into())
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.cancel_notes_document_edit(cx);
@@ -343,7 +358,7 @@ fn render_head(
             Button::new("notes-document-edit", tokens)
                 .label("Edit")
                 .ghost()
-                .small()
+                .with_size(Size::Small)
                 .disabled(generation_running)
                 .debug_selector(|| "notes-document-edit".into())
                 .on_click(cx.listener(|this, _, window, cx| {
@@ -485,7 +500,7 @@ pub(crate) fn latest_anchor(events: &[TimelineEvent]) -> Option<EventId> {
 pub(crate) fn render_pinned_annotation_with_tokens(
     annotation: AnnotationView,
     tokens: WorkspaceTokens,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     div()
         .mt_2()
         .ml_4()
@@ -495,7 +510,7 @@ pub(crate) fn render_pinned_annotation_with_tokens(
         .text_sm()
         .child(
             div()
-                .text_color(tokens.accent)
+                .text_color(tokens.accent_ink)
                 .child(format!("Your {}", mark_label(annotation.mark))),
         )
         .child(SelectableText {
@@ -511,7 +526,7 @@ fn render_your_notes(
     annotations: &[AnnotationView],
     citation_times: &CitationTimes,
     cx: &mut Context<MeetingWorkspace>,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let tokens = WorkspaceTokens::resolve(cx);
     div()
         .mb_4()
@@ -562,7 +577,7 @@ fn render_your_notes(
                             ControlRole::Ellipsizing,
                             div()
                                 .text_sm()
-                                .text_color(tokens.accent)
+                                .text_color(tokens.accent_ink)
                                 .child(mark_label(annotation.mark)),
                         )
                         .child(
@@ -657,42 +672,56 @@ fn timecode(time: Duration) -> String {
 
 /// Record text the reader can select, copy, and reach with the keyboard.
 ///
-/// A note-taking product whose notes cannot be copied is failing at its own job, and until now no
-/// text in this workspace was selectable. [`TextView`] is `gpui-component`'s only selectable text
-/// primitive, and it needs a `Window` that the column's plain render functions never receive — so
-/// the leaf is a [`RenderOnce`] component, which is handed one at draw time. It also registers a
-/// focus handle as a tab stop, so the text is reachable without a mouse.
+/// A note-taking product whose notes cannot be copied is failing at its own job. gpui-kit's
+/// markdown renderer is the selectable text primitive; it needs an `App` the column's plain render
+/// functions never receive — so the leaf is a [`RenderOnce`] component, handed one at draw time.
 #[derive(IntoElement)]
 struct SelectableText {
     /// Identifies the text's place in the document; hashed with the text itself to key
-    /// `TextView`'s parse state, because a stable id alone would show a stale sentence.
+    /// the markdown element, because a stable id alone would show a stale sentence.
     id: ElementId,
     text: String,
-    color: Rgba,
+    color: gpui_kit::Hsla,
 }
 
 impl RenderOnce for SelectableText {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let mut identity = std::collections::hash_map::DefaultHasher::new();
         self.id.hash(&mut identity);
+        // Text is hashed into the element id so a reworded claim remounts, but the retained
+        // markdown key stays on `self.id` alone so a drag mid-frame isn't orphaned by a notify.
+        let key = {
+            let mut key_hasher = std::collections::hash_map::DefaultHasher::new();
+            self.id.hash(&mut key_hasher);
+            key_hasher.finish()
+        };
         self.text.hash(&mut identity);
-        TextView::markdown(
-            ("selectable-text", identity.finish()),
-            as_literal_markdown(&self.text),
-            window,
-            cx,
-        )
-        .selectable(true)
-        .text_color(self.color)
+        let style = TextViewStyle::default();
+        div()
+            .id(("selectable-text", identity.finish()))
+            .text_color(self.color)
+            .on_mouse_down(gpui_kit::MouseButton::Left, move |_, _, cx| {
+                selectable::begin_leaf_press(key, cx);
+            })
+            .on_mouse_move(move |_, _, cx| {
+                selectable::suppress_if_foreign_leaf(key, cx);
+            })
+            .child(selectable::retained_markdown(
+                key,
+                as_literal_markdown(&self.text),
+                style,
+                cx,
+            ))
     }
 }
 
 /// Presents record text as text rather than as markup.
 ///
-/// [`TextView`] parses its input as markdown. Summary claims and typed notes are prose that nobody
-/// wrote as markup, so a claim mentioning `*` or a note beginning `- ` must not silently restyle
-/// itself. CommonMark defines a backslash before any ASCII punctuation character as that literal
-/// character, and selection copies the rendered text, so the escape never reaches the clipboard.
+/// The markdown renderer parses its input as markdown. Summary claims and typed notes are prose
+/// that nobody wrote as markup, so a claim mentioning `*` or a note beginning `- ` must not
+/// silently restyle itself. CommonMark defines a backslash before any ASCII punctuation character
+/// as that literal character, and selection copies the rendered text, so the escape never reaches
+/// the clipboard.
 fn as_literal_markdown(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len().saturating_mul(2));
     for character in text.chars() {
@@ -988,7 +1017,7 @@ fn render_source_context(
     servers: Vec<ConfiguredServer>,
     selected: Option<SessionGrantView>,
     cx: &mut Context<MeetingWorkspace>,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let tokens = WorkspaceTokens::resolve(cx);
     let (policy, receipt) = match SourceContext::resolve(!servers.is_empty(), selected.as_ref()) {
         SourceContext::Quiet(line) => {
@@ -1610,14 +1639,10 @@ impl RenderOnce for SummaryBody {
         div()
             .debug_selector(|| "summary-area".into())
             .children(summary.caution.map(|caution| {
+                use gpui_kit::component::alert::Alert;
                 div()
                     .mb_3()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(tokens.warn_wash)
-                    .text_sm()
-                    .text_color(tokens.warn)
-                    .child(caution)
+                    .child(Alert::warning("summary-caution", caution).banner())
             }))
             .children(
                 summary
@@ -1667,7 +1692,7 @@ fn render_screen_receipt(
     disclosure: Entity<EvidenceDisclosure>,
     revealed: bool,
     tokens: WorkspaceTokens,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let count = consultations.len();
     div()
         .mt_2()
@@ -1680,7 +1705,7 @@ fn render_screen_receipt(
                     format!("Screen requests: {count} · Show receipt")
                 })
                 .ghost()
-                .small()
+                .with_size(Size::Small)
                 .on_click(move |_, _, cx| {
                     disclosure.update(cx, |state, cx| {
                         state.toggle_screen(summary);
@@ -1701,7 +1726,7 @@ fn render_screen_receipt(
 }
 
 /// The one control that reveals or hides every claim's evidence at once.
-fn render_evidence_control(context: &ClaimContext<'_>) -> gpui::AnyElement {
+fn render_evidence_control(context: &ClaimContext<'_>) -> gpui_kit::AnyElement {
     let shown = context.revealed.all;
     let summary = context.summary;
     let disclosure = context.disclosure.clone();
@@ -1738,7 +1763,7 @@ fn render_section(
     section: SummarySection,
     context: &ClaimContext<'_>,
     ordinal: &mut usize,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let tokens = context.tokens;
     let count = section.claims.len().to_string();
     let prose = section.shape == SectionShape::Prose;
@@ -1750,8 +1775,7 @@ fn render_section(
                     .child(
                         ControlRole::Ellipsizing,
                         div()
-                            .font_family(TypeScale::READING)
-                            .text_size(TypeScale::TITLE)
+                            .text_size(TypeScale::title(&tokens))
                             .text_color(tokens.ink)
                             .child(section.heading),
                     )
@@ -1776,7 +1800,7 @@ fn render_claim(
     ordinal: usize,
     prose: bool,
     context: &ClaimContext<'_>,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let tokens = context.tokens;
     let checked = claim.checked;
     let target = claim.target.clone();
@@ -1791,27 +1815,30 @@ fn render_claim(
     let header = if claim.action {
         if let Some(check_target) = target {
             let check_workspace = context.workspace.clone();
-            let button = Button::new(("notes-check", ordinal), tokens)
-                .label(if checked { "☑" } else { "☐" })
-                .ghost()
-                .small()
-                .on_click(move |_, _, cx| {
+            // Stock `Checkbox` is rebuilt each frame from the composed document; checked state
+            // is owned by the notes overlay, not by a long-lived entity.
+            let checkbox = Checkbox::new(("notes-check", ordinal))
+                .checked(checked)
+                .with_size(Size::Small)
+                .on_click(move |new_checked, _, cx| {
                     let operation = NotesOverlayOperation::SetChecked {
                         target: check_target.clone(),
-                        checked: !checked,
+                        checked: *new_checked,
                     };
                     let _ = check_workspace.update(cx, |this, cx| {
                         this.apply_notes_operation(operation, cx);
                     });
                 });
             #[cfg(test)]
-            let button = button.debug_selector(move || format!("notes-check-{ordinal}"));
+            let checkbox = div()
+                .debug_selector(move || format!("notes-check-{ordinal}"))
+                .child(checkbox);
 
             div()
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(button)
+                .child(checkbox)
                 .child(
                     div()
                         .min_w_0()
@@ -1873,7 +1900,7 @@ fn render_evidence(
     external: Vec<mcp::EvidenceId>,
     ordinal: usize,
     context: &ClaimContext<'_>,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     div()
         .mt_1()
         .min_w_0()
@@ -1888,17 +1915,15 @@ fn render_evidence(
 
 /// One evidence control: a focusable button that answers the pointer and the keyboard alike.
 ///
-/// `gpui-component`'s button registers a tab stop but binds no key activation, so a control that
-/// only answered a click would put the evidence out of a keyboard reader's reach. Hiding the chips
-/// is a decision about vertical space; it may not become a decision about who can see the evidence.
-/// The key listener sits on the wrapper because key events dispatch up from the focused button
-/// through its ancestors.
+/// gpui-kit's focusable announcement alone does not activate on Enter/Space, so a control that only
+/// answered a click would put the evidence out of a keyboard reader's reach. Hiding the chips is a
+/// decision about vertical space; it may not become a decision about who can see the evidence. The
+/// key listener sits on the wrapper because key events dispatch up from the focused button through
+/// its ancestors.
 ///
-/// **The key path is NOT covered by an automated test.** The mounted-render harness builds a window
-/// whose root view is [`MeetingWorkspace`] rather than `gpui_component::Root`, so a simulated
-/// keystroke panics inside `gpui-component`'s root lookup before reaching any listener, and mouse
-/// events in that harness never move focus onto a button. Both are properties of how the window is
-/// mounted, not of this control. The pointer path below is covered.
+/// **The key path is NOT covered by an automated test.** Mouse events in the mounted-render
+/// harness do not move focus onto a button, so Enter/Space activation of evidence chips is not
+/// exercised here. The pointer path below is covered.
 pub(super) fn evidence_control(
     id: ElementId,
     selector: String,
@@ -1906,7 +1931,7 @@ pub(super) fn evidence_control(
     tooltip: &'static str,
     tokens: WorkspaceTokens,
     activate: impl Fn(&mut App) + 'static,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let activate = std::rc::Rc::new(activate);
     let by_key = std::rc::Rc::clone(&activate);
     div()
@@ -1923,7 +1948,7 @@ pub(super) fn evidence_control(
                 .ghost()
                 .xsmall()
                 .tooltip(tooltip)
-                .debug_selector(move || selector)
+                .debug_selector(move || selector.into())
                 .on_click(move |_, _, cx| activate(cx)),
         )
         .into_any_element()
@@ -1942,7 +1967,7 @@ fn render_citations(
     external: Vec<mcp::EvidenceId>,
     ordinal: usize,
     context: &ClaimContext<'_>,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let tokens = context.tokens;
     let citation_times = context.citation_times;
     let bundle = &context.bundle;
@@ -1963,7 +1988,7 @@ fn render_citations(
                 .outline()
                 .xsmall()
                 .tooltip("Jump to the transcript row that supports this claim")
-                .debug_selector(move || format!("summary-citation-{ordinal}-{index}"))
+                .debug_selector(move || format!("summary-citation-{ordinal}-{index}").into())
                 .on_click(move |_, _, cx| {
                     let _ = workspace.update(cx, |this, cx| this.open_citation(event_id, cx));
                 })
@@ -2741,8 +2766,7 @@ mod tests {
         use std::{sync::Arc, time::Duration};
 
         use futures_util::stream;
-        use gpui::{AppContext as _, Entity, Modifiers, TestAppContext, px, size};
-        use gpui_component::input::InputEvent;
+        use gpui_kit::{AppContext as _, Entity, Modifiers, TestAppContext, px, size};
         use insight::{
             MeetingNotesGenerator, NotesBlockProvenance, NotesOverlayOperation, OverlayTarget,
             RecordingNotesSectionKind, append_notes_overlay_operation, load_latest_grounded_notes,
@@ -2763,7 +2787,7 @@ mod tests {
         use crate::{mcp, notes::NotesState, reasoning, session};
 
         /// The width the shipped window refuses to go below.
-        const MIN_WORKSPACE_WIDTH: gpui::Pixels = px(680.0);
+        const MIN_WORKSPACE_WIDTH: gpui_kit::Pixels = px(680.0);
 
         struct NoOpenAiCredentials;
 
@@ -2926,16 +2950,29 @@ mod tests {
             Ok(ids[1])
         }
 
-        /// Opens the workspace over the persisted summary at the narrowest supported width.
+        /// Opens the workspace over the persisted summary under kit `Root`.
+        ///
+        /// Selectable markdown copy is window-scoped via `TextSelectionLayer` on Root; mounting
+        /// `MeetingWorkspace` alone leaves drag-select and ⌘C empty (ADR-0025).
         fn open_summarized_workspace<'window>(
             cx: &'window mut TestAppContext,
             dir: &std::path::Path,
             database: std::path::PathBuf,
-        ) -> (
-            Entity<crate::workspace::MeetingWorkspace>,
-            &'window mut gpui::VisualTestContext,
-        ) {
-            cx.update(gpui_component::init);
+        ) -> Result<
+            (
+                Entity<crate::workspace::MeetingWorkspace>,
+                &'window mut gpui_kit::VisualTestContext,
+            ),
+            Box<dyn std::error::Error>,
+        > {
+            use std::ops::Deref as _;
+
+            use gpui_kit::{WindowBounds, WindowOptions, point};
+
+            cx.update(|cx| {
+                gpui_kit::init(cx);
+                cx.set_reduce_motion(true);
+            });
             let reasoning_path = dir.join("reasoning.json");
             let mcp_path = dir.join("mcp.json");
             let (ingress, timeline) = cx.update(|cx| crate::devwindow::attach_ingress(cx, 16));
@@ -2945,22 +2982,60 @@ mod tests {
             });
             let mcp_controller =
                 cx.new(|_| mcp::McpController::load(Some(mcp_path), Arc::new(NoMcpCredentials)));
-            cx.add_window_view(move |window, cx| {
-                crate::workspace::MeetingWorkspace::new(
-                    database,
-                    timeline,
-                    reasoning,
-                    session,
-                    mcp_controller,
-                    window,
-                    cx,
+            let handle = cx.update(|cx| {
+                cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(gpui_kit::Bounds {
+                            origin: point(px(0.0), px(0.0)),
+                            size: size(px(900.0), px(820.0)),
+                        })),
+                        ..WindowOptions::default()
+                    },
+                    move |window, cx| {
+                        let view = cx.new(|cx| {
+                            crate::workspace::MeetingWorkspace::new(
+                                database,
+                                timeline,
+                                reasoning,
+                                session,
+                                mcp_controller,
+                                window,
+                                cx,
+                            )
+                        });
+                        let keyboard_root =
+                            cx.new(|cx| crate::workspace::KeyboardRoot::new(view, window, cx));
+                        cx.new(|cx| gpui_kit::component::Root::new(keyboard_root, window, cx))
+                    },
                 )
-            })
+            })?;
+            let workspace = cx
+                .update(|cx| {
+                    handle.update(cx, |root, _, cx| {
+                        root.view()
+                            .clone()
+                            .downcast::<crate::workspace::KeyboardRoot>()
+                            .ok()
+                            .and_then(|keyboard| {
+                                keyboard
+                                    .read(cx)
+                                    .view()
+                                    .clone()
+                                    .downcast::<crate::workspace::MeetingWorkspace>()
+                                    .ok()
+                            })
+                    })
+                })?
+                .ok_or_else(|| std::io::Error::other("Root → KeyboardRoot → MeetingWorkspace"))?;
+            let visual = gpui_kit::VisualTestContext::from_window(*handle.deref(), cx).into_mut();
+            visual.update(|window, _| window.activate_window());
+            visual.run_until_parked();
+            Ok((workspace, visual))
         }
 
         /// Asserts every named control renders wholly inside the notes column.
         fn assert_in_column(
-            visual: &mut gpui::VisualTestContext,
+            visual: &mut gpui_kit::VisualTestContext,
             selectors: &[&'static str],
         ) -> Result<(), Box<dyn std::error::Error>> {
             for selector in selectors {
@@ -2983,7 +3058,7 @@ mod tests {
         }
 
         fn click_control(
-            visual: &mut gpui::VisualTestContext,
+            visual: &mut gpui_kit::VisualTestContext,
             selector: &'static str,
         ) -> Result<(), Box<dyn std::error::Error>> {
             let bounds = visual.debug_bounds(selector).ok_or_else(|| {
@@ -2997,7 +3072,7 @@ mod tests {
         }
 
         fn replace_document_text(
-            visual: &mut gpui::VisualTestContext,
+            visual: &mut gpui_kit::VisualTestContext,
             workspace: &Entity<crate::workspace::MeetingWorkspace>,
             value: &str,
         ) {
@@ -3011,7 +3086,7 @@ mod tests {
         }
 
         fn replace_composer_text(
-            visual: &mut gpui::VisualTestContext,
+            visual: &mut gpui_kit::VisualTestContext,
             workspace: &Entity<crate::workspace::MeetingWorkspace>,
             value: &str,
         ) {
@@ -3025,22 +3100,28 @@ mod tests {
         }
 
         fn copy_claim(
-            visual: &mut gpui::VisualTestContext,
+            visual: &mut gpui_kit::VisualTestContext,
             selector: &'static str,
         ) -> Result<String, Box<dyn std::error::Error>> {
             visual.executor().advance_clock(Duration::from_millis(500));
             visual.run_until_parked();
-            visual.refresh()?;
-            visual.run_until_parked();
+            crate::workspace::test_support::settle_root_overlays(visual);
             let claim = visual.debug_bounds(selector).ok_or_else(|| {
                 std::io::Error::other(format!("{selector} must render before it can be copied"))
             })?;
-            let start = gpui::point(claim.left() + px(2.0), claim.top() + px(4.0));
-            let end = gpui::point(claim.right() - px(2.0), claim.bottom() - px(4.0));
-            visual.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
-            visual.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
-            visual.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+            let start = gpui_kit::point(claim.left() + px(2.0), claim.top() + px(4.0));
+            let end = gpui_kit::point(claim.right() - px(2.0), claim.bottom() - px(4.0));
+            visual.update(|_, cx| {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(String::new()))
+            });
+            visual.simulate_mouse_down(start, gpui_kit::MouseButton::Left, Modifiers::none());
+            visual.simulate_mouse_move(end, Some(gpui_kit::MouseButton::Left), Modifiers::none());
+            visual.simulate_mouse_up(end, gpui_kit::MouseButton::Left, Modifiers::none());
             visual.run_until_parked();
+            // Selection registers on paint; kit text tests draw once after the drag.
+            visual.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
             visual.simulate_keystrokes("cmd-c");
             visual.run_until_parked();
             Ok(visual
@@ -3057,7 +3138,7 @@ mod tests {
             let cited = recording_with_summary(&database).await?;
 
             let mut cx = TestAppContext::single();
-            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
+            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database)?;
             visual.simulate_resize(size(MIN_WORKSPACE_WIDTH, px(720.0)));
             // A stopped session must be open for the review stage to mount the notes column.
             visual.update(|_, cx| {
@@ -3163,7 +3244,7 @@ mod tests {
 
             let mut cx = TestAppContext::single();
             let (workspace, visual) =
-                open_summarized_workspace(&mut cx, dir.path(), database.clone());
+                open_summarized_workspace(&mut cx, dir.path(), database.clone())?;
             visual.simulate_resize(size(px(900.0), px(820.0)));
             visual.update(|_, cx| {
                 workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
@@ -3336,7 +3417,7 @@ mod tests {
 
             let mut cx = TestAppContext::single();
             let (workspace, visual) =
-                open_summarized_workspace(&mut cx, dir.path(), database.clone());
+                open_summarized_workspace(&mut cx, dir.path(), database.clone())?;
             visual.simulate_resize(size(px(900.0), px(820.0)));
             visual.update(|_, cx| {
                 workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
@@ -3345,14 +3426,15 @@ mod tests {
             visual.run_until_parked();
 
             replace_composer_text(visual, &workspace, "Chase the staging outage postmortem.");
-            // The composer's own key handling belongs to `gpui-component` and is unchanged; what
-            // this pins is the subscription that decides what plain Return means here. Focusing the
-            // input instead would not reach it: a focused `TextElement` paints through
-            // `Root::read`, and this window's first layer is the workspace rather than a `Root`.
+            // The composer's own key handling belongs to gpui-kit's Input and is unchanged; what
+            // this pins is the subscription that decides what plain Return means here.
             visual.update(|_, cx| {
                 let input = workspace.read(cx).annotation_input.clone();
                 input.update(cx, |_, cx| {
-                    cx.emit(InputEvent::PressEnter { secondary: false });
+                    cx.emit(gpui_kit::component::input::InputEvent::PressEnter {
+                        secondary: false,
+                        shift: false,
+                    });
                 });
             });
             visual.run_until_parked();
@@ -3385,7 +3467,7 @@ mod tests {
             let _ = recording_with_summary(&database).await?;
 
             let mut cx = TestAppContext::single();
-            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
+            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database)?;
             visual.simulate_resize(size(px(900.0), px(820.0)));
             visual.update(|_, cx| {
                 workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
@@ -3469,7 +3551,7 @@ mod tests {
 
             let mut cx = TestAppContext::single();
             let (workspace, visual) =
-                open_summarized_workspace(&mut cx, dir.path(), database.clone());
+                open_summarized_workspace(&mut cx, dir.path(), database.clone())?;
             visual.simulate_resize(size(px(900.0), px(820.0)));
             visual.update(|_, cx| {
                 workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
@@ -3552,7 +3634,7 @@ mod tests {
             drop(store);
 
             let mut cx = TestAppContext::single();
-            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
+            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database)?;
             visual.simulate_resize(size(px(900.0), px(820.0)));
             visual.update(|_, cx| {
                 workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
@@ -3602,7 +3684,7 @@ mod tests {
             )?;
 
             let mut cx = TestAppContext::single();
-            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
+            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database)?;
             visual.simulate_resize(size(MIN_WORKSPACE_WIDTH, px(720.0)));
             visual.update(|_, cx| {
                 workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
@@ -3632,28 +3714,32 @@ mod tests {
             let _ = recording_with_summary(&database).await?;
 
             let mut cx = TestAppContext::single();
-            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database);
+            let (workspace, visual) = open_summarized_workspace(&mut cx, dir.path(), database)?;
             visual.simulate_resize(size(px(900.0), px(720.0)));
             visual.update(|_, cx| {
                 workspace.update(cx, |this, cx| this.select_meeting(SessionId::new(41), cx));
             });
             visual.refresh()?;
             visual.run_until_parked();
-            // The markdown parse is debounced off the render thread; let it land.
             visual.executor().advance_clock(Duration::from_millis(500));
             visual.run_until_parked();
-            visual.refresh()?;
-            visual.run_until_parked();
+            crate::workspace::test_support::settle_root_overlays(visual);
 
             let claim = visual
                 .debug_bounds("summary-claim-0")
                 .ok_or_else(|| std::io::Error::other("the first claim must render"))?;
-            let start = gpui::point(claim.left() + px(2.0), claim.top() + px(4.0));
-            let end = gpui::point(claim.right() - px(2.0), claim.bottom() - px(4.0));
-            visual.simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::none());
-            visual.simulate_mouse_move(end, gpui::MouseButton::Left, Modifiers::none());
-            visual.simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::none());
+            let start = gpui_kit::point(claim.left() + px(2.0), claim.top() + px(4.0));
+            let end = gpui_kit::point(claim.right() - px(2.0), claim.bottom() - px(4.0));
+            visual.update(|_, cx| {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(String::new()))
+            });
+            visual.simulate_mouse_down(start, gpui_kit::MouseButton::Left, Modifiers::none());
+            visual.simulate_mouse_move(end, Some(gpui_kit::MouseButton::Left), Modifiers::none());
+            visual.simulate_mouse_up(end, gpui_kit::MouseButton::Left, Modifiers::none());
             visual.run_until_parked();
+            visual.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
             visual.simulate_keystrokes("cmd-c");
             visual.run_until_parked();
 

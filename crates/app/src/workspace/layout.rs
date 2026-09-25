@@ -26,13 +26,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gpui::{
+use gpui_kit::component::input::InputState;
+use gpui_kit::{
     AnyElement, Context, Entity, IntoElement, Pixels, Render, Window, div, prelude::*, px, relative,
-};
-use gpui_component::{
-    Disableable, IconName, Root, Selectable as _, Sizable as _, Size,
-    button::ButtonVariants as _,
-    input::{Input, InputState},
 };
 use rag::SessionSummary;
 use sotto_core::{Entry, TargetKind};
@@ -43,7 +39,11 @@ use crate::session::SessionLifecycle;
 use super::{
     Button, MeetingWorkspace, OpenRecording, PersistedWorkspaceState, StageTab,
     control_row::{ControlRole, ControlRow},
-    delete_icon_button, library, motion, notes,
+    delete_icon_button,
+    focus::Size,
+    icons::IconName,
+    input::Input,
+    library, motion, notes,
     tokens::{Space, TypeScale, WorkspaceTokens},
     transcript,
 };
@@ -245,7 +245,7 @@ impl Render for MeetingWorkspace {
             .flex_col()
             .bg(tokens.ground)
             .text_color(tokens.ink)
-            .text_size(TypeScale::BODY)
+            .text_size(TypeScale::body(&tokens))
             // The window titlebar is transparent so this ground colour reaches the top of the
             // window and the appearance choice covers the whole frame. The traffic lights are drawn
             // by macOS over the left of that area, so the toolbar starts to the right of them and
@@ -266,7 +266,7 @@ impl Render for MeetingWorkspace {
                         .py(Space::SM)
                         .bg(tokens.warn_wash)
                         .text_color(tokens.warn)
-                        .text_size(TypeScale::CONTROL)
+                        .text_size(TypeScale::control(&tokens))
                         .debug_selector(|| "workspace-message".into())
                         .child(message),
                 )
@@ -379,13 +379,8 @@ impl Render for MeetingWorkspace {
                         .child(sheet),
                 )
             })
-            // Confirm dialogs, painted last so they sit over the shell *and* over the settings
-            // sheet that raised them. `gpui_component::Root` stores the open dialogs but renders
-            // nothing itself, so the view it wraps is the only place this layer can come from —
-            // and there is exactly one such view, which is why it belongs here rather than in the
-            // sheet. Off a `Root` — the layout tests that mount the shell bare — it yields nothing
-            // rather than panicking.
-            .children(Root::render_dialog_layer(window, cx))
+        // Confirm dialogs mount under kit `Root` via `window.open_dialog` (ADR-0025), not as
+        // siblings of this shell tree.
     }
 }
 
@@ -547,8 +542,8 @@ fn render_stage(
             .child(
                 div()
                     .h_full()
-                    .flex_grow()
-                    .flex_shrink()
+                    .flex_grow(1.0)
+                    .flex_shrink(1.0)
                     .flex_basis(relative(TRANSCRIPT_STAGE_SHARE))
                     .min_w_0()
                     .bg(tokens.surface)
@@ -558,8 +553,8 @@ fn render_stage(
             .child(
                 div()
                     .h_full()
-                    .flex_grow()
-                    .flex_shrink()
+                    .flex_grow(1.0)
+                    .flex_shrink(1.0)
                     .flex_basis(relative(1.0 - TRANSCRIPT_STAGE_SHARE))
                     .min_w_0()
                     .bg(tokens.surface)
@@ -586,7 +581,7 @@ fn render_stage(
 
 /// One tab of the review stage. The inactive layer keeps its full width, parked off the clipped
 /// edge of the stage, so its measured content and scroll offset survive the switch.
-fn stage_layer(active: bool) -> gpui::Div {
+fn stage_layer(active: bool) -> gpui_kit::Div {
     let layer = div()
         .absolute()
         .top_0()
@@ -644,16 +639,17 @@ fn render_capture_bar(
         .child(
             ControlRole::Essential,
             div()
-                .text_size(TypeScale::CHIP)
-                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_size(TypeScale::chip(&tokens))
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                 .text_color(tokens.live_ink)
                 .child(kind),
         )
         .child(
             ControlRole::Ellipsizing,
             div()
-                .text_size(TypeScale::BODY)
-                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_size(TypeScale::body(&tokens))
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .text_color(tokens.ink_on_wash)
                 .debug_selector(|| "capture-target-name".into())
                 .child(capture_target_name(target)),
         )
@@ -661,8 +657,8 @@ fn render_capture_bar(
             ControlRole::Expendable,
             div()
                 .min_w_0()
-                .text_size(TypeScale::BODY)
-                .text_color(tokens.muted)
+                .text_size(TypeScale::body(&tokens))
+                .text_color(tokens.muted_on_wash)
                 .whitespace_nowrap()
                 .debug_selector(|| "capture-scope-chips".into())
                 .child(scope_sentence(target)),
@@ -671,8 +667,9 @@ fn render_capture_bar(
             ControlRole::Essential,
             div()
                 .debug_selector(|| "capture-clock".into())
-                .font_family("Menlo")
-                .text_size(TypeScale::CLOCK)
+                .font_family(TypeScale::mono(cx))
+                .text_size(TypeScale::clock(&tokens))
+                .text_color(tokens.ink_on_wash)
                 .child(format_clock(elapsed)),
         )
         // No Pause control, decided (not deferred) by T079. Compressing the timeline to keep
@@ -728,7 +725,7 @@ fn render_prepared_entry(
         .child(
             div()
                 .text_size(px(19.0))
-                .font_weight(gpui::FontWeight::BOLD)
+                .font_weight(gpui_kit::FontWeight::BOLD)
                 .child("Prepared — no recording yet"),
         )
         .child(
@@ -746,7 +743,7 @@ fn render_prepared_entry(
                 .p(Space::MD)
                 .rounded(px(8.0))
                 .bg(tokens.sunken)
-                .text_size(TypeScale::BODY)
+                .text_size(TypeScale::body(&tokens))
                 .debug_selector(|| "prepared-note-block".into())
                 .child(note.clone())
         }))
@@ -813,35 +810,23 @@ fn render_entry_view_bar(
         .child(
             ControlRole::Ellipsizing,
             div()
-                .text_size(TypeScale::TITLE)
-                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_size(TypeScale::title(&tokens))
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                 .debug_selector(|| "view-title".into())
                 .child(library::entry_name(entry, meetings)),
         )
         .child(
             ControlRole::Essential,
             div()
-                .font_family("Menlo")
-                .text_size(TypeScale::META)
+                .font_family(TypeScale::mono(cx))
+                .text_size(TypeScale::meta(&tokens))
                 .text_color(tokens.faint)
                 .debug_selector(|| "view-meta".into())
                 .child(meta),
         )
         .spacer()
         .child_when(session.is_some(), ControlRole::Essential, || {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(2.0))
-                .p(px(2.0))
-                .rounded_md()
-                .bg(tokens.sunken)
-                .border_1()
-                .border_color(tokens.line_soft)
-                .debug_selector(|| "view-tabs".into())
-                .child(stage_tab_button(StageTab::Notes, tab, tokens, cx))
-                .child(stage_tab_button(StageTab::Transcript, tab, tokens, cx))
-                .into_any_element()
+            stage_tabs(tab, tokens, cx)
         })
         .child_when(live_elsewhere, ControlRole::Expendable, || {
             Button::new("back-to-live", tokens)
@@ -915,6 +900,15 @@ fn render_sessions_strip(
     tokens: WorkspaceTokens,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
+    use gpui_kit::component::Sizable as _;
+    use gpui_kit::component::tab::{Tab, TabBar};
+
+    let selected_index = sessions
+        .iter()
+        .position(|session| Some(session.id) == selected)
+        .unwrap_or(0);
+    let session_ids: Vec<_> = sessions.iter().map(|session| session.id).collect();
+
     div()
         .flex_none()
         .flex()
@@ -926,19 +920,24 @@ fn render_sessions_strip(
         .border_b_1()
         .border_color(tokens.line)
         .debug_selector(|| "entry-sessions-strip".into())
-        .children(sessions.iter().enumerate().map(|(index, session)| {
-            let id = session.id;
-            Button::new(("entry-recording-tab", index), tokens)
-                .label(format!(
-                    "Recording {} · {}",
-                    index + 1,
-                    view_meta(session, None)
-                ))
-                .ghost()
-                .selected(selected == Some(id))
+        .child(
+            TabBar::new("entry-recording-tabs")
+                .segmented()
                 .with_size(Size::Small)
-                .on_click(cx.listener(move |this, _, _, cx| this.select_meeting(id, cx)))
-        }))
+                .selected_index(selected_index)
+                .children(sessions.iter().enumerate().map(|(index, session)| {
+                    Tab::new().label(format!(
+                        "Recording {} · {}",
+                        index + 1,
+                        view_meta(session, None)
+                    ))
+                }))
+                .on_click(cx.listener(move |this, index: &usize, _, cx| {
+                    if let Some(id) = session_ids.get(*index).copied() {
+                        this.select_meeting(id, cx);
+                    }
+                })),
+        )
         .child(
             div()
                 .debug_selector(|| "entry-delete-recording-control".into())
@@ -980,16 +979,16 @@ fn render_view_bar(
         .child(
             ControlRole::Ellipsizing,
             div()
-                .text_size(TypeScale::TITLE)
-                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_size(TypeScale::title(&tokens))
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                 .debug_selector(|| "view-title".into())
                 .child(library::recording_name(session)),
         )
         .child(
             ControlRole::Essential,
             div()
-                .font_family("Menlo")
-                .text_size(TypeScale::META)
+                .font_family(TypeScale::mono(cx))
+                .text_size(TypeScale::meta(&tokens))
                 .text_color(tokens.faint)
                 .debug_selector(|| "view-meta".into())
                 .child(view_meta(session, recording)),
@@ -997,7 +996,7 @@ fn render_view_bar(
         .child(
             ControlRole::Expendable,
             div()
-                .text_size(TypeScale::META)
+                .text_size(TypeScale::meta(&tokens))
                 .text_color(tokens.faint)
                 .child(format!(
                     "started {}",
@@ -1005,21 +1004,7 @@ fn render_view_bar(
                 )),
         )
         .spacer()
-        .child(
-            ControlRole::Essential,
-            div()
-                .flex()
-                .items_center()
-                .gap(px(2.0))
-                .p(px(2.0))
-                .rounded_md()
-                .bg(tokens.sunken)
-                .border_1()
-                .border_color(tokens.line_soft)
-                .debug_selector(|| "view-tabs".into())
-                .child(stage_tab_button(StageTab::Notes, tab, tokens, cx))
-                .child(stage_tab_button(StageTab::Transcript, tab, tokens, cx)),
-        )
+        .child(ControlRole::Essential, stage_tabs(tab, tokens, cx))
         .spacer()
         .child_when(live_elsewhere, ControlRole::Expendable, || {
             div()
@@ -1094,27 +1079,47 @@ const fn retranscription_label(running: bool, model_unavailable: bool) -> &'stat
     }
 }
 
-fn stage_tab_button(
-    tab: StageTab,
+/// Notes / Transcript switch for a stopped recording.
+///
+/// Stock [`TabBar::segmented`] matches the sunken control the recording strip already uses.
+/// Each [`Tab`] carries the product `stage-tab-*` debug selector so interaction tests keep working.
+fn stage_tabs(
     selected: StageTab,
-    tokens: WorkspaceTokens,
+    _tokens: WorkspaceTokens,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
-    let active = tab == selected;
+    use gpui_kit::component::Sizable as _;
+    use gpui_kit::component::tab::{Tab, TabBar};
+
+    let selected_index = match selected {
+        StageTab::Notes => 0,
+        StageTab::Transcript => 1,
+    };
     div()
-        .id(tab.element_id())
-        .px(Space::MD)
-        .py(px(3.0))
-        .rounded_md()
-        .text_size(TypeScale::CONTROL)
-        .cursor_pointer()
-        .when(active, |view| {
-            view.bg(tokens.surface).text_color(tokens.ink)
-        })
-        .when(!active, |view| view.text_color(tokens.muted))
-        .debug_selector(move || tab.debug_selector().into())
-        .child(tab.label())
-        .on_click(cx.listener(move |this, _, _, cx| this.select_stage_tab(tab, cx)))
+        .debug_selector(|| "view-tabs".into())
+        .child(
+            TabBar::new("stage-tabs")
+                .segmented()
+                .with_size(Size::Small)
+                .selected_index(selected_index)
+                .child(
+                    Tab::new()
+                        .label(StageTab::Notes.label())
+                        .debug_selector(|| StageTab::Notes.debug_selector().into()),
+                )
+                .child(
+                    Tab::new()
+                        .label(StageTab::Transcript.label())
+                        .debug_selector(|| StageTab::Transcript.debug_selector().into()),
+                )
+                .on_click(cx.listener(move |this, index: &usize, _, cx| {
+                    let tab = match *index {
+                        1 => StageTab::Transcript,
+                        _ => StageTab::Notes,
+                    };
+                    this.select_stage_tab(tab, cx);
+                })),
+        )
         .into_any_element()
 }
 
@@ -1232,16 +1237,16 @@ pub(super) fn save_workspace_state(
 
 #[cfg(test)]
 mod tests {
+    use gpui_kit::component::ThemeMode;
     use std::sync::Arc;
     use std::time::Duration;
 
     use std::ops::Deref as _;
 
-    use gpui::{
+    use gpui_kit::{
         AppContext as _, Bounds, Modifiers, TestAppContext, VisualTestContext, WindowBounds,
         WindowOptions, point, px, size,
     };
-    use gpui_component::{ActiveTheme as _, Root, Theme, ThemeMode, WindowExt as _};
     use rag::{SessionSummary, Store};
     use secrecy::SecretString;
     use sotto_core::{
@@ -1263,7 +1268,7 @@ mod tests {
     use crate::{mcp, reasoning, session};
 
     /// Wide enough that every expendable control in both bars survives.
-    const WIDE_WORKSPACE_WIDTH: gpui::Pixels = px(1400.0);
+    const WIDE_WORKSPACE_WIDTH: gpui_kit::Pixels = px(1400.0);
 
     struct NoOpenAiCredentials;
 
@@ -1346,25 +1351,28 @@ mod tests {
     }
 
     struct MountedShell {
-        workspace: gpui::Entity<MeetingWorkspace>,
-        session: gpui::Entity<session::SessionController>,
+        workspace: gpui_kit::Entity<MeetingWorkspace>,
+        session: gpui_kit::Entity<session::SessionController>,
         visual: &'static mut VisualTestContext,
     }
 
-    /// The shell mounted the way `main.rs` mounts it: under `gpui_component::Root`, with the
-    /// menu-bar actions registered and the window activated.
+    /// The shell mounted the way `main.rs` mounts it: under [`crate::workspace::KeyboardRoot`],
+    /// with the menu-bar actions registered and the window activated.
     ///
     /// [`mount`] deliberately does not do this — it puts `MeetingWorkspace` at the window root so
     /// its layout assertions are about the shell alone. That difference is not cosmetic: the menu
-    /// path only exists when the root view is a `Root` that has to be downcast, and
+    /// path only exists when the root view is a `KeyboardRoot` that has to be downcast, and
     /// `App::dispatch_action` only routes through a window when one is *active*. A test that
     /// skipped either would pass against the defect T082 fixed.
     fn mount_as_the_product_does(
         cx: &mut TestAppContext,
         directory: &std::path::Path,
         lifecycle: Option<session::SessionLifecycle>,
-        width: gpui::Pixels,
+        width: gpui_kit::Pixels,
     ) -> Result<MountedApp, Box<dyn std::error::Error>> {
+        // Kit dialogs animate; without reduced motion their footers are not painted for
+        // `debug_bounds` until the entrance finishes (gpui-component's own dialog tests do this).
+        cx.update(|cx| cx.set_reduce_motion(true));
         let database = directory.join("sotto.sqlite3");
         let reasoning_path = directory.join("reasoning.json");
         let mcp_path = directory.join("mcp.json");
@@ -1396,17 +1404,32 @@ mod tests {
                             database, timeline, reasoning, session, mcp, window, cx,
                         )
                     });
-                    cx.new(|cx| Root::new(view, window, cx))
+                    let keyboard_root =
+                        cx.new(|cx| crate::workspace::KeyboardRoot::new(view, window, cx));
+                    cx.new(|cx| gpui_kit::component::Root::new(keyboard_root, window, cx))
                 },
             )
         })?;
         let workspace = cx
             .update(|cx| {
-                handle.update(cx, |root, _, _| {
-                    root.view().clone().downcast::<MeetingWorkspace>()
+                handle.update(cx, |root, _, cx| {
+                    root.view()
+                        .clone()
+                        .downcast::<crate::workspace::KeyboardRoot>()
+                        .ok()
+                        .and_then(|keyboard| {
+                            keyboard
+                                .read(cx)
+                                .view()
+                                .clone()
+                                .downcast::<MeetingWorkspace>()
+                                .ok()
+                        })
                 })
             })?
-            .map_err(|_| std::io::Error::other("the window root must wrap a MeetingWorkspace"))?;
+            .ok_or_else(|| {
+                std::io::Error::other("the window root must wrap KeyboardRoot → MeetingWorkspace")
+            })?;
         cx.update(|cx| crate::workspace::register_menu_actions(handle, cx));
         let visual = VisualTestContext::from_window(*handle.deref(), cx).into_mut();
         // The real platform activates the window it opens; the test platform does not. Without
@@ -1422,7 +1445,7 @@ mod tests {
     }
 
     struct MountedApp {
-        workspace: gpui::Entity<MeetingWorkspace>,
+        workspace: gpui_kit::Entity<MeetingWorkspace>,
         visual: &'static mut VisualTestContext,
     }
 
@@ -1436,7 +1459,7 @@ mod tests {
         cx: &mut TestAppContext,
         directory: &std::path::Path,
         lifecycle: Option<session::SessionLifecycle>,
-        width: gpui::Pixels,
+        width: gpui_kit::Pixels,
     ) -> Result<MountedShell, Box<dyn std::error::Error>> {
         let database = directory.join("sotto.sqlite3");
         let reasoning_path = directory.join("reasoning.json");
@@ -1705,7 +1728,7 @@ mod tests {
     #[test]
     fn the_shell_mounts_and_renders_in_both_themes() -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let shell = mount(
             &mut cx,
@@ -1715,7 +1738,7 @@ mod tests {
         )?;
         let visual = shell.visual;
         for mode in [ThemeMode::Dark, ThemeMode::Light] {
-            visual.update(|window, cx| Theme::change(mode, Some(window), cx));
+            visual.update(|_, cx| crate::workspace::tokens::apply_theme(mode, None, cx));
             visual.refresh()?;
             visual.run_until_parked();
             assert!(
@@ -1734,7 +1757,7 @@ mod tests {
     fn an_empty_library_opens_on_the_three_ways_a_session_begins()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = shell.workspace;
@@ -1804,7 +1827,7 @@ mod tests {
     fn checking_a_cached_model_does_not_flash_the_choice_panel()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = shell.workspace;
@@ -1835,7 +1858,7 @@ mod tests {
     async fn launch_opens_home_not_the_newest_recording() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         persist_stopped_session(&dir.path().join("sotto.sqlite3"), 4).await?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
@@ -1868,7 +1891,7 @@ mod tests {
     async fn a_prepared_entry_renders_notes_and_record_control_at_minimum_width()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("sotto.sqlite3");
         let store = Store::open(&database).await?;
@@ -1921,7 +1944,7 @@ mod tests {
     async fn a_two_recording_entry_keeps_one_entry_and_two_distinct_transcript_tabs()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("sotto.sqlite3");
         let entry_id = EntryId::new(701);
@@ -1973,7 +1996,7 @@ mod tests {
     async fn mounted_record_again_control_targets_the_open_entry_before_picker_completion()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("sotto.sqlite3");
         let entry_id = EntryId::new(721);
@@ -2015,7 +2038,7 @@ mod tests {
     async fn mounted_this_entry_ask_scope_contains_every_attached_recording()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("sotto.sqlite3");
         let entry_id = EntryId::new(731);
@@ -2051,7 +2074,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn home_is_reachable_from_an_open_recording() -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 6).await?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
@@ -2100,7 +2123,7 @@ mod tests {
     async fn home_during_a_recording_keeps_stop_and_says_the_capture_is_running()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 3).await?;
         let shell = mount(
@@ -2180,7 +2203,7 @@ mod tests {
     async fn the_home_entry_fits_the_rail_and_reports_only_what_is_measured()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         persist_stopped_session(&dir.path().join("sotto.sqlite3"), 3).await?;
         let visual = mount(&mut cx, dir.path(), None, MIN_WORKSPACE_WIDTH)?.visual;
@@ -2237,7 +2260,7 @@ mod tests {
     #[test]
     fn a_wide_capture_bar_shows_every_control_it_can() -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let shell = mount(
             &mut cx,
@@ -2268,7 +2291,7 @@ mod tests {
     fn a_narrow_capture_bar_keeps_the_clock_and_a_clickable_stop()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let shell = mount(
             &mut cx,
@@ -2345,7 +2368,7 @@ mod tests {
     async fn a_narrow_view_bar_keeps_the_tabs_and_delete() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 7).await?;
         let shell = mount(&mut cx, dir.path(), None, MIN_WORKSPACE_WIDTH)?;
@@ -2430,12 +2453,12 @@ mod tests {
     /// then claimed "the menu item's path must open the same overlay the gear does" — which is
     /// exactly the assertion the shipped menu item failed. Here the action is dispatched through
     /// `App::dispatch_action`, which is verbatim what GPUI's macOS menu callback does, against a
-    /// window rooted in `gpui_component::Root` and activated, as the product's is.
+    /// window rooted in [`crate::workspace::KeyboardRoot`] and activated, as the product's is.
     #[test]
     fn the_settings_menu_action_opens_the_overlay_over_this_window()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let app = mount_as_the_product_does(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = app.workspace;
@@ -2526,7 +2549,7 @@ mod tests {
     fn settings_is_reachable_from_the_menu_while_a_recording_runs()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let app = mount_as_the_product_does(
             &mut cx,
@@ -2566,13 +2589,15 @@ mod tests {
     fn appearance_is_chosen_from_the_menu_bar_and_recorded()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
         let app = mount_as_the_product_does(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = app.workspace;
         let visual = app.visual;
-        visual.update(|window, cx| Theme::change(ThemeMode::Light, Some(window), cx));
+        visual.update(|_window, cx| {
+            crate::workspace::tokens::apply_theme(ThemeMode::Light, None, cx)
+        });
         visual.run_until_parked();
         assert_eq!(
             visual.update(|_, cx| workspace.read(cx).appearance()),
@@ -2584,7 +2609,10 @@ mod tests {
         visual.refresh()?;
         visual.run_until_parked();
         assert!(
-            visual.update(|_, cx| cx.theme().is_dark()),
+            visual.update(|_, cx| {
+                use gpui_kit::component::{ActiveTheme as _, ThemeMode};
+                cx.theme().mode == ThemeMode::Dark
+            }),
             "`View ▸ Appearance ▸ Dark` must actually switch the theme, or it is a dead item"
         );
         assert_eq!(
@@ -2597,7 +2625,10 @@ mod tests {
         visual.refresh()?;
         visual.run_until_parked();
         assert!(
-            visual.update(|_, cx| !cx.theme().is_dark()),
+            visual.update(|_, cx| {
+                use gpui_kit::component::{ActiveTheme as _, ThemeMode};
+                cx.theme().mode != ThemeMode::Dark
+            }),
             "the appearance menu must switch back, not only one way"
         );
         assert_eq!(
@@ -2629,7 +2660,7 @@ mod tests {
     #[test]
     fn the_settings_shortcut_parses_and_opens_settings() -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let app = mount_as_the_product_does(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = app.workspace;
@@ -2648,7 +2679,7 @@ mod tests {
         Ok(())
     }
 
-    /// GPUI 0.2.2 cannot check a menu item, so the mark lives in the item's text. If that mark
+    /// gpui-pre cannot check a menu item, so the mark lives in the item's text. If that mark
     /// drifts, the menu silently stops saying which appearance is in force.
     #[test]
     fn the_appearance_menu_marks_exactly_the_choice_in_force() {
@@ -2662,14 +2693,14 @@ mod tests {
                 .iter()
                 .flat_map(|menu| &menu.items)
                 .filter_map(|item| match item {
-                    gpui::MenuItem::Submenu(submenu) if submenu.name == "Appearance" => {
+                    gpui_kit::MenuItem::Submenu(submenu) if submenu.name == "Appearance" => {
                         Some(&submenu.items)
                     }
                     _ => None,
                 })
                 .flatten()
                 .filter_map(|item| match item {
-                    gpui::MenuItem::Action { name, .. } => Some(name.to_string()),
+                    gpui_kit::MenuItem::Action { name, .. } => Some(name.to_string()),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -2703,7 +2734,7 @@ mod tests {
             app_menu.first().is_some_and(|menu| menu.name == "Sotto"
                 && menu.items.iter().any(|item| matches!(
                     item,
-                    gpui::MenuItem::Action { name, .. } if name.starts_with("Settings")
+                    gpui_kit::MenuItem::Action { name, .. } if name.starts_with("Settings")
                 ))),
             "`Sotto ▸ Settings…` is the entry point the window no longer carries"
         );
@@ -2721,7 +2752,7 @@ mod tests {
     async fn a_finished_recording_stops_rendering_as_live_without_a_refresh()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let session_id = persist_stopped_session(&dir.path().join("sotto.sqlite3"), 3).await?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
@@ -2761,13 +2792,14 @@ mod tests {
 
     /// Opens a stopped recording with measured retained media, ready for the trash control.
     ///
-    /// The shell is mounted the way `main.rs` mounts it — under `gpui_component::Root` — because
-    /// that is the whole precondition for a dialog: `Window::open_dialog` stores the open dialogs
-    /// on the `Root`, and the layer that draws them reads them back from there.
+    /// The shell is mounted the way `main.rs` mounts it — under [`crate::workspace::KeyboardRoot`]
+    /// and kit [`gpui_kit::component::Root`] — because confirm dialogs open via
+    /// `window.open_dialog` on that Root layer (ADR-0025).
     async fn mount_with_a_recording_open(
         cx: &mut TestAppContext,
         directory: &std::path::Path,
     ) -> Result<(SessionId, MountedApp), Box<dyn std::error::Error>> {
+        cx.update(|cx| cx.set_reduce_motion(true));
         let database = directory.join("sotto.sqlite3");
         let session_id = persist_stopped_session(&database, 4).await?;
         persist_stopped_session_titled(&database, BYSTANDER_SESSION, "A bystander recording", 2)
@@ -2824,13 +2856,14 @@ mod tests {
     fn open_delete_dialog(
         visual: &mut VisualTestContext,
         selector: &'static str,
-    ) -> Result<(Bounds<gpui::Pixels>, Bounds<gpui::Pixels>), Box<dyn std::error::Error>> {
+    ) -> Result<(Bounds<gpui_kit::Pixels>, Bounds<gpui_kit::Pixels>), Box<dyn std::error::Error>>
+    {
         let delete = visual
             .debug_bounds(selector)
             .ok_or_else(|| std::io::Error::other(format!("{selector} must render")))?;
         visual.simulate_click(delete.center(), Modifiers::none());
-        visual.refresh()?;
         visual.run_until_parked();
+        crate::workspace::test_support::settle_root_overlays(visual);
         let cancel = visual
             .debug_bounds(CONFIRM_CANCEL_SELECTOR)
             .ok_or_else(|| std::io::Error::other("a destructive confirmation must offer Cancel"))?;
@@ -2846,9 +2879,16 @@ mod tests {
     /// loaded `--workspace` run — `the_view_bar_delete_asks_in_a_dialog_and_cancel_keeps_everything`
     /// failed roughly one run in three on "Cancel must dismiss the dialog" while passing five times
     /// out of five alone. The wait is bounded so a dialog that genuinely never closes still fails.
-    fn wait_for_dialog_dismissed(visual: &mut gpui::VisualTestContext) -> bool {
+    fn wait_for_dialog_dismissed(
+        visual: &mut gpui_kit::VisualTestContext,
+        _workspace: &gpui_kit::Entity<MeetingWorkspace>,
+    ) -> bool {
         for _ in 0..50 {
-            if !visual.update(|window, cx| window.has_active_dialog(cx)) {
+            crate::workspace::test_support::settle_root_overlays(visual);
+            if visual
+                .debug_bounds(crate::workspace::CONFIRM_OK_SELECTOR)
+                .is_none()
+            {
                 return true;
             }
             visual.executor().advance_clock(Duration::from_millis(20));
@@ -2860,7 +2900,8 @@ mod tests {
     /// Opens the view bar's trash control and returns the dialog's Cancel and OK bounds.
     fn open_view_bar_delete_dialog(
         visual: &mut VisualTestContext,
-    ) -> Result<(Bounds<gpui::Pixels>, Bounds<gpui::Pixels>), Box<dyn std::error::Error>> {
+    ) -> Result<(Bounds<gpui_kit::Pixels>, Bounds<gpui_kit::Pixels>), Box<dyn std::error::Error>>
+    {
         open_delete_dialog(visual, "view-delete-control")
     }
 
@@ -2870,7 +2911,7 @@ mod tests {
     async fn the_view_bar_delete_asks_in_a_dialog_and_cancel_keeps_everything()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
         let (session_id, app) = mount_with_a_recording_open(&mut cx, dir.path()).await?;
@@ -2887,7 +2928,9 @@ mod tests {
 
         let (cancel, _) = open_view_bar_delete_dialog(visual)?;
         assert!(
-            visual.update(|window, cx| window.has_active_dialog(cx)),
+            visual
+                .debug_bounds(crate::workspace::CONFIRM_OK_SELECTOR)
+                .is_some(),
             "the trash control must ask before it acts"
         );
         assert!(
@@ -2900,7 +2943,7 @@ mod tests {
         visual.refresh()?;
         visual.run_until_parked();
         assert!(
-            wait_for_dialog_dismissed(visual),
+            wait_for_dialog_dismissed(visual, &workspace),
             "Cancel must dismiss the dialog"
         );
         assert!(
@@ -2919,10 +2962,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn escape_cancels_the_view_bar_delete_dialog() -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
         let (session_id, app) = mount_with_a_recording_open(&mut cx, dir.path()).await?;
+        let workspace = app.workspace.clone();
         let visual = app.visual;
         open_view_bar_delete_dialog(visual)?;
 
@@ -2930,7 +2974,7 @@ mod tests {
         visual.refresh()?;
         visual.run_until_parked();
         assert!(
-            wait_for_dialog_dismissed(visual),
+            wait_for_dialog_dismissed(visual, &workspace),
             "Escape must cancel the dialog"
         );
         assert!(
@@ -2941,7 +2985,9 @@ mod tests {
         // still reachable, and opening the dialog a second time works exactly as the first did.
         open_view_bar_delete_dialog(visual)?;
         assert!(
-            visual.update(|window, cx| window.has_active_dialog(cx)),
+            visual
+                .debug_bounds(crate::workspace::CONFIRM_OK_SELECTOR)
+                .is_some(),
             "the shell must still be interactive after a cancelled confirmation"
         );
         Ok(())
@@ -2952,7 +2998,7 @@ mod tests {
     async fn confirming_the_view_bar_dialog_deletes_only_that_entry()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
         let (session_id, app) = mount_with_a_recording_open(&mut cx, dir.path()).await?;
@@ -2964,7 +3010,7 @@ mod tests {
         visual.refresh()?;
         visual.run_until_parked();
         assert!(
-            wait_for_dialog_dismissed(visual),
+            wait_for_dialog_dismissed(visual, &workspace),
             "confirming must close the dialog"
         );
         assert!(
@@ -2987,7 +3033,7 @@ mod tests {
     async fn mounted_entry_delete_control_removes_the_entry_and_both_recordings()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("sotto.sqlite3");
         let entry_id = EntryId::new(8_001);
@@ -3030,7 +3076,7 @@ mod tests {
     async fn mounted_recording_delete_control_keeps_the_entry_and_other_recording()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let directory = tempfile::tempdir()?;
         let database = directory.path().join("sotto.sqlite3");
         let entry_id = EntryId::new(8_101);
@@ -3076,7 +3122,7 @@ mod tests {
     async fn a_stopped_session_opens_on_notes_with_transcript_one_tab_away()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         // Enough rows that the list genuinely scrolls; a transcript that fits the viewport has no
         // scroll position to lose and would prove nothing.
@@ -3190,7 +3236,7 @@ mod tests {
     /// Every toolbar control's rectangle, or a failure naming the one that did not render.
     fn toolbar_bounds(
         visual: &mut VisualTestContext,
-    ) -> Result<Vec<gpui::Bounds<gpui::Pixels>>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<gpui_kit::Bounds<gpui_kit::Pixels>>, Box<dyn std::error::Error>> {
         TOOLBAR_CONTROLS
             .into_iter()
             .map(|selector| {
@@ -3209,7 +3255,7 @@ mod tests {
     fn the_toolbar_fills_the_strip_without_reaching_under_the_traffic_lights()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let visual = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?.visual;
         visual.refresh()?;
@@ -3256,7 +3302,7 @@ mod tests {
     async fn the_library_collapses_from_the_toolbar_and_comes_back()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         persist_stopped_session(&dir.path().join("sotto.sqlite3"), 4).await?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
@@ -3330,7 +3376,7 @@ mod tests {
     async fn a_collapsed_library_is_still_collapsed_after_a_relaunch()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
         persist_stopped_session(&database, 3).await?;
@@ -3384,7 +3430,7 @@ mod tests {
     async fn toolbar_search_reaches_a_collapsed_entry_rail_and_opens_the_note_match()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
         persist_stopped_session(&database, 4).await?;
@@ -3492,12 +3538,68 @@ mod tests {
         Ok(())
     }
 
+    /// Toolbar search forwards `.cleanable(true)` so clearing the filter is one control, not a
+    /// hidden keyboard-only path.
+    #[test]
+    fn toolbar_search_clear_empties_an_active_filter() -> Result<(), Box<dyn std::error::Error>> {
+        let mut cx = TestAppContext::single();
+        cx.update(gpui_kit::init);
+        let dir = tempfile::tempdir()?;
+        let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
+        let workspace = shell.workspace;
+        let visual = shell.visual;
+        visual.refresh()?;
+        visual.run_until_parked();
+
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.library_filter.update(cx, |state, cx| {
+                    state.set_value("zirconium", window, cx);
+                });
+            });
+        });
+        visual.refresh()?;
+        visual.run_until_parked();
+        assert_eq!(
+            visual.update(|_, cx| {
+                workspace
+                    .read(cx)
+                    .library_filter
+                    .read(cx)
+                    .value()
+                    .to_string()
+            }),
+            "zirconium"
+        );
+
+        // Kit clear_button calls InputState::clean — the same path `.cleanable(true)` wires.
+        visual.update(|window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.library_filter.update(cx, |state, cx| {
+                    state.clean(window, cx);
+                });
+            });
+        });
+        visual.refresh()?;
+        visual.run_until_parked();
+        assert!(
+            visual.update(|_, cx| workspace
+                .read(cx)
+                .library_filter
+                .read(cx)
+                .value()
+                .is_empty()),
+            "clearing the toolbar search must empty the active library filter"
+        );
+        Ok(())
+    }
+
     /// Ask is toggled from the toolbar, and a closed Ask costs the stage nothing.
     #[test]
     fn ask_reserves_no_width_until_the_toolbar_opens_it() -> Result<(), Box<dyn std::error::Error>>
     {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let shell = mount(&mut cx, dir.path(), None, WIDE_WORKSPACE_WIDTH)?;
         let workspace = shell.workspace;
@@ -3568,7 +3670,7 @@ mod tests {
     fn stop_survives_every_sidebar_and_ask_combination_at_the_minimum_width()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let shell = mount(
             &mut cx,

@@ -72,3 +72,16 @@ large_futures = "warn"
 # Guard/temporary with significant Drop held across a match/if-let body — deadlock-shape hazard.
 significant_drop_in_scrutinee = "deny"
 missing_assert_message = "warn"
+
+# Longbridge install guidance: keep app code a fast debug build while GPUI / kit / text
+# layout crates compile optimized so `cargo run` is usable beside a live meeting client.
+[profile.dev.package]
+gpui-pre = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
+gpui-kit = { opt-level = 3 }
+gpui-kit-assets = { opt-level = 3 }
+gpui-pre-macros = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }

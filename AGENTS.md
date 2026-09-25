@@ -82,10 +82,11 @@ The shipped product has no Board lens, zoom controls, spatial canvas, or canvas-
 
 One language, one shipped binary. No Electron, no webview, and no bundled sidecar/IPC boundary.
 
-- **UI: GPUI** (Zed's GPU-accelerated UI framework) + `gpui-component` for the meeting transcript, notes, settings screens, lists, and inputs.
-  - GPUI is pre-1.0 with breaking changes between versions: **pin the exact version** in Cargo.toml, upgrade deliberately with an ADR per upgrade, never `*`.
-  - Prefer the official crates.io release; fall back to a pinned git revision of the Zed repo if a needed fix isn't released. Avoid unofficial forks unless unavoidable (record as ADR).
-  - When docs run out, the reference is the Zed source code — reading it is the expected workflow, not a workaround.
+- **UI: GPUI** (Zed's GPU-accelerated UI framework) via Longbridge **`gpui-kit = "=0.6.6"`** for the meeting transcript, notes, settings screens, lists, and inputs.
+  - The app depends on `gpui-kit` alone (default features + `test-support` in dev-dependencies). Do not list `gpui` / `gpui_platform` / `gpuikit` directly. Use `gpui_kit::*` for GPUI types, `gpui_kit::component` for styled components, `gpui_kit::assets` for assets, `gpui_kit::platform` if needed (ADR-0025).
+  - GPUI / kit lines are pre-1.0 with breaking changes between versions: **pin the exact version** in Cargo.toml, upgrade deliberately with an ADR per upgrade, never `*`.
+  - Boot through `gpui_kit::application().with_assets(gpui_kit::assets::Assets)` and `gpui_kit::init`; host windows under `Root`. Fully adopt Longbridge theme tokens — no parallel Sotto palette painted onto the toolkit.
+  - When docs run out, the references are [gpui-kit.com](https://gpui-kit.com) and the Zed / Longbridge sources — reading them is the expected workflow, not a workaround.
 - **Async runtime:** tokio for the pipeline and network. Bridge carefully to GPUI's own executor at the UI boundary (single, well-defined seam: timeline events → UI entities).
 - **Capture scope:** every session begins with the user choosing a target — an application or a window — via `SCContentSharingPicker`. That choice builds the `SCContentFilter` for both video and audio, so scope is enforced by the OS rather than by us discarding data afterwards. The chosen target (bundle id, window title) is recorded on the session and is useful context downstream: knowing the session is Zoom versus Keynote is free signal for notes and proposals.
   - **Open question for Spike A:** ScreenCaptureKit scopes *video* per-window/per-application natively. Whether *audio* can be scoped to the target application on our minimum macOS version must be verified, not assumed. If audio remains system-wide, say so plainly in the UI and the ADR — the scope guarantee is then video-only, and Slack pings and Spotify are in the recording.

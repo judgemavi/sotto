@@ -10,7 +10,7 @@ use std::{
     thread::JoinHandle,
 };
 
-use gpui::Context;
+use gpui_kit::Context;
 use mcp::{
     BearerCredential, ContextBudget, ContextCancellation, GrantRunFingerprint, HttpEndpoint,
     McpBroker, MeetingQueryDisclosure, ResourceCatalog, ResourceDescriptor, ResourceUri,
@@ -1001,7 +1001,7 @@ mod tests {
         },
     };
 
-    use gpui::AppContext;
+    use gpui_kit::AppContext;
     use secrecy::{ExposeSecret, SecretString};
 
     use super::{
@@ -1119,9 +1119,9 @@ mod tests {
         }
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn resources_default_off_and_endpoint_replacement_clears_old_approval(
-        cx: &mut gpui::TestAppContext,
+        cx: &mut gpui_kit::TestAppContext,
     ) {
         let (_directory, credentials, controller) = controller();
         let entity = cx.new(|_| controller);
@@ -1182,9 +1182,9 @@ mod tests {
         assert!(!credentials.contains(&server_id, &old_endpoint));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn persisted_identifiers_endpoints_and_grants_roundtrip_without_bearer(
-        cx: &mut gpui::TestAppContext,
+        cx: &mut gpui_kit::TestAppContext,
     ) {
         let (directory, credentials, controller) = controller();
         let settings_path = directory.path().join("mcp.json");
@@ -1244,8 +1244,8 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    fn source_removal_deletes_exact_key_and_cleans_future_grant(cx: &mut gpui::TestAppContext) {
+    #[gpui_kit::test]
+    fn source_removal_deletes_exact_key_and_cleans_future_grant(cx: &mut gpui_kit::TestAppContext) {
         let (directory, credentials, controller) = controller();
         let settings_path = directory.path().join("mcp.json");
         let entity = cx.new(|_| controller);
@@ -1296,9 +1296,9 @@ mod tests {
         assert!(persisted.fingerprint.is_none());
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn endpoint_replacement_persistence_failure_rolls_back_memory_and_keychain(
-        cx: &mut gpui::TestAppContext,
+        cx: &mut gpui_kit::TestAppContext,
     ) {
         let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
         let credentials = Arc::new(FakeCredentials::default());
@@ -1345,9 +1345,9 @@ mod tests {
         assert!(!credentials.contains(&server_id, &new_endpoint));
     }
 
-    #[gpui::test]
+    #[gpui_kit::test]
     fn source_removal_persistence_failure_rolls_back_memory_grant_and_keychain(
-        cx: &mut gpui::TestAppContext,
+        cx: &mut gpui_kit::TestAppContext,
     ) {
         let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
         let credentials = Arc::new(FakeCredentials::default());

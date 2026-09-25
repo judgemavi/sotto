@@ -1,6 +1,6 @@
 # ADR-0024: Adopt gpuikit on gpui-unofficial
 
-- Status: Accepted
+- Status: Superseded by ADR-0025
 - Date: 2026-09-21
 - Decision owners: Sotto maintainers
 - Evidence: T105 spike (`.tasks/T105-spike-notes.md`, local `crates/gpuikit-spike`)

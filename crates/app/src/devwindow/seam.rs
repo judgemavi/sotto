@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use gpui::{App, AppContext, Entity, Timer};
+use gpui_kit::{App, AppContext, Entity};
 use sotto_core::TimelineEvent;
 use tokio::sync::mpsc;
 
@@ -47,7 +47,9 @@ pub fn attach_ingress(cx: &mut App, capacity: usize) -> (TimelineIngress, Entity
     let drain_state = state.clone();
     cx.spawn(async move |cx| {
         loop {
-            Timer::after(Duration::from_millis(16)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
             let mut batch = Vec::new();
             while let Ok(event) = receiver.try_recv() {
                 batch.push(event);
@@ -55,19 +57,16 @@ pub fn attach_ingress(cx: &mut App, capacity: usize) -> (TimelineIngress, Entity
             if batch.is_empty() {
                 continue;
             }
-            if cx
-                .update(|cx| {
-                    drain_state.update(cx, |state, cx| {
-                        for event in batch {
-                            state.append(event);
-                        }
-                        cx.notify();
-                    });
-                })
-                .is_err()
-            {
-                return;
-            }
+            // AsyncApp::update returns unit in gpui-pre 1.14; a dropped app ends the task
+            // when later awaits stop being scheduled.
+            cx.update(|cx| {
+                drain_state.update(cx, |state, cx| {
+                    for event in batch {
+                        state.append(event);
+                    }
+                    cx.notify();
+                });
+            });
         }
     })
     .detach();

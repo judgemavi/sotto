@@ -2,6 +2,7 @@
 
 #![deny(warnings)]
 
+pub mod assets;
 pub mod devwindow;
 pub mod mcp;
 pub mod notes;

@@ -14,7 +14,7 @@
 
 use std::panic::Location;
 
-use gpui::{
+use gpui_kit::{
     AnyElement, Bounds, Div, Element, ElementId, GlobalElementId, InspectorElementId,
     Interactivity, IntoElement, LayoutId, Pixels, StyleRefinement, div, prelude::*, px,
 };
@@ -173,8 +173,8 @@ impl Element for ControlRowElement {
         &mut self,
         id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
-        window: &mut gpui::Window,
-        cx: &mut gpui::App,
+        window: &mut gpui_kit::Window,
+        cx: &mut gpui_kit::App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         self.row.request_layout(id, inspector_id, window, cx)
     }
@@ -185,8 +185,8 @@ impl Element for ControlRowElement {
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
-        window: &mut gpui::Window,
-        cx: &mut gpui::App,
+        window: &mut gpui_kit::Window,
+        cx: &mut gpui_kit::App,
     ) -> Self::PrepaintState {
         self.row
             .prepaint(id, inspector_id, bounds, request_layout, window, cx)
@@ -199,8 +199,8 @@ impl Element for ControlRowElement {
         bounds: Bounds<Pixels>,
         request_layout: &mut Self::RequestLayoutState,
         prepaint: &mut Self::PrepaintState,
-        window: &mut gpui::Window,
-        cx: &mut gpui::App,
+        window: &mut gpui_kit::Window,
+        cx: &mut gpui_kit::App,
     ) {
         self.row.paint(
             id,
@@ -244,7 +244,7 @@ impl ControlRole {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{ParentElement as _, div, px};
+    use gpui_kit::{ParentElement as _, div, px};
 
     use super::{ControlRole, ControlRow};
 

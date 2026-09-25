@@ -24,7 +24,7 @@ use capture::macos::{
     CaptureStatus, MacCapture, PickOutcome, PickedMacCapture, PickedTarget, probe_recording,
 };
 use futures_util::FutureExt;
-use gpui::{Context, PathPromptOptions, Timer};
+use gpui_kit::{Context, PathPromptOptions};
 use rag::{Store, TimelinePersistence};
 use sotto_core::types::{MediaTimeMapping, RecordingContainer, SessionRecording};
 use sotto_core::{
@@ -793,10 +793,12 @@ impl SessionController {
             cx.notify();
             return;
         }
-        let controller = cx.entity();
+        let controller = cx.weak_entity();
         cx.spawn(async move |_, cx| {
             loop {
-                Timer::after(LIFECYCLE_POLL_INTERVAL).await;
+                cx.background_executor()
+                    .timer(LIFECYCLE_POLL_INTERVAL)
+                    .await;
                 match receiver.try_recv() {
                     Ok(availability) => {
                         let _ = controller.update(cx, |controller, cx| {
@@ -880,10 +882,12 @@ impl SessionController {
         let controller = cx.entity();
         cx.spawn(async move |_, cx| {
             loop {
-                Timer::after(LIFECYCLE_POLL_INTERVAL).await;
+                cx.background_executor()
+                    .timer(LIFECYCLE_POLL_INTERVAL)
+                    .await;
                 match receiver.try_recv() {
                     Ok(ModelDownloadEvent::Progress(progress)) => {
-                        let _ = controller.update(cx, |controller, cx| {
+                        controller.update(cx, |controller, cx| {
                             if controller.model_operation_is_current(generation) {
                                 controller.transcription_model.set_provisioning(progress);
                                 cx.notify();
@@ -891,7 +895,7 @@ impl SessionController {
                         });
                     }
                     Ok(ModelDownloadEvent::Finished(result)) => {
-                        let _ = controller.update(cx, |controller, cx| {
+                        controller.update(cx, |controller, cx| {
                             if !controller.model_operation_is_current(generation) {
                                 return;
                             }
@@ -988,7 +992,7 @@ impl SessionController {
         let controller = cx.entity();
         cx.spawn(async move |_, cx| {
             let outcome = MacCapture::pick_target().await;
-            let _ = controller.update(cx, |controller, cx| match outcome {
+            controller.update(cx, |controller, cx| match outcome {
                 PickOutcome::Picked(target) => {
                     controller.begin_worker(generation, CaptureSelection::Scoped(target), cx)
                 }
@@ -1098,7 +1102,7 @@ impl SessionController {
                 _ => None,
             };
             let Some(source) = picked else {
-                let _ = controller.update(cx, |controller, cx| {
+                controller.update(cx, |controller, cx| {
                     controller.importing = false;
                     cx.notify();
                 });
@@ -1126,7 +1130,7 @@ impl SessionController {
                     let _ = result_sender.send(outcome);
                 });
             if let Err(error) = spawn {
-                let _ = controller.update(cx, |controller, cx| {
+                controller.update(cx, |controller, cx| {
                     controller.importing = false;
                     controller.import_error = Some(format!("Could not start the import: {error}"));
                     cx.notify();
@@ -1134,10 +1138,12 @@ impl SessionController {
                 return;
             }
             loop {
-                Timer::after(LIFECYCLE_POLL_INTERVAL).await;
+                cx.background_executor()
+                    .timer(LIFECYCLE_POLL_INTERVAL)
+                    .await;
                 match result_receiver.try_recv() {
                     Ok(outcome) => {
-                        let _ = controller.update(cx, |controller, cx| {
+                        controller.update(cx, |controller, cx| {
                             controller.importing = false;
                             match outcome {
                                 Ok(outcome) => {
@@ -1151,7 +1157,7 @@ impl SessionController {
                     }
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        let _ = controller.update(cx, |controller, cx| {
+                        controller.update(cx, |controller, cx| {
                             controller.importing = false;
                             controller.import_error =
                                 Some("The import ended unexpectedly.".to_owned());
@@ -1285,10 +1291,12 @@ impl SessionController {
             app_shutdown,
         });
 
-        let controller = cx.entity();
+        let controller = cx.weak_entity();
         cx.spawn(async move |_, cx| {
             loop {
-                Timer::after(LIFECYCLE_POLL_INTERVAL).await;
+                cx.background_executor()
+                    .timer(LIFECYCLE_POLL_INTERVAL)
+                    .await;
                 loop {
                     match receiver.try_recv() {
                         Ok(event) => {
@@ -2262,7 +2270,7 @@ mod tests {
         model::{ModelProvisionError, ProvisionPhase, ProvisionProgress},
     };
     use capture::macos::CaptureStatus;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui_kit::{AppContext as _, TestAppContext};
     use sotto_core::types::{MediaTimeMapping, RecordingContainer, SessionRecording};
     use sotto_core::{
         CancellationToken, CaptureError, CaptureTarget, EventBus, EventId, EventPayload, MarkKind,

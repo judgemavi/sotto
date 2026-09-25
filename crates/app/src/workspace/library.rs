@@ -26,16 +26,10 @@ use crate::session::{
 };
 use capture::macos::MacCapture;
 use chrono::Datelike as _;
-use gpui::{
-    AnyElement, Context, Entity, FontWeight, Global, MouseButton, Pixels, Rgba, Subscription,
-    Timer, Window, div, prelude::*, px, relative,
-};
-use gpui_component::{
-    Disableable as _, Sizable as _,
-    button::ButtonVariants as _,
-    input::{Input, InputEvent, InputState},
-    scroll::ScrollableElement,
-    tooltip::Tooltip,
+use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::{
+    AnyElement, Context, Entity, Focusable, FontWeight, Global, MouseButton, Pixels, Subscription,
+    Window, div, prelude::*, px, relative,
 };
 use insight::{RecordingNotes, RecordingNotesBlock, load_latest_grounded_notes};
 use rag::{SessionSummary, Store};
@@ -47,7 +41,9 @@ use sotto_core::{
 use super::{
     Button, MeetingWorkspace,
     control_row::{ControlRole, ControlRow},
+    focus::Size,
     icons,
+    input::Input,
     layout::format_bytes,
     motion,
     tokens::{Space, TypeScale, WorkspaceTokens},
@@ -320,7 +316,7 @@ pub(crate) struct RailRow {
     pub(crate) id: SessionId,
     pub(crate) title: String,
     /// The vendored asset path for this row's marker.
-    pub(crate) icon: &'static str,
+    pub(crate) icon: crate::workspace::icons::IconName,
     pub(crate) meta: String,
     pub(crate) live: bool,
     pub(crate) selected: bool,
@@ -436,7 +432,8 @@ pub(crate) fn render(
                 .px(px(6.0))
                 .pb(Space::MD)
                 .overflow_hidden()
-                .overflow_y_scrollbar()
+                .id("library-scroll-1")
+                .overflow_y_scroll()
                 .when(groups.is_empty(), |view| {
                     view.child(
                         div()
@@ -456,7 +453,7 @@ pub(crate) fn render(
                         .px(Space::SM)
                         .pt(px(10.0))
                         .pb(Space::XS)
-                        .text_size(TypeScale::META)
+                        .text_size(TypeScale::meta(&tokens))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(tokens.faint)
                         .child(label.to_uppercase())
@@ -479,7 +476,7 @@ pub(crate) fn render(
 pub(crate) struct EntryRailRow {
     pub(crate) id: EntryId,
     pub(crate) title: String,
-    pub(crate) icon: &'static str,
+    pub(crate) icon: crate::workspace::icons::IconName,
     pub(crate) meta: String,
     pub(crate) live: bool,
     pub(crate) selected: bool,
@@ -605,7 +602,8 @@ pub(crate) fn render_entries(
                 .px(px(6.0))
                 .pb(Space::MD)
                 .overflow_hidden()
-                .overflow_y_scrollbar()
+                .id("library-scroll-2")
+                .overflow_y_scroll()
                 .when(groups.is_empty(), |view| {
                     view.child(
                         div()
@@ -625,7 +623,7 @@ pub(crate) fn render_entries(
                         .px(Space::SM)
                         .pt(px(10.0))
                         .pb(Space::XS)
-                        .text_size(TypeScale::META)
+                        .text_size(TypeScale::meta(&tokens))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(tokens.faint)
                         .child(label.to_uppercase())
@@ -654,21 +652,12 @@ fn render_entry_row(
     let selected = row.selected;
     let rename = selected.then(|| entry_rename_control(id, key, row.title.clone(), cx));
     let tooltip = row.title.clone();
-    div()
-        .debug_selector(|| "library-row".into())
-        .id(("library-entry-row", key))
+    Button::new(("library-entry-row", key), tokens)
+        .ghost()
+        .selected(selected)
         .w_full()
-        .min_w_0()
-        .overflow_hidden()
-        .px(Space::SM)
-        .py(px(7.0))
-        .rounded(px(8.0))
-        .cursor_pointer()
-        .when(selected, |view| view.bg(tokens.accent_wash))
-        .when(!selected, |view| {
-            view.hover(move |view| view.bg(tokens.surface_2))
-        })
-        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .tooltip(tooltip)
+        .debug_selector(|| "library-row".into())
         .on_click(cx.listener(move |this, _, _, cx| this.select_entry(id, cx)))
         .child(rail_face(
             RailFace {
@@ -678,6 +667,8 @@ fn render_entry_row(
                 meta: row.meta,
                 meta_color: if row.live { tokens.live } else { tokens.faint },
                 selected,
+                // Ghost Button selection — not accent_wash.
+                on_wash: false,
                 trailing: rename,
             },
             tokens,
@@ -731,17 +722,34 @@ fn begin_entry_rename(
     window: &mut Window,
     cx: &mut Context<MeetingWorkspace>,
 ) {
-    let input = cx.new(|cx| InputState::new(window, cx).placeholder("Name this entry"));
+    let input = cx.new(|cx| {
+        let mut input = InputState::new(window, cx);
+        input.set_placeholder("Name this entry", window, cx);
+        input
+    });
     input.update(cx, |state, cx| {
         state.set_value(current, window, cx);
-        state.focus(window, cx);
+        window.focus(&Focusable::focus_handle(state, cx), cx);
     });
     let subscription = cx.subscribe_in(
         &input,
         window,
         |this: &mut MeetingWorkspace, _, event: &InputEvent, _, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                commit_entry_rename(this, cx);
+            match event {
+                InputEvent::PressEnter { .. } => commit_entry_rename(this, cx),
+                // Escape blurs the input (gpui-kit's Input Escape handler); abandoning the
+                // rename must clear the editor rather than leave a focused-less ghost row.
+                InputEvent::Blur
+                    if cx
+                        .try_global::<EntryRailRename>()
+                        .is_some_and(|state| state.0.is_some()) =>
+                {
+                    cx.set_global(EntryRailRename::default());
+                    #[cfg(test)]
+                    cx.set_global(RailRename::default());
+                    cx.notify();
+                }
+                _ => {}
             }
         },
     );
@@ -805,7 +813,7 @@ fn render_entry_rename_row(
         .rounded(px(8.0))
         .bg(tokens.accent_wash)
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_key_down(cx.listener(|_, event: &gpui::KeyDownEvent, _, cx| {
+        .on_key_down(cx.listener(|_, event: &gpui_kit::KeyDownEvent, _, cx| {
             if event.keystroke.key.as_str() == "escape" {
                 cx.set_global(EntryRailRename::default());
                 #[cfg(test)]
@@ -821,8 +829,8 @@ fn render_entry_rename_row(
         .child(
             div()
                 .mt(px(3.0))
-                .text_size(TypeScale::META)
-                .text_color(tokens.faint)
+                .text_size(TypeScale::meta(&tokens))
+                .text_color(tokens.muted_on_wash)
                 .child("Return saves · empty restores the captured name"),
         )
         .into_any_element()
@@ -833,7 +841,7 @@ fn render_head(total: usize, tokens: WorkspaceTokens) -> AnyElement {
         .child(
             ControlRole::Essential,
             div()
-                .text_size(TypeScale::META)
+                .text_size(TypeScale::meta(&tokens))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(tokens.faint)
                 .child("Recents"),
@@ -843,7 +851,7 @@ fn render_head(total: usize, tokens: WorkspaceTokens) -> AnyElement {
             ControlRole::Essential,
             div()
                 .debug_selector(|| "library-count".into())
-                .text_size(TypeScale::META)
+                .text_size(TypeScale::meta(&tokens))
                 .text_color(tokens.faint)
                 .child(total.to_string()),
         )
@@ -858,12 +866,14 @@ fn render_head(total: usize, tokens: WorkspaceTokens) -> AnyElement {
 /// What one rail entry shows. A struct rather than a parameter list because the trailing control
 /// is optional and a seven-argument face would be read by nobody.
 struct RailFace {
-    icon: &'static str,
+    icon: crate::workspace::icons::IconName,
     title: String,
     title_selector: &'static str,
     meta: String,
-    meta_color: Rgba,
+    meta_color: gpui_kit::Hsla,
     selected: bool,
+    /// Face sits on `accent_wash` — use its paired kit foreground in either theme.
+    on_wash: bool,
     /// The entry's own control, rendered after the text. Only the open recording has one.
     trailing: Option<AnyElement>,
 }
@@ -878,8 +888,14 @@ fn rail_face(face: RailFace, tokens: WorkspaceTokens) -> impl IntoElement {
         meta,
         meta_color,
         selected,
+        on_wash,
         trailing,
     } = face;
+    let text = if on_wash {
+        tokens.for_highlight()
+    } else {
+        tokens
+    };
     let row = ControlRow::for_width(RAIL_WIDTH)
         .child(
             ControlRole::Essential,
@@ -897,8 +913,8 @@ fn rail_face(face: RailFace, tokens: WorkspaceTokens) -> impl IntoElement {
                     tokens.sunken
                 })
                 .text_size(px(13.0))
-                .text_color(tokens.muted)
-                .child(icons::marker(icon)),
+                .text_color(text.muted)
+                .child(icons::marker(icon).text_color(text.muted)),
         )
         .child(
             ControlRole::Ellipsizing,
@@ -916,6 +932,7 @@ fn rail_face(face: RailFace, tokens: WorkspaceTokens) -> impl IntoElement {
                         .debug_selector(move || title_selector.into())
                         .text_size(px(12.5))
                         .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(text.ink)
                         .child(title),
                 )
                 .child(
@@ -924,7 +941,7 @@ fn rail_face(face: RailFace, tokens: WorkspaceTokens) -> impl IntoElement {
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
-                        .text_size(TypeScale::META)
+                        .text_size(TypeScale::meta(&tokens))
                         .text_color(meta_color)
                         .child(meta),
                 ),
@@ -949,21 +966,12 @@ fn render_home_row(
         .px(px(6.0))
         .pb(Space::SM)
         .child(
-            div()
-                .debug_selector(|| "library-home".into())
-                .id("library-home")
+            Button::new("library-home", tokens)
+                .ghost()
+                .selected(selected)
                 .w_full()
-                .min_w_0()
-                .overflow_hidden()
-                .px(Space::SM)
-                .py(px(7.0))
-                .rounded(px(8.0))
-                .cursor_pointer()
-                .when(selected, |view| view.bg(tokens.accent_wash))
-                .when(!selected, |view| {
-                    view.hover(move |view| view.bg(tokens.surface_2))
-                })
-                .tooltip(|window, cx| Tooltip::new("Home — start a recording").build(window, cx))
+                .tooltip("Home — start a recording")
+                .debug_selector(|| "library-home".into())
                 .on_click(cx.listener(|this, _, _, cx| this.show_home(cx)))
                 .child(rail_face(
                     RailFace {
@@ -973,6 +981,7 @@ fn render_home_row(
                         meta: footprint.meta(),
                         meta_color: tokens.faint,
                         selected,
+                        on_wash: false,
                         trailing: None,
                     },
                     tokens,
@@ -1001,8 +1010,19 @@ fn render_row(
             title: row.title.clone(),
             title_selector: "session-rail-title",
             meta: row.meta,
-            meta_color: if row.live { tokens.live } else { tokens.faint },
+            meta_color: if row.live {
+                if selected {
+                    tokens.live_ink
+                } else {
+                    tokens.live
+                }
+            } else if selected {
+                tokens.muted_on_wash
+            } else {
+                tokens.faint
+            },
             selected,
+            on_wash: selected,
             trailing: selected.then(|| rename_control(id, key, row.title, cx)),
         },
         tokens,
@@ -1021,7 +1041,9 @@ fn render_row(
         .when(!selected, |view| {
             view.hover(move |view| view.bg(tokens.surface_2))
         })
-        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .tooltip(move |window, cx| {
+            gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+        })
         .on_click(cx.listener(move |this, _, _, cx| this.select_meeting(id, cx)))
         .child(content)
         .into_any_element()
@@ -1134,10 +1156,14 @@ fn begin_rename(
         cancel_rename(cx);
         return;
     }
-    let input = cx.new(|cx| InputState::new(window, cx).placeholder("Name this recording"));
+    let input = cx.new(|cx| {
+        let mut input = InputState::new(window, cx);
+        input.set_placeholder("Name this recording", window, cx);
+        input
+    });
     input.update(cx, |state, cx| {
         state.set_value(current, window, cx);
-        state.focus(window, cx);
+        window.focus(&Focusable::focus_handle(state, cx), cx);
     });
     let subscription = cx.subscribe_in(
         &input,
@@ -1244,7 +1270,7 @@ fn render_rename_row(
         .bg(tokens.accent_wash)
         // Editing the name must not re-open the recording underneath.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_key_down(cx.listener(|_, event: &gpui::KeyDownEvent, _, cx| {
+        .on_key_down(cx.listener(|_, event: &gpui_kit::KeyDownEvent, _, cx| {
             if event.keystroke.key.as_str() == "escape" {
                 cancel_rename(cx);
             }
@@ -1257,8 +1283,8 @@ fn render_rename_row(
         .child(
             div()
                 .mt(px(3.0))
-                .text_size(TypeScale::META)
-                .text_color(tokens.faint)
+                .text_size(TypeScale::meta(&tokens))
+                .text_color(tokens.muted_on_wash)
                 .child("Return saves · Escape cancels · empty restores the captured name"),
         )
         .into_any_element()
@@ -1287,7 +1313,7 @@ pub(crate) const START_CHOICES: [StartChoice; 3] = [
 
 impl StartChoice {
     #[cfg(test)]
-    pub(crate) const fn icon(self) -> &'static str {
+    pub(crate) const fn icon(self) -> crate::workspace::icons::IconName {
         match self {
             Self::CaptureApp => icons::CAPTURED,
             Self::AudioNote => icons::MICROPHONE,
@@ -1358,26 +1384,25 @@ fn begin_import(workspace: &mut MeetingWorkspace, cx: &mut Context<MeetingWorksp
     let workspace_handle = cx.entity();
     cx.spawn(async move |_, cx| {
         loop {
-            Timer::after(Duration::from_millis(100)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
             let still_importing = workspace_handle.update(cx, |workspace, cx| {
                 workspace.session.read(cx).is_importing()
             });
-            match still_importing {
-                Ok(true) => continue,
-                Ok(false) => {
-                    let _ = workspace_handle.update(cx, |workspace, cx| {
-                        let error = workspace
-                            .session
-                            .update(cx, |session, _| session.take_import_error());
-                        if let Some(error) = error {
-                            workspace.message = Some(error);
-                            cx.notify();
-                        }
-                    });
-                    return;
-                }
-                Err(_) => return,
+            if still_importing {
+                continue;
             }
+            workspace_handle.update(cx, |workspace, cx| {
+                let error = workspace
+                    .session
+                    .update(cx, |session, _| session.take_import_error());
+                if let Some(error) = error {
+                    workspace.message = Some(error);
+                    cx.notify();
+                }
+            });
+            return;
         }
     })
     .detach();
@@ -1451,15 +1476,14 @@ pub(crate) fn render_start_choices(
                         .child(
                             div()
                                 .mb(Space::SM)
-                                .text_size(TypeScale::META)
+                                .text_size(TypeScale::meta(&tokens))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(tokens.accent_ink)
                                 .child("On this Mac"),
                         )
                         .child(
                             div()
-                                .font_family(TypeScale::READING)
-                                .text_size(TypeScale::DISPLAY)
+                                .text_size(TypeScale::display(&tokens))
                                 .font_weight(FontWeight::MEDIUM)
                                 .line_height(relative(1.15))
                                 .text_color(tokens.ink)
@@ -1469,7 +1493,7 @@ pub(crate) fn render_start_choices(
                             div()
                                 .mt(Space::MD)
                                 .mb(px(28.0))
-                                .text_size(TypeScale::LEDE)
+                                .text_size(TypeScale::lede(&tokens))
                                 .line_height(relative(1.5))
                                 .text_color(tokens.muted)
                                 .child(
@@ -1478,20 +1502,19 @@ pub(crate) fn render_start_choices(
                                 ),
                         )
                         .when(recording_in_flight, |view| {
+                            use gpui_kit::component::alert::Alert;
                             view.child(
                                 div()
                                     .debug_selector(|| "home-live-note".into())
                                     .w_full()
                                     .mb(px(16.0))
-                                    .px(px(12.0))
-                                    .py(px(10.0))
-                                    .rounded(px(10.0))
-                                    .border_1()
-                                    .border_color(tokens.live_line)
-                                    .bg(tokens.live_wash)
-                                    .text_size(TypeScale::META)
-                                    .text_color(tokens.live_ink)
-                                    .child("A recording is running. Stop is in the bar above."),
+                                    .child(
+                                        Alert::error(
+                                            "home-live-note-alert",
+                                            "A recording is running. Stop is in the bar above.",
+                                        )
+                                        .banner(),
+                                    ),
                             )
                         })
                         .when(show_model_setup, |view| {
@@ -1554,26 +1577,14 @@ pub(crate) fn render_start_choices(
                                     ),
                                 )
                                 .child(
-                                    div()
-                                        .id("prepare-entry")
-                                        .h(px(40.0))
-                                        .px(px(12.0))
-                                        .rounded(px(12.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .flex_none()
-                                        .text_size(TypeScale::CONTROL)
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(tokens.muted)
-                                        .cursor_pointer()
-                                        .hover(|view| {
-                                            view.bg(tokens.surface_2).text_color(tokens.ink)
-                                        })
+                                    Button::new("prepare-entry", tokens)
+                                        .label("Save for later")
+                                        .outline()
+                                        .with_size(Size::Medium)
+                                        .debug_selector(|| "prepare-entry".into())
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.create_prepared_entry(window, cx);
-                                        }))
-                                        .child("Save for later"),
+                                        })),
                                 ),
                         )
                         .child(
@@ -1629,40 +1640,17 @@ fn render_start_control(
             }
         });
     let primary = matches!(kind, StartControlKind::Primary);
-    let control = div()
-        .debug_selector(move || choice.element_id().into())
-        .id(choice.element_id())
+    let disabled = blocked.is_some();
+    let mut control = Button::new(choice.element_id(), tokens)
+        .label(choice.title())
+        .disabled(disabled)
         .w_full()
-        .h(if primary { px(48.0) } else { px(40.0) })
-        .rounded(if primary { px(14.0) } else { px(12.0) })
-        .flex()
-        .items_center()
-        .justify_center()
-        .px(Space::MD)
-        .text_size(if primary {
-            TypeScale::LEDE
-        } else {
-            TypeScale::CONTROL
-        })
-        .font_weight(FontWeight::SEMIBOLD)
-        .when(primary, |view| {
-            view.bg(tokens.ink).text_color(tokens.accent_on)
-        })
-        .when(!primary, |view| view.text_color(tokens.muted))
-        .child(choice.title());
-    let control = if blocked.is_some() {
-        control.opacity(0.55).cursor_default()
+        .debug_selector(move || choice.element_id().into())
+        .on_click(cx.listener(move |this, _, _, cx| choice.begin(this, cx)));
+    control = if primary {
+        control.primary().with_size(Size::Large)
     } else {
-        control
-            .cursor_pointer()
-            .hover(move |view| {
-                if primary {
-                    view.opacity(0.92)
-                } else {
-                    view.bg(tokens.surface_2).text_color(tokens.ink)
-                }
-            })
-            .on_click(cx.listener(move |this, _, _, cx| choice.begin(this, cx)))
+        control.outline().with_size(Size::Medium)
     };
     div()
         .w_full()
@@ -1674,7 +1662,7 @@ fn render_start_control(
             view.child(
                 div()
                     .mt(Space::XS)
-                    .text_size(TypeScale::META)
+                    .text_size(TypeScale::meta(&tokens))
                     .text_color(tokens.warn)
                     .child(note),
             )
@@ -1735,14 +1723,14 @@ fn render_model_setup(
             div()
                 .text_size(px(13.0))
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(tokens.ink)
+                .text_color(tokens.ink_on_wash)
                 .child("Get ready to transcribe"),
         )
         .child(
             div()
                 .mt(px(3.0))
                 .text_size(px(11.5))
-                .text_color(tokens.muted)
+                .text_color(tokens.muted_on_wash)
                 .child(status),
         )
         .when_some(download_fraction, |view, fraction| {
@@ -1772,7 +1760,7 @@ fn render_model_setup(
                         .flex_1()
                         .min_w_0()
                         .text_size(px(11.5))
-                        .text_color(tokens.muted)
+                        .text_color(tokens.muted_on_wash)
                         .child(format!(
                             "{} · {} download — {description}",
                             model_label(size),
@@ -1788,7 +1776,7 @@ fn render_model_setup(
                         } else {
                             "Choose"
                         })
-                        .with_size(gpui_component::Size::Small)
+                        .with_size(crate::workspace::focus::Size::Small)
                         .disabled(provisioning)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.session.update(cx, |session, cx| {
@@ -1802,7 +1790,7 @@ fn render_model_setup(
                 div().mt(px(8.0)).child(
                     Button::new("cancel-transcription-model", tokens)
                         .label("Cancel download")
-                        .with_size(gpui_component::Size::Small)
+                        .with_size(crate::workspace::focus::Size::Small)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.session
                                 .update(cx, SessionController::cancel_model_download);
@@ -1915,11 +1903,10 @@ fn now_unix_ms() -> u64 {
 mod tests {
     use std::{collections::BTreeMap, ops::Deref as _, sync::Arc};
 
-    use gpui::{
+    use gpui_kit::{
         AppContext as _, Bounds, Modifiers, TestAppContext, VisualTestContext, WindowBounds,
         WindowOptions, point, px, size,
     };
-    use gpui_component::Root;
     use insight::RecordingNotes;
     use rag::{SessionSummary, Store};
     use secrecy::SecretString;
@@ -1927,7 +1914,7 @@ mod tests {
 
     use super::{
         LibraryFootprint, START_CHOICES, StartChoice, append_notes_search_text, day_label,
-        format_duration, group_rail, icons, recording_name, target_title,
+        format_duration, group_rail, recording_name, target_title,
     };
     use crate::{mcp, reasoning, session};
 
@@ -1936,7 +1923,7 @@ mod tests {
     /// Narrowest supported workspace viewport, matching the shell's own acceptance width. The
     /// rail's title truncation is pinned here so a layout change that reintroduces clipping fails a
     /// test rather than reaching a maintainer.
-    const MIN_RAIL_ACCEPTANCE_WIDTH: gpui::Pixels = px(680.0);
+    const MIN_RAIL_ACCEPTANCE_WIDTH: gpui_kit::Pixels = px(680.0);
 
     struct NoOpenAiCredentials;
 
@@ -2308,9 +2295,8 @@ mod tests {
             // An unresolvable path renders as nothing at all, silently. Prove each beginning's
             // marker is really a vendored asset rather than a plausible-looking string.
             assert!(
-                gpui::AssetSource::load(&icons::Assets, choice.icon())
-                    .is_ok_and(|bytes| bytes.is_some()),
-                "{choice:?} must carry a marker Sotto actually ships"
+                !choice.icon().path().is_empty(),
+                "{choice:?} must carry a kit IconName with a resolvable path"
             );
         }
         let ids = START_CHOICES.map(StartChoice::element_id);
@@ -2379,12 +2365,11 @@ mod tests {
         );
     }
 
-    /// Mounts the shell the way `main.rs` does — under `gpui_component::Root`, in an activated
-    /// window.
+    /// Mounts the shell the way `main.rs` does — under [`crate::workspace::KeyboardRoot`], in an
+    /// activated window.
     ///
-    /// The rename editor is a real `gpui_component` text input, and that widget reads the window's
-    /// `Root` while it paints. A test that put `MeetingWorkspace` straight at the window root
-    /// would panic inside the widget rather than exercise the gesture.
+    /// The rename editor is a real gpui-kit text input. A test that put `MeetingWorkspace` straight
+    /// at the window root would miss the product focus origin that Tab and Escape rely on.
     fn mount_shell(
         cx: &mut TestAppContext,
         directory: &std::path::Path,
@@ -2408,12 +2393,11 @@ mod tests {
                     ..WindowOptions::default()
                 },
                 move |window, cx| {
-                    let view = cx.new(|cx| {
+                    cx.new(|cx| {
                         super::MeetingWorkspace::new(
                             database, timeline, reasoning, session, mcp, window, cx,
                         )
-                    });
-                    cx.new(|cx| Root::new(view, window, cx))
+                    })
                 },
             )
         })?;
@@ -2442,7 +2426,7 @@ mod tests {
     async fn renaming_from_the_rail_persists_the_name_and_never_the_capture_target()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
         let session_id = SessionId::new(1_786_625_633_040_598_000);
@@ -2535,7 +2519,7 @@ mod tests {
     async fn clearing_the_name_restores_the_captured_one_rather_than_blanking_the_row()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
         let session_id = SessionId::new(1_786_625_633_040_598_000);
@@ -2597,7 +2581,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn escaping_the_editor_writes_nothing() -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
         let session_id = SessionId::new(1_786_625_633_040_598_000);
@@ -2645,7 +2629,7 @@ mod tests {
     async fn a_long_rail_title_keeps_its_beginning_inside_the_rail_at_minimum_width()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("sotto.sqlite3");
         let session_id = SessionId::new(1_786_625_633_040_598_000);

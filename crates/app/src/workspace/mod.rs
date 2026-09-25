@@ -4,12 +4,14 @@ mod ask;
 mod control_row;
 pub(crate) mod focus;
 pub(crate) mod icons;
+pub(crate) mod input;
 mod layout;
 mod library;
 pub(crate) mod motion;
 mod notes;
 mod pacing;
 mod runtime;
+mod selectable;
 pub(crate) mod tokens;
 mod transcript;
 
@@ -20,18 +22,17 @@ use std::{
     time::Instant,
 };
 
-use gpui::{
+use gpui_kit::component::button::{Button as KitButton, ButtonVariants as _};
+use gpui_kit::component::input::{EditorState, InputEvent, InputState};
+use gpui_kit::component::{Root, ThemeMode, WindowExt as _, h_flex};
+use gpui_kit::{
     App, Context, ElementId, Entity, KeyBinding, ListAlignment, ListState, Menu, MenuItem,
-    SharedString, Subscription, Timer, Window, WindowHandle, actions, div, prelude::*, px,
+    SharedString, Subscription, Window, WindowHandle, div, prelude::*, px,
 };
-use gpui_component::{
-    IconName, Root, Sizable as _, Size, Theme, ThemeMode, WindowExt as _,
-    button::{Button as ComponentButton, ButtonVariant, ButtonVariants as _},
-    dialog::{Dialog, DialogButtonProps},
-    input::{InputEvent, InputState},
-};
+use std::rc::Rc;
 
-use focus::Button;
+use focus::{Button, Size};
+use icons::IconName;
 use providers::ReasoningSurface;
 use serde::{Deserialize, Serialize};
 use sotto_core::{Entry, EntryId, EventId, SessionId, TimelineEvent};
@@ -48,7 +49,7 @@ use crate::{
 // The actions macOS invokes on Sotto's behalf. They are declared here rather than in `main.rs`
 // because their handlers reach into this workspace, and because the menu bar that carries them is
 // built from this module's state.
-actions!(
+gpui_kit::actions!(
     sotto,
     [
         /// `Sotto ▸ Settings…`, and ⌘, — the shortcut every macOS user tries first.
@@ -62,31 +63,39 @@ actions!(
     ]
 );
 
-pub use icons::Assets;
 pub use tokens::KeyboardRoot;
+
+/// Always-visible scrollbars after kit init (see [`tokens::install_visible_scrollbars`]).
+pub fn install_visible_scrollbars(cx: &mut App) {
+    tokens::install_visible_scrollbars(cx);
+}
 
 /// Where the traffic lights sit inside the title strip, and how tall that strip is.
 ///
 /// The window titlebar is transparent so the shell's own ground colour reaches the very top of the
-/// window. macOS draws its own titlebar in the *system* appearance, and gpui 0.2.2 exposes no way
-/// to set a window's `NSAppearance` — so with `View ▸ Appearance` set to Dark against a light
+/// window. macOS draws its own titlebar in the *system* appearance, and gpui-pre exposes no
+/// way to set a window's `NSAppearance` — so with `View ▸ Appearance` set to Dark against a light
 /// system, the strip stayed light above a dark window. Painting it ourselves is the only way the
 /// appearance choice reaches the whole window.
 ///
 /// The cost is that the traffic lights now sit over the shell's own content, so the top of the
 /// stage reserves this much room for them.
-pub const TRAFFIC_LIGHT_INSET: gpui::Pixels = gpui::px(13.0);
-pub(crate) const TITLE_STRIP_HEIGHT: gpui::Pixels = gpui::px(38.0);
+pub const TRAFFIC_LIGHT_INSET: gpui_kit::Pixels = gpui_kit::px(13.0);
+pub(crate) const TITLE_STRIP_HEIGHT: gpui_kit::Pixels = gpui_kit::px(38.0);
 
 /// An icon control: a picture the app owns, with its words in the tooltip.
+///
+/// Built on [`focus::Button`] rather than stock kit `IconButton`, so tests can attach a
+/// `debug_selector` and chrome can use the kit Lucide catalog (ADR-0025).
 ///
 /// Every icon button in the shell is built here so no call site can ship a picture with nothing
 /// behind it. `label` is that control's accessible name and reaches a person through the tooltip.
 ///
-/// Be precise about how far that goes: GPUI 0.2.2 publishes **no** platform accessibility tree —
-/// no ARIA, no `AXTitle`, no AccessKit bridge — so there is no channel through which a screen
-/// reader could read this name, and drawing an invisible label to satisfy the letter of the rule
-/// would be a dead control written as text. The tooltip is the whole of what the framework offers,
+/// Be precise about how far that goes: the pinned gpui-pre line still publishes **no**
+/// platform accessibility tree — no ARIA, no `AXTitle`, no AccessKit bridge — so there is no
+/// channel through which a screen reader could read this name, and drawing an invisible label to
+/// satisfy the letter of the rule would be a dead control written as text. The tooltip is the whole
+/// of what the framework offers,
 /// which is why icons stay confined to chrome and to a destructive action whose words arrive in
 /// the dialog it opens. Domain verbs — Start, Stop, Ask, Re-transcribe, Reveal — keep their words
 /// even now that the pictures are real.
@@ -95,7 +104,7 @@ pub(crate) fn icon_button(
     icon: IconName,
     label: impl Into<SharedString>,
     tokens: tokens::WorkspaceTokens,
-) -> ComponentButton {
+) -> Button {
     Button::new(id, tokens)
         .icon(icon)
         .tooltip(label)
@@ -111,7 +120,7 @@ pub(crate) fn delete_icon_button(
     id: impl Into<ElementId>,
     target: &str,
     tokens: tokens::WorkspaceTokens,
-) -> ComponentButton {
+) -> Button {
     Button::new(id, tokens)
         .icon(IconName::Delete)
         .tooltip(format!("Delete {target}…"))
@@ -121,61 +130,72 @@ pub(crate) fn delete_icon_button(
 
 /// Debug selectors for a confirm dialog's two answers.
 ///
-/// `gpui_component` builds the OK and Cancel buttons itself and carries no selector on either, so
-/// a mounted test could otherwise only assert that *a* dialog exists. Wrapping each rendered button
-/// is what lets a test click the same control a person clicks.
+/// Kit dialog buttons carry no product selectors, so the footer wraps each answer. That is what
+/// lets a mounted test click the same control a person clicks.
 pub(crate) const CONFIRM_OK_SELECTOR: &str = "confirm-dialog-ok";
 pub(crate) const CONFIRM_CANCEL_SELECTOR: &str = "confirm-dialog-cancel";
 
-/// The one shape every destructive confirmation in Sotto takes.
+/// Opens the one shape every destructive confirmation in Sotto takes.
 ///
-/// It exists so all three sites read identically, and because the properties that make this a real
-/// confirmation are easy to lose one call site at a time: [`Dialog::confirm`] gives OK **and**
-/// Cancel, refuses to dismiss on an outside click, and drops the close glyph, so the question can
-/// be answered but not missed. `prompt` is the sentence the armed state used to write into the
-/// shell's message strip — it stays word for word, next to the control now instead of at the top
-/// of the window.
-///
-/// `on_ok` runs on confirmation only; returning `true` afterwards closes the dialog. Escape and
-/// Cancel run neither it nor anything else.
-pub(crate) fn confirm_delete_dialog(
-    dialog: Dialog,
+/// Cancel first, then the destructive verb; no outside-click dismiss; no close glyph. Escape and
+/// Cancel close without running `on_ok`. Mounts under `Root` via [`WindowExt::open_alert_dialog`]
+/// — kit AlertDialog disables backdrop dismissal by design.
+pub(crate) fn open_confirm_delete_dialog(
+    window: &mut Window,
+    cx: &mut App,
+    id: &'static str,
     title: &str,
     prompt: &str,
     ok_label: &str,
     on_ok: impl Fn(&mut Window, &mut App) + 'static,
-) -> Dialog {
-    dialog
-        .confirm()
-        .title(title.to_owned())
-        .button_props(
-            DialogButtonProps::default()
-                .ok_text(ok_label.to_owned())
-                .ok_variant(ButtonVariant::Danger)
-                .cancel_text("Cancel"),
-        )
-        // Cancel first, then OK — the order `Dialog::confirm` already lays them out in. This
-        // repeats it only to attach the selectors above; nothing else about the footer changes.
-        .footer(|ok, cancel, window, cx| {
-            vec![
-                div()
-                    .debug_selector(|| CONFIRM_CANCEL_SELECTOR.into())
-                    .child(cancel(window, cx)),
-                div()
-                    .debug_selector(|| CONFIRM_OK_SELECTOR.into())
-                    .child(ok(window, cx)),
-            ]
-        })
-        .on_ok(move |_, window, cx| {
-            on_ok(window, cx);
-            true
-        })
-        .child(prompt.to_owned())
+) {
+    let title = SharedString::from(title.to_owned());
+    let prompt = SharedString::from(prompt.to_owned());
+    let ok_label = SharedString::from(ok_label.to_owned());
+    let on_ok = Rc::new(on_ok);
+    let cancel_id = format!("{id}-cancel");
+    let ok_id = format!("{id}-ok");
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let on_ok = Rc::clone(&on_ok);
+        let ok_label = ok_label.clone();
+        let cancel_id = cancel_id.clone();
+        let ok_id = ok_id.clone();
+        alert
+            .confirm()
+            .title(title.clone())
+            .description(prompt.clone())
+            .footer(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id(CONFIRM_CANCEL_SELECTOR)
+                            .debug_selector(|| CONFIRM_CANCEL_SELECTOR.into())
+                            .child(KitButton::new(cancel_id).label("Cancel").on_click(
+                                |_, window, cx| {
+                                    window.close_dialog(cx);
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id(CONFIRM_OK_SELECTOR)
+                            .debug_selector(|| CONFIRM_OK_SELECTOR.into())
+                            .child(KitButton::new(ok_id).label(ok_label).danger().on_click({
+                                let on_ok = Rc::clone(&on_ok);
+                                move |_, window, cx| {
+                                    on_ok(window, cx);
+                                    window.close_dialog(cx);
+                                }
+                            })),
+                    ),
+            )
+    });
 }
 
 /// The theme the person chose, as it survives a relaunch.
 ///
-/// `gpui_component::init` syncs the theme to the system appearance at launch, so `None` — no
+/// `gpui_kit::init` syncs the theme to the system appearance at launch, so `None` — no
 /// recorded choice — means Sotto keeps following the system. A recorded choice is what makes the
 /// appearance menu a real setting rather than a switch that forgets.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -236,7 +256,7 @@ impl Appearance {
 
 /// The three appearance items, and which one is currently in force.
 ///
-/// GPUI 0.2.2's `MenuItem` exposes no checked state — there is no way to reach `NSMenuItem`'s
+/// gpui-pre's `MenuItem` exposes no checked state — there is no way to reach `NSMenuItem`'s
 /// `state` through it — so the current choice is marked in the item's own text. U+2713 is a
 /// text-presentation codepoint: unlike the trash bin that started T082, no font substitutes a
 /// colour emoji for it, and this is a macOS menu string rather than one of Sotto's controls.
@@ -266,6 +286,31 @@ fn appearance_items(current: Appearance) -> Vec<MenuItem> {
 /// and a typo in a string literal on the launch path is not something to discover by launching.
 pub fn key_bindings() -> Vec<KeyBinding> {
     vec![KeyBinding::new("cmd-,", OpenSettings, None)]
+}
+
+/// App-level key bindings and action listeners that outlive any one window.
+///
+/// ⌘C for markdown selection is bound here as a fallback when window-scoped selection is empty;
+/// `Root` already binds Copy for [`gpui_kit::base::TextSelection`] (see [`selectable`]).
+pub fn install_global_bindings(cx: &mut App) {
+    selectable::bind_copy_keys(cx);
+}
+
+/// Test helpers shared by workspace mounts that host kit Root overlays.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use gpui_kit::VisualTestContext;
+
+    /// Kit Root dialogs animate in. Reduce motion + two draws matches gpui-component's own tests:
+    /// one frame mounts the layer, the next paints it at rest so `debug_bounds` can see footers.
+    pub(crate) fn settle_root_overlays(visual: &mut VisualTestContext) {
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        visual.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+    }
 }
 
 /// Wires the menu-bar actions to the workspace inside `window`.
@@ -368,13 +413,16 @@ pub(crate) fn application_menus(appearance: Appearance) -> Vec<Menu> {
         Menu {
             name: "Sotto".into(),
             items: vec![MenuItem::action("Settings…", OpenSettings)],
+            disabled: false,
         },
         Menu {
             name: "View".into(),
             items: vec![MenuItem::submenu(Menu {
                 name: "Appearance".into(),
                 items: appearance_items(appearance),
+                disabled: false,
             })],
+            disabled: false,
         },
     ]
 }
@@ -456,7 +504,7 @@ pub struct MeetingWorkspace {
     library_filter: Entity<InputState>,
     entry_title_input: Entity<InputState>,
     annotation_input: Entity<InputState>,
-    notes_document_input: Entity<InputState>,
+    notes_document_input: Entity<EditorState>,
     prepared_notes: Vec<String>,
     editing_annotation: Option<notes::AnnotationView>,
     editing_notes_document: bool,
@@ -473,6 +521,7 @@ pub struct MeetingWorkspace {
     /// re-open must not build another.
     settings: Option<Entity<SettingsView>>,
     settings_open: bool,
+    /// Confirm dialog currently open over the shell (delete recording / entry). Rendered last.
     theme: Option<PersistedTheme>,
     live_started_at: Option<Instant>,
     retranscription_running: bool,
@@ -490,6 +539,7 @@ impl MeetingWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        selectable::bind_copy_keys(cx);
         let mut controller = NotesController::new(database.clone());
         let message = controller.refresh_catalogue().err();
         let notes = cx.new(|_| controller);
@@ -505,8 +555,10 @@ impl MeetingWorkspace {
         let annotation_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Add a note to this recording"));
         let notes_document_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .auto_grow(8, 40)
+            EditorState::new(window, cx)
+                .language("markdown")
+                .soft_wrap(true)
+                .line_number(false)
                 .placeholder("Edit the note as markdown")
         });
         let persisted = layout::load_workspace_state(&database);
@@ -517,7 +569,7 @@ impl MeetingWorkspace {
         // A recorded theme choice is applied before the first frame, so the shell never paints one
         // theme and then flips to the other in front of the person who chose it.
         if let Some(theme) = persisted.theme {
-            Theme::change(theme.mode(), Some(window), cx);
+            tokens::apply_theme(theme.mode(), Some(window), cx);
         }
         tokens::install_visible_scrollbars(cx);
         // The menu bar carries the app name, Settings and the appearance switch, so it has to be
@@ -528,7 +580,7 @@ impl MeetingWorkspace {
         let ask_panel = cx.new(|cx| ask::AskPanel::new(window, cx));
         let following_system = cx.entity().downgrade();
         let subscriptions = vec![
-            // "Follow System" has to keep following. `gpui_component::init` reads the system
+            // "Follow System" has to keep following. `gpui_kit::init` reads the system
             // appearance once at launch and never again, so without this the choice would quietly
             // mean "match the system as it was when Sotto started". A recorded Light or Dark
             // choice is left alone: the person asked for a fixed palette.
@@ -537,7 +589,7 @@ impl MeetingWorkspace {
                     .upgrade()
                     .is_some_and(|workspace| workspace.read(cx).theme.is_none());
                 if follows {
-                    Theme::sync_system_appearance(Some(window), cx);
+                    tokens::sync_system_appearance(Some(window), cx);
                 }
             }),
             cx.observe(&reasoning, |this, _, cx| {
@@ -551,29 +603,23 @@ impl MeetingWorkspace {
             cx.observe(&mcp, |_, _, cx| cx.notify()),
             cx.observe(&timeline, |this: &mut Self, _, cx| {
                 if this.transcript_live && this.follow_transcript {
-                    this.transcript_list.scroll_to(gpui::ListOffset {
+                    this.transcript_list.scroll_to(gpui_kit::ListOffset {
                         item_ix: this.transcript_pacer.rows().len(),
                         offset_in_item: px(0.0),
                     });
                 }
                 cx.notify();
             }),
-            cx.subscribe(
-                &library_filter,
-                |this: &mut Self, filter, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        // A search needs somewhere to land. The toolbar keeps the control
-                        // reachable while the rail is collapsed, but the results are rail rows —
-                        // so typing a query restores the rail rather than filtering a list nobody
-                        // can see. Clearing the query deliberately does *not* collapse it again: a
-                        // second unasked-for move is worse than the first.
-                        if this.library_collapsed && !filter.read(cx).value().trim().is_empty() {
-                            this.set_library_collapsed(false);
-                        }
-                        cx.notify();
-                    }
-                },
-            ),
+            // Observe, not only subscribe-to-Change: kit `InputState::set_value` notifies without
+            // emitting `InputEvent::Change`, and a search that lands nowhere is still no search.
+            // Typing also notifies, so one observer covers both paths. Clearing the query
+            // deliberately does *not* collapse the rail again.
+            cx.observe(&library_filter, |this: &mut Self, filter, cx| {
+                if this.library_collapsed && !filter.read(cx).value().trim().is_empty() {
+                    this.set_library_collapsed(false);
+                }
+                cx.notify();
+            }),
             cx.subscribe_in(
                 &annotation_input,
                 window,
@@ -585,9 +631,7 @@ impl MeetingWorkspace {
                         this.submit_prepared_note(window, cx);
                         return;
                     }
-                    if matches!(event, InputEvent::PressEnter { secondary: true })
-                        || matches!(event, InputEvent::PressEnter { secondary: false })
-                    {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
                         this.submit_annotation(window, cx);
                     }
                 },
@@ -806,6 +850,7 @@ impl MeetingWorkspace {
     }
 
     pub(crate) fn select_meeting(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.on_displayed_view_changed(cx);
         self.cancel_pending_ask();
         self.editing_notes_document = false;
         if self.session.read(cx).active_session_id() == Some(id) {
@@ -854,6 +899,7 @@ impl MeetingWorkspace {
             self.select_meeting(session_id, cx);
             return;
         }
+        self.on_displayed_view_changed(cx);
         self.cancel_pending_ask();
         self.clear_ask_selection(cx);
         self.transcript_session = None;
@@ -1039,6 +1085,7 @@ impl MeetingWorkspace {
     }
 
     fn show_live_transcript(&mut self, id: SessionId, cx: &mut Context<Self>) {
+        self.on_displayed_view_changed(cx);
         self.cancel_pending_ask();
         self.clear_ask_selection(cx);
         self.transcript_session = Some(id);
@@ -1060,6 +1107,7 @@ impl MeetingWorkspace {
     /// controller nor the timeline, so a running capture keeps running and its bar, which follows
     /// the lifecycle rather than the stage, keeps Stop one visible action away.
     pub(crate) fn show_home(&mut self, cx: &mut Context<Self>) {
+        self.on_displayed_view_changed(cx);
         self.cancel_pending_ask();
         self.clear_ask_selection(cx);
         self.transcript_session = None;
@@ -1087,9 +1135,18 @@ impl MeetingWorkspace {
 
     pub(crate) fn select_stage_tab(&mut self, tab: StageTab, cx: &mut Context<Self>) {
         if self.stage_tab != tab {
+            self.on_displayed_view_changed(cx);
             self.stage_tab = tab;
             cx.notify();
         }
+    }
+
+    /// Drop retained selectable leaves whenever the displayed recording or stage view changes.
+    ///
+    /// Call from every navigation path that swaps what the stage shows — including live return,
+    /// prepared-entry open, and Home — not only [`Self::select_meeting`].
+    fn on_displayed_view_changed(&mut self, cx: &mut Context<Self>) {
+        selectable::clear_retained(cx);
     }
 
     /// Shows the retained recording in Finder. The file stays where it already lives on this Mac.
@@ -1123,20 +1180,20 @@ impl MeetingWorkspace {
         };
         let prompt = self.delete_prompt(id, cx);
         let workspace = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let workspace = workspace.clone();
-            confirm_delete_dialog(
-                dialog,
-                "Delete recording",
-                &prompt,
-                "Delete",
-                move |_, cx| {
-                    let _ = workspace.update(cx, |workspace, cx| {
-                        workspace.confirm_delete_session(id, cx);
-                    });
-                },
-            )
-        });
+        open_confirm_delete_dialog(
+            window,
+            cx,
+            "delete-recording",
+            "Delete recording",
+            &prompt,
+            "Delete",
+            move |_, cx| {
+                let _ = workspace.update(cx, |workspace, cx| {
+                    workspace.confirm_delete_session(id, cx);
+                });
+            },
+        );
+        cx.notify();
     }
 
     /// Deletes exactly the recording the dialog named — `id` is the one the prompt was written
@@ -1162,6 +1219,7 @@ impl MeetingWorkspace {
             return;
         }
         if self.transcript_session == Some(id) {
+            self.on_displayed_view_changed(cx);
             self.transcript_session = None;
             self.transcript_events.clear();
             self.transcript_pacer.clear();
@@ -1247,20 +1305,20 @@ impl MeetingWorkspace {
             "Delete the entry “{name}”? This removes its {count} recording(s), transcripts, retained media and notes from this Mac."
         );
         let workspace = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
-            let workspace = workspace.clone();
-            confirm_delete_dialog(
-                dialog,
-                "Delete entry",
-                &prompt,
-                "Delete entry",
-                move |_, cx| {
-                    let _ = workspace.update(cx, |workspace, cx| {
-                        workspace.confirm_delete_entry(entry_id, cx);
-                    });
-                },
-            )
-        });
+        open_confirm_delete_dialog(
+            window,
+            cx,
+            "delete-entry",
+            "Delete entry",
+            &prompt,
+            "Delete entry",
+            move |_, cx| {
+                let _ = workspace.update(cx, |workspace, cx| {
+                    workspace.confirm_delete_entry(entry_id, cx);
+                });
+            },
+        );
+        cx.notify();
     }
 
     fn confirm_delete_entry(&mut self, entry_id: EntryId, cx: &mut Context<Self>) {
@@ -1374,7 +1432,7 @@ impl MeetingWorkspace {
         self.follow_transcript = true;
         self.focused_event = None;
         self.clear_ask_selection(cx);
-        self.transcript_list.scroll_to(gpui::ListOffset {
+        self.transcript_list.scroll_to(gpui_kit::ListOffset {
             item_ix: self.transcript_pacer.rows().len(),
             offset_in_item: px(0.0),
         });
@@ -1455,7 +1513,7 @@ impl MeetingWorkspace {
         let workspace = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             loop {
-                Timer::after(std::time::Duration::from_millis(50)).await;
+                cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
                 match receiver.try_recv() {
                     Ok(result) => {
                         let _ = workspace.update(cx, |workspace, cx| {
@@ -1562,10 +1620,10 @@ impl MeetingWorkspace {
 
     /// Applies an appearance chosen from the menu bar, records it, and re-marks the menu.
     ///
-    /// `gpui_component::Theme` is a global that both the shell's tokens and every `gpui_component`
-    /// control resolve against, so changing it repaints the whole window. "Follow System" is not a
-    /// no-op: it adopts the system appearance now and, because the recorded choice is cleared, the
-    /// window's appearance observer keeps following it afterwards.
+    /// Kit `Theme::change` is what both the shell's tokens and every stock control resolve against,
+    /// so changing it repaints the whole window. "Follow System" is not a no-op: it adopts the
+    /// system appearance now and, because the recorded choice is cleared, the window's appearance
+    /// observer keeps following it afterwards.
     pub fn set_appearance(
         &mut self,
         appearance: Appearance,
@@ -1574,8 +1632,8 @@ impl MeetingWorkspace {
     ) {
         self.theme = appearance.persisted();
         match self.theme {
-            Some(theme) => Theme::change(theme.mode(), Some(window), cx),
-            None => Theme::sync_system_appearance(Some(window), cx),
+            Some(theme) => tokens::apply_theme(theme.mode(), Some(window), cx),
+            None => tokens::sync_system_appearance(Some(window), cx),
         }
         tokens::install_visible_scrollbars(cx);
         self.persist_workspace_state();
@@ -1643,7 +1701,7 @@ impl MeetingWorkspace {
         self.settings_open = false;
         // The sheet held focus so Escape reached it. Release it rather than leaving focus parked on
         // an element that is no longer rendered.
-        window.blur();
+        window.blur(cx);
         // Settings can delete retained media, so the shell re-measures what it claims about the
         // library and about the open recording rather than keeping a figure that just stopped
         // being true.
@@ -1690,7 +1748,9 @@ impl MeetingWorkspace {
         let workspace = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
             loop {
-                Timer::after(std::time::Duration::from_secs(1)).await;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
                 if workspace.update(cx, |_, cx| cx.notify()).is_err() {
                     return;
                 }

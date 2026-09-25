@@ -774,7 +774,14 @@ mod tests {
         controller.set_reasoning_enabled(false);
 
         assert!(wait_for_flag(&observed));
-        let _ = controller.poll();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        while std::time::Instant::now() < deadline {
+            let _ = controller.poll();
+            if controller.retired_workers.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert!(controller.retired_workers.is_empty());
         assert_eq!(controller.snapshot().state, NotesState::Disabled);
         Ok(())

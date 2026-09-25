@@ -11,7 +11,7 @@ use std::{
 };
 
 use futures_util::StreamExt;
-use gpui::Context;
+use gpui_kit::Context;
 use providers::{
     AuthStatus, BackendDescriptor, BackendId, CODEX_CLI_BACKEND_ID, OPENAI_RESPONSES_BACKEND_ID,
     ReasoningSurface, Registry, RegistryError, ResolvedBackend,
@@ -1239,7 +1239,7 @@ mod tests {
     };
 
     use futures_util::stream;
-    use gpui::{AppContext, Subscription, TestAppContext};
+    use gpui_kit::{AppContext, Subscription, TestAppContext};
     use secrecy::{ExposeSecret, SecretString};
 
     use super::persistence::SETTINGS_FILE_NAME;

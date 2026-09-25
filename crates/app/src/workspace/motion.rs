@@ -12,15 +12,17 @@
 
 use std::time::Duration;
 
-use gpui::{
+use gpui_kit::component::progress::Progress;
+use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, Div, ElementId, IntoElement, ParentElement as _,
-    Styled as _, div, ease_in_out, ease_out_quint, pulsating_between, px, relative,
+    Styled as _, div, ease_out_quint, pulsating_between, px,
 };
 
 use super::tokens::WorkspaceTokens;
 
 const ENTER: Duration = Duration::from_millis(240);
 const PULSE: Duration = Duration::from_millis(1600);
+#[cfg(test)]
 const SWEEP: Duration = Duration::from_millis(1400);
 
 /// Fade a newly mounted surface in. The id must change when the *occasion* changes — a second
@@ -76,44 +78,17 @@ pub(crate) fn live_pulse(dot: Div) -> impl IntoElement {
     )
 }
 
-/// Determinate bar for a known fraction, 0..=1. Width follows the measurement; no looping.
-pub(crate) fn measured_progress(fraction: f32, tokens: WorkspaceTokens) -> AnyElement {
+/// Determinate bar for a known fraction, 0..=1. Kit [`Progress`] owns the paint (ADR-0025).
+pub(crate) fn measured_progress(fraction: f32, _tokens: WorkspaceTokens) -> AnyElement {
     let fraction = fraction.clamp(0.0, 1.0);
-    track(tokens)
-        .child(
-            div()
-                .h_full()
-                .rounded_full()
-                .bg(tokens.accent)
-                .w(relative(fraction)),
-        )
+    Progress::new("measured-progress")
+        .value(fraction * 100.0)
         .into_any_element()
 }
 
-/// Indeterminate bar: a segment sweeps while work is happening and we cannot say how much is left.
-pub(crate) fn writing_progress(id: impl Into<ElementId>, tokens: WorkspaceTokens) -> AnyElement {
-    track(tokens)
-        .child(
-            div()
-                .h_full()
-                .rounded_full()
-                .bg(tokens.accent)
-                .with_animation(
-                    id,
-                    Animation::new(SWEEP).repeat().with_easing(ease_in_out),
-                    |this, delta| this.w(relative(0.36)).ml(relative(delta * 0.64)),
-                ),
-        )
-        .into_any_element()
-}
-
-fn track(tokens: WorkspaceTokens) -> Div {
-    div()
-        .h(px(3.0))
-        .w_full()
-        .rounded_full()
-        .overflow_hidden()
-        .bg(tokens.accent_wash)
+/// Indeterminate bar while work is running and the fraction is unknown.
+pub(crate) fn writing_progress(id: impl Into<ElementId>, _tokens: WorkspaceTokens) -> AnyElement {
+    Progress::new(id).loading(true).into_any_element()
 }
 
 #[cfg(test)]

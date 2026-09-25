@@ -19,16 +19,10 @@
 
 use std::{collections::BTreeSet, sync::mpsc};
 
-use gpui::{
+use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::{
     Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, Render, Window,
     div, prelude::*, px,
-};
-use gpui_component::{
-    Disableable, Selectable as _, Sizable as _,
-    button::ButtonVariants as _,
-    dock::{Panel, PanelEvent},
-    input::{Input, InputEvent, InputState},
-    scroll::ScrollableElement,
 };
 use insight::{AskCitation, AskEngine, AskEvidence, AskReply, AskResult, AskTurn};
 use providers::{CODEX_CLI_BACKEND_ID, OPENAI_RESPONSES_BACKEND_ID, ReasoningSurface};
@@ -38,6 +32,7 @@ use sotto_core::{CancellationToken, EventId, SessionId};
 use super::{
     Button, MeetingWorkspace,
     control_row::{ControlRole, ControlRow},
+    input::Input,
     motion, notes,
     tokens::{Space, TypeScale, WorkspaceTokens},
     transcript,
@@ -45,7 +40,7 @@ use super::{
 use crate::reasoning::inspection::{ScreenInspectorAssembly, product_screen_inspectors};
 
 #[cfg(test)]
-const MIN_ASK_PANEL_WIDTH: gpui::Pixels = gpui::px(300.0);
+const MIN_ASK_PANEL_WIDTH: gpui_kit::Pixels = gpui_kit::px(300.0);
 
 /// What a question is answered from. The person picks; nothing picks for them silently.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -114,8 +109,11 @@ impl AskPanel {
         // The placeholder names the default scope, not the open note. Ask answers from the library
         // unless the person narrows it, and a prompt that says "this recording" while the panel is
         // set to all of them is the app telling on itself.
-        let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Ask about your recordings"));
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx);
+            input.set_placeholder("Ask about your recordings", window, cx);
+            input
+        });
         cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.emit_submit(cx);
@@ -403,7 +401,7 @@ impl Render for AskPanel {
             .flex_col()
             .bg(tokens.surface)
             .text_color(tokens.ink)
-            .text_size(TypeScale::CONTROL)
+            .text_size(TypeScale::control(&tokens))
             .child(
                 div()
                     .flex_none()
@@ -412,20 +410,22 @@ impl Render for AskPanel {
                     .pb(px(8.0))
                     .child(
                         div()
-                            .text_size(TypeScale::CONTROL)
+                            .text_size(TypeScale::control(&tokens))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Ask"),
                     ),
             )
             .child(
                 div()
+                    .id("ask-panel-scroll")
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
-                    .overflow_y_scrollbar()
+                    .id("ask-scroll-1")
+                    .overflow_y_scroll()
                     .px(px(14.0))
                     .pb(px(14.0))
-                    .text_size(TypeScale::CONTROL)
+                    .text_size(TypeScale::control(&tokens))
                     // Two peers, not a toggle that renames itself. A control labelled "Use all recordings"
                     // never says which scope is *current* — you have to infer it from the label of the
                     // thing you would switch to. Both scopes are always shown, and the selected one is
@@ -486,7 +486,7 @@ impl Render for AskPanel {
                             .child(
                                 ControlRole::Ellipsizing,
                                 div()
-                                    .text_size(TypeScale::CONTROL)
+                                    .text_size(TypeScale::control(&tokens))
                                     .text_color(tokens.muted)
                                     .child(selection.label.clone()),
                             )
@@ -512,7 +512,7 @@ impl Render for AskPanel {
                     .child(
                         div()
                             .mt_1()
-                            .text_size(TypeScale::CONTROL)
+                            .text_size(TypeScale::control(&tokens))
                             .text_color(tokens.muted)
                             .debug_selector(|| "ask-scope-line".into())
                             .child(scope),
@@ -521,7 +521,7 @@ impl Render for AskPanel {
                         view.child(
                             div()
                                 .mt(Space::MD)
-                                .text_size(TypeScale::CONTROL)
+                                .text_size(TypeScale::control(&tokens))
                                 .text_color(tokens.muted)
                                 .child(reason),
                         )
@@ -542,7 +542,7 @@ impl Render for AskPanel {
                         view.child(
                             div()
                                 .mt_3()
-                                .text_size(TypeScale::CONTROL)
+                                .text_size(TypeScale::control(&tokens))
                                 .text_color(tokens.faint)
                                 .child(notice),
                         )
@@ -605,7 +605,7 @@ fn render_turn(
     turn: &AskTurn,
     receipt_revealed: bool,
     cx: &mut Context<AskPanel>,
-) -> gpui::AnyElement {
+) -> gpui_kit::AnyElement {
     let tokens = WorkspaceTokens::resolve(cx);
     let answer = match &turn.reply {
         AskReply::Refusal { reason, covered } => div()
@@ -666,7 +666,7 @@ fn render_turn(
                     div().children(turn.screen_consultations.iter().map(|entry| {
                         div()
                             .mt_1()
-                            .text_size(TypeScale::CONTROL)
+                            .text_size(TypeScale::control(&tokens))
                             .text_color(tokens.faint)
                             .child(entry.describe())
                     }))
@@ -676,30 +676,11 @@ fn render_turn(
 }
 
 impl EventEmitter<AskPanelEvent> for AskPanel {}
-impl EventEmitter<PanelEvent> for AskPanel {}
 impl Focusable for AskPanel {
-    fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
+    fn focus_handle(&self, _: &gpui_kit::App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
-impl Panel for AskPanel {
-    fn panel_name(&self) -> &'static str {
-        "SottoAskPanel"
-    }
-    fn tab_name(&self, _: &gpui::App) -> Option<gpui::SharedString> {
-        Some("Ask".into())
-    }
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        "Ask"
-    }
-    fn closable(&self, _: &gpui::App) -> bool {
-        false
-    }
-    fn zoomable(&self, _: &gpui::App) -> Option<gpui_component::dock::PanelControl> {
-        None
-    }
-}
-
 impl MeetingWorkspace {
     /// Runs one question against whichever scope the panel is showing.
     ///
@@ -1036,7 +1017,7 @@ async fn retained_evidence(
 
 #[cfg(test)]
 mod layout_tests {
-    use gpui::{TestAppContext, px, size};
+    use gpui_kit::{TestAppContext, px, size};
     use sotto_core::{EventId, SessionId};
 
     use super::{AskPanel, AskScope, AskSelection, MIN_ASK_PANEL_WIDTH, scope_line};
@@ -1122,7 +1103,7 @@ mod layout_tests {
     #[test]
     fn selection_is_never_default_and_clearing_it_restores_the_previous_scope() {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let (panel, visual) = cx.add_window_view(AskPanel::new);
         visual.update(|_, cx| {
             panel.update(cx, |panel, _| {
@@ -1150,7 +1131,7 @@ mod layout_tests {
     fn narrow_ask_panel_keeps_both_scopes_and_submit_inside_bounds()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let (panel, visual) = cx.add_window_view(AskPanel::new);
         visual.update(|_, cx| {
             panel.update(cx, |panel, _| panel.set_selection(Some(selection())));
@@ -1192,7 +1173,7 @@ mod layout_tests {
     fn the_scope_controls_never_sit_on_the_line_that_qualifies_them()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         let (panel, visual) = cx.add_window_view(AskPanel::new);
         visual.update(|_, cx| {
             panel.update(cx, |panel, _| panel.set_selection(Some(selection())));

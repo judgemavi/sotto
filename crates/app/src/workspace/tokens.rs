@@ -1,61 +1,46 @@
-//! Theme-resolved workspace design tokens for the quiet-page visual system.
+//! Theme-resolved workspace design tokens for meeting-specific surfaces.
 //!
-//! `docs/design/workspace-v4-mock.html` is the direction: a readable notebook for everyday use,
-//! not an engineering console. Field names still follow the older mocks so existing callers keep
-//! compiling; the hex values moved together in both appearances so one theme cannot paint the
-//! other's ink.
-//!
-//! - `surface_2` is the raised/hovered variant of `surface`.
-//! - `ink_2` is the mid-weight body ink.
-//! - `accent_on` and `live_on` are the inks that sit *on* those fills. CSS would inherit; GPUI
-//!   must be told.
+//! Chrome uses stock Longbridge components and their theme. Custom transcript / notes / capture
+//! rendering reads the same tokens through [`WorkspaceTokens::resolve`] so Sotto does not keep a
+//! parallel hex palette (ADR-0025). Field names match older call sites; values come from
+//! `cx.theme()`.
 
-use std::rc::Rc;
-
-use gpui::{
-    AnyView, App, Context, FocusHandle, IntoElement, Pixels, Render, Rgba, Window, div, prelude::*,
-    px, rgb, rgba,
+use gpui_kit::component::{ActiveTheme as _, Root, Theme, ThemeMode, scroll::ScrollbarMode};
+use gpui_kit::{
+    AnyView, App, Context, FocusHandle, Hsla, IntoElement, Pixels, Render, SharedString, Window,
+    div, prelude::*, px,
 };
-use gpui_component::{ActiveTheme as _, Theme};
 
-// The component library applies 20% alpha to this token. Black-on-light and white-on-dark retain
-// the greatest possible edge contrast after that fixed alpha is applied.
-const LIGHT_FOCUS_RING: &str = "#000000";
-const DARK_FOCUS_RING: &str = "#FFFFFF";
+/// Apply Light or Dark. Call after init and whenever the appearance menu picks a fixed mode.
+pub(crate) fn apply_theme(mode: ThemeMode, window: Option<&mut Window>, cx: &mut App) {
+    Theme::change(mode, window, cx);
+    install_visible_scrollbars(cx);
+}
 
-/// Installs Sotto's focus colour into both component-theme appearances.
-///
-/// `gpui-component` owns the geometry of its button focus ring, but its default ring colour is
-/// unrelated to Sotto's surfaces and is drawn at 20% alpha. Keeping the colour in both stored
-/// theme configurations matters: [`Theme::change`] reapplies one of those configurations whenever
-/// the person switches appearance, so changing only the active colour would repair one frame and
-/// lose the indicator at the next switch.
-pub(crate) fn install_component_focus_ring(cx: &mut App) {
-    let theme = Theme::global_mut(cx);
-    Rc::make_mut(&mut theme.light_theme).colors.ring = Some(LIGHT_FOCUS_RING.into());
-    Rc::make_mut(&mut theme.dark_theme).colors.ring = Some(DARK_FOCUS_RING.into());
-    theme.colors.ring = if theme.is_dark() {
-        rgb(0xffffff).into()
-    } else {
-        rgb(0x000000).into()
-    };
+/// Follow the OS appearance. `None` recorded choice at launch means this path.
+pub(crate) fn sync_system_appearance(window: Option<&mut Window>, cx: &mut App) {
+    Theme::sync_system_appearance(window, cx);
+    install_visible_scrollbars(cx);
 }
 
 /// Overlay scrollbars stay visible so a long transcript or notes column can be judged at a glance.
 ///
-/// `gpui_component::init` copies macOS "Show scroll bars: When scrolling", which fades the thumb
-/// after idle. That hides how much of the recording is off-screen. Appearance changes do not
-/// reset this; call it after init and after any `Theme::change` that might rebuild the global.
+/// Kit init may copy macOS "Show scroll bars: When scrolling", which fades the thumb after idle.
+/// Appearance changes can re-sync that preference; call this after init and after theme changes.
 pub(crate) fn install_visible_scrollbars(cx: &mut App) {
-    Theme::global_mut(cx).scrollbar_show = gpui_component::scroll::ScrollbarShow::Always;
+    Theme::set_scrollbar_mode(ScrollbarMode::Always, cx);
 }
 
-/// Non-tab-stop focus origin which lets the first Tab enter `gpui-component::Root`'s key context.
+/// No-op retained for call sites that previously painted a Sotto focus ring into the theme.
 ///
-/// GPUI dispatches a key through the focused node's ancestry. With no focused node, Root's Tab
-/// action is never reached, even though the frame contains tab stops. This wrapper is focused when
-/// the window is built and sits between Root and the workspace, so the first Tab reaches Root and
-/// moves to the first real control without presenting the origin itself as a stop.
+/// Stock Longbridge focus rings are the product look now (ADR-0025).
+pub(crate) fn install_component_focus_ring(_cx: &mut App) {}
+
+/// Non-tab-stop focus origin so the first Tab reaches a real control under `Root`.
+///
+/// GPUI dispatches keys through the focused node's ancestry. With nothing focused, Tab never
+/// reaches a listener even though the frame contains tab stops. This wrapper is focused when the
+/// window is built and sits between `Root` and the workspace.
 pub struct KeyboardRoot {
     focus_handle: FocusHandle,
     view: AnyView,
@@ -64,8 +49,9 @@ pub struct KeyboardRoot {
 impl KeyboardRoot {
     #[must_use]
     pub fn new(view: impl Into<AnyView>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        crate::workspace::selectable::bind_copy_keys(cx);
         let focus_handle = cx.focus_handle();
-        window.focus(&focus_handle);
+        window.focus(&focus_handle, cx);
         Self {
             focus_handle,
             view: view.into(),
@@ -79,103 +65,128 @@ impl KeyboardRoot {
 }
 
 impl Render for KeyboardRoot {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Kit Root stores dialog/sheet/notification state but does not paint those layers itself;
+        // the window's content view must (gpui-kit overlays contract, ADR-0025).
+        let dialogs = Root::render_dialog_layer(window, cx);
+        let sheets = Root::render_sheet_layer(window, cx);
+        let notifications = Root::render_notification_layer(window, cx);
         div()
             .size_full()
             .track_focus(&self.focus_handle)
             .child(self.view.clone())
+            .children(sheets)
+            .children(dialogs)
+            .children(notifications)
     }
 }
 
+/// Colours for meeting-specific surfaces, mapped from the active Longbridge theme.
+///
+/// Not a private palette: every field is a theme token (or a close semantic neighbour). Prefer
+/// reading `cx.theme()` directly in new code; this struct exists so existing layout call sites
+/// keep compiling while chrome moves onto stock components.
 #[derive(Clone, Copy)]
 #[expect(
     dead_code,
-    reason = "complete normative palette remains centralized for gradual component adoption"
+    reason = "complete token surface remains centralized for gradual call-site adoption"
 )]
 pub(crate) struct WorkspaceTokens {
-    pub(crate) ground: Rgba,
-    pub(crate) surface: Rgba,
-    pub(crate) surface_2: Rgba,
-    pub(crate) sunken: Rgba,
-    pub(crate) line: Rgba,
-    pub(crate) line_soft: Rgba,
-    pub(crate) ink: Rgba,
-    pub(crate) ink_2: Rgba,
-    pub(crate) muted: Rgba,
-    pub(crate) faint: Rgba,
-    /// Opaque inset focus border: maximum contrast for the active appearance.
-    pub(crate) focus: Rgba,
-    pub(crate) accent: Rgba,
-    pub(crate) accent_ink: Rgba,
-    pub(crate) accent_on: Rgba,
-    pub(crate) accent_wash: Rgba,
-    pub(crate) accent_line: Rgba,
-    pub(crate) live: Rgba,
-    pub(crate) live_ink: Rgba,
-    pub(crate) live_on: Rgba,
-    pub(crate) live_wash: Rgba,
-    pub(crate) live_line: Rgba,
-    pub(crate) warn: Rgba,
-    pub(crate) warn_wash: Rgba,
-    pub(crate) scrim: Rgba,
+    pub(crate) ground: Hsla,
+    pub(crate) surface: Hsla,
+    pub(crate) surface_2: Hsla,
+    pub(crate) sunken: Hsla,
+    pub(crate) line: Hsla,
+    pub(crate) line_soft: Hsla,
+    pub(crate) ink: Hsla,
+    pub(crate) ink_2: Hsla,
+    pub(crate) muted: Hsla,
+    pub(crate) faint: Hsla,
+    /// Kit foreground paired with the accent surface used by highlights and the capture bar.
+    pub(crate) ink_on_wash: Hsla,
+    /// Keep small highlight metadata on the same accessible foreground as body text.
+    pub(crate) muted_on_wash: Hsla,
+    pub(crate) focus: Hsla,
+    pub(crate) accent: Hsla,
+    pub(crate) accent_ink: Hsla,
+    pub(crate) accent_on: Hsla,
+    pub(crate) accent_wash: Hsla,
+    pub(crate) accent_line: Hsla,
+    pub(crate) live: Hsla,
+    pub(crate) live_ink: Hsla,
+    pub(crate) live_on: Hsla,
+    pub(crate) live_wash: Hsla,
+    pub(crate) live_line: Hsla,
+    pub(crate) warn: Hsla,
+    pub(crate) warn_line: Hsla,
+    pub(crate) warn_wash: Hsla,
+    pub(crate) scrim: Hsla,
+    /// Kit typography ladder (ADR-0025) — meeting surfaces read these instead of a private scale.
+    pub(crate) text_meta: Pixels,
+    pub(crate) text_chip: Pixels,
+    pub(crate) text_control: Pixels,
+    pub(crate) text_body: Pixels,
+    pub(crate) text_lede: Pixels,
+    pub(crate) text_title: Pixels,
+    pub(crate) text_clock: Pixels,
+    pub(crate) text_display: Pixels,
 }
 
 impl WorkspaceTokens {
     pub(crate) fn resolve(cx: &App) -> Self {
-        if cx.theme().is_dark() {
-            Self {
-                ground: rgb(0x16141c),
-                surface: rgb(0x1e1b26),
-                surface_2: rgb(0x252230),
-                sunken: rgb(0x121018),
-                line: rgb(0x2f2b3a),
-                line_soft: rgb(0x272430),
-                ink: rgb(0xf4f1f8),
-                ink_2: rgb(0xcfc8dc),
-                muted: rgb(0xb7b1c4),
-                faint: rgb(0x8a8498),
-                focus: rgb(0xffffff),
-                accent: rgb(0xc8b6ee),
-                accent_ink: rgb(0xd4c6f4),
-                accent_on: rgb(0x1c1924),
-                accent_wash: rgb(0x2a2438),
-                accent_line: rgb(0x4a3f68),
-                live: rgb(0xf07a70),
-                live_ink: rgb(0xf49a93),
-                live_on: rgb(0x2a0f0c),
-                live_wash: rgb(0x3a2220),
-                live_line: rgb(0x63302a),
-                warn: rgb(0xe0b07a),
-                warn_wash: rgb(0x32261a),
-                scrim: rgba(0x00000099),
-            }
-        } else {
-            Self {
-                ground: rgb(0xf3f2f7),
-                surface: rgb(0xfffdff),
-                surface_2: rgb(0xf7f6fb),
-                sunken: rgb(0xeeeaf4),
-                line: rgb(0xe4e1eb),
-                line_soft: rgb(0xeceaf1),
-                ink: rgb(0x1c1924),
-                ink_2: rgb(0x3d3848),
-                muted: rgb(0x5f5a6a),
-                faint: rgb(0x8b8696),
-                focus: rgb(0x000000),
-                accent: rgb(0x5a4588),
-                accent_ink: rgb(0x4b3874),
-                accent_on: rgb(0xffffff),
-                accent_wash: rgb(0xede8f6),
-                accent_line: rgb(0xd4cce8),
-                live: rgb(0xc94b40),
-                live_ink: rgb(0xb43e35),
-                live_on: rgb(0xffffff),
-                live_wash: rgb(0xfbedec),
-                live_line: rgb(0xf0c7c3),
-                warn: rgb(0x8a5a28),
-                warn_wash: rgb(0xf7eedf),
-                scrim: rgba(0x1c19245c),
-            }
+        let theme = cx.theme();
+        let typo = theme.typography_tokens();
+        // Use kit surface/foreground pairs unchanged in both appearances. Status colour belongs
+        // on indicators and borders, not on small labels or a privately generated light wash.
+        Self {
+            ground: theme.background,
+            surface: theme.secondary,
+            surface_2: theme.list_hover,
+            sunken: theme.input,
+            line: theme.border,
+            line_soft: theme.border,
+            ink: theme.foreground,
+            ink_2: theme.muted_foreground,
+            muted: theme.muted_foreground,
+            faint: theme.muted_foreground,
+            ink_on_wash: theme.accent_foreground,
+            muted_on_wash: theme.accent_foreground,
+            focus: theme.ring,
+            accent: theme.accent,
+            accent_ink: theme.foreground,
+            // Text on a solid accent fill.
+            accent_on: theme.accent_foreground,
+            accent_wash: theme.accent,
+            accent_line: theme.border,
+            live: theme.danger,
+            live_ink: theme.accent_foreground,
+            // Text on a solid live/danger fill.
+            live_on: theme.danger_foreground,
+            live_wash: theme.accent,
+            live_line: theme.danger,
+            warn: theme.foreground,
+            warn_line: theme.warning,
+            warn_wash: theme.background,
+            scrim: theme.overlay,
+            text_meta: typo.xs.size,
+            text_chip: typo.sm.size,
+            text_control: theme.font_size,
+            text_body: typo.md.size,
+            text_lede: typo.lg.size,
+            text_title: typo.lg.size,
+            text_clock: typo.xl.size,
+            text_display: typo.xl.size,
+        }
+    }
+
+    /// Body and metadata use the kit foreground paired with the highlight surface.
+    pub(crate) fn for_highlight(self) -> Self {
+        Self {
+            ink: self.ink_on_wash,
+            ink_2: self.muted_on_wash,
+            muted: self.muted_on_wash,
+            faint: self.muted_on_wash,
+            ..self
         }
     }
 }
@@ -183,21 +194,43 @@ impl WorkspaceTokens {
 pub(crate) struct TypeScale;
 
 impl TypeScale {
-    /// Eyebrows, chips, timecodes and other measured metadata.
-    pub(crate) const META: Pixels = px(12.0);
-    /// Scope chips and the capture bar's recording kind.
-    pub(crate) const CHIP: Pixels = px(12.5);
-    /// Buttons, Ask copy, and other chrome that should share one size.
-    pub(crate) const CONTROL: Pixels = px(14.0);
-    pub(crate) const BODY: Pixels = px(15.0);
-    /// Home lede and the primary Capture label.
-    pub(crate) const LEDE: Pixels = px(16.0);
-    /// The open session's title in the view bar.
-    pub(crate) const TITLE: Pixels = px(17.0);
-    pub(crate) const CLOCK: Pixels = px(22.0);
-    /// Home headline. macOS ships New York; elsewhere GPUI falls back.
-    pub(crate) const DISPLAY: Pixels = px(34.0);
-    pub(crate) const READING: &'static str = "New York";
+    /// Thin aliases onto [`WorkspaceTokens`] typography fields (kit ladder, ADR-0025).
+    pub(crate) fn meta(tokens: &WorkspaceTokens) -> Pixels {
+        tokens.text_meta
+    }
+
+    pub(crate) fn chip(tokens: &WorkspaceTokens) -> Pixels {
+        tokens.text_chip
+    }
+
+    pub(crate) fn control(tokens: &WorkspaceTokens) -> Pixels {
+        tokens.text_control
+    }
+
+    pub(crate) fn body(tokens: &WorkspaceTokens) -> Pixels {
+        tokens.text_body
+    }
+
+    pub(crate) fn lede(tokens: &WorkspaceTokens) -> Pixels {
+        tokens.text_lede
+    }
+
+    pub(crate) fn title(tokens: &WorkspaceTokens) -> Pixels {
+        tokens.text_title
+    }
+
+    pub(crate) fn clock(tokens: &WorkspaceTokens) -> Pixels {
+        tokens.text_clock
+    }
+
+    pub(crate) fn display(tokens: &WorkspaceTokens) -> Pixels {
+        tokens.text_display
+    }
+
+    /// Kit monospace family from the active theme (resolved at init; never hardcode Menlo).
+    pub(crate) fn mono(cx: &App) -> SharedString {
+        cx.theme().mono_font_family.clone()
+    }
 }
 
 pub(crate) struct Space;
@@ -209,136 +242,155 @@ impl Space {
     pub(crate) const LG: Pixels = px(16.0);
 }
 
+/// WCAG 2.x relative luminance from linearized sRGB (not HSL lightness).
 #[cfg(test)]
-mod tests {
-    use std::{cell::Cell, ops::Deref as _, rc::Rc};
-
-    use gpui::{
-        Bounds, Context, IntoElement, Render, TestAppContext, VisualTestContext, Window,
-        WindowBounds, WindowOptions, div, point, prelude::*, px, size,
-    };
-    use gpui_component::{Root, Theme, ThemeMode, button::Button};
-
-    use super::{DARK_FOCUS_RING, KeyboardRoot, LIGHT_FOCUS_RING, install_component_focus_ring};
-
-    struct KeyboardProbe {
-        activated: Rc<Cell<bool>>,
-    }
-
-    impl Render for KeyboardProbe {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let activated = Rc::clone(&self.activated);
-            div()
-                .child(crate::workspace::notes::evidence_control(
-                    "keyboard-probe".into(),
-                    "keyboard-probe".to_owned(),
-                    "Show timecodes".to_owned(),
-                    "Show or hide timecodes",
-                    super::WorkspaceTokens::resolve(cx),
-                    move |_| activated.set(true),
-                ))
-                .child(Button::new("keyboard-probe-second").label("Edit note"))
+fn relative_luminance(color: Hsla) -> f32 {
+    let rgb = color.to_rgb();
+    fn linearize(channel: f32) -> f32 {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
         }
     }
+    0.2126 * linearize(rgb.r) + 0.7152 * linearize(rgb.g) + 0.0722 * linearize(rgb.b)
+}
 
-    #[test]
-    fn focus_tokens_survive_both_appearance_changes() -> Result<(), Box<dyn std::error::Error>> {
-        let cx = TestAppContext::single();
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            install_component_focus_ring(cx);
-            assert_eq!(
-                Theme::global(cx)
-                    .light_theme
-                    .colors
-                    .ring
-                    .as_ref()
-                    .map(AsRef::as_ref),
-                Some(LIGHT_FOCUS_RING)
-            );
-            assert_eq!(
-                Theme::global(cx)
-                    .dark_theme
-                    .colors
-                    .ring
-                    .as_ref()
-                    .map(AsRef::as_ref),
-                Some(DARK_FOCUS_RING)
-            );
-            Theme::change(ThemeMode::Dark, None, cx);
-            assert_eq!(Theme::global(cx).colors.ring, gpui::rgb(0xffffff).into());
-            Theme::change(ThemeMode::Light, None, cx);
-            assert_eq!(Theme::global(cx).colors.ring, gpui::rgb(0x000000).into());
-        });
-        Ok(())
-    }
+/// WCAG contrast ratio `(L1 + 0.05) / (L2 + 0.05)` using relative luminance.
+#[cfg(test)]
+fn contrast_ratio(fg: Hsla, bg: Hsla) -> f32 {
+    let l1 = relative_luminance(fg);
+    let l2 = relative_luminance(bg);
+    let (hi, lo) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
+}
 
-    #[test]
-    fn scrollbars_stay_visible_across_appearance_changes() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let cx = TestAppContext::single();
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            super::install_visible_scrollbars(cx);
-            assert_eq!(
-                Theme::global(cx).scrollbar_show,
-                gpui_component::scroll::ScrollbarShow::Always
-            );
-            Theme::change(ThemeMode::Dark, None, cx);
-            super::install_visible_scrollbars(cx);
-            assert_eq!(
-                Theme::global(cx).scrollbar_show,
-                gpui_component::scroll::ScrollbarShow::Always
-            );
-            Theme::change(ThemeMode::Light, None, cx);
-            super::install_visible_scrollbars(cx);
-            assert_eq!(
-                Theme::global(cx).scrollbar_show,
-                gpui_component::scroll::ScrollbarShow::Always
-            );
-        });
-        Ok(())
-    }
+#[cfg(test)]
+mod tests {
+    use gpui_kit::Hsla;
+    use gpui_kit::TestAppContext;
+    use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, scroll::ScrollbarMode};
 
-    #[test]
-    fn root_tab_focus_reaches_a_real_button_and_enter_bubbles_to_its_handler()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let cx = TestAppContext::single();
-        let activated = Rc::new(Cell::new(false));
-        let probe = Rc::clone(&activated);
-        let handle = cx.update(|cx| {
-            gpui_component::init(cx);
-            install_component_focus_ring(cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds {
-                        origin: point(px(0.0), px(0.0)),
-                        size: size(px(320.0), px(180.0)),
-                    })),
-                    ..WindowOptions::default()
-                },
-                move |window, cx| {
-                    let view = cx.new(|_| KeyboardProbe { activated: probe });
-                    let keyboard_root = cx.new(|cx| KeyboardRoot::new(view, window, cx));
-                    cx.new(|cx| Root::new(keyboard_root, window, cx))
-                },
-            )
-        })?;
-        let visual = VisualTestContext::from_window(*handle.deref(), &cx).into_mut();
-        visual.update(|window, _| window.activate_window());
-        visual.run_until_parked();
-        let origin = visual.update(|window, cx| format!("{:?}", window.focused(cx)));
-        visual.simulate_keystrokes("tab");
-        let first = visual.update(|window, cx| format!("{:?}", window.focused(cx)));
-        assert_ne!(first, origin, "Tab must leave the non-stop focus origin");
-        visual.simulate_keystrokes("enter");
+    use super::{
+        contrast_ratio, install_visible_scrollbars, relative_luminance, sync_system_appearance,
+    };
+
+    #[gpui_kit::test]
+    fn relative_luminance_matches_wcag_reference_points() {
+        let black = Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.0,
+            a: 1.0,
+        };
+        let white = Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 1.0,
+            a: 1.0,
+        };
         assert!(
-            activated.get(),
-            "the focused button's ancestor must receive Enter"
+            (relative_luminance(black) - 0.0).abs() < 1e-5,
+            "black luminance"
         );
-        visual.simulate_keystrokes("shift-tab");
-        let previous = visual.update(|window, cx| format!("{:?}", window.focused(cx)));
-        assert_ne!(previous, first, "Shift-Tab must move to the prior control");
-        Ok(())
+        assert!(
+            (relative_luminance(white) - 1.0).abs() < 1e-5,
+            "white luminance"
+        );
+        // Pure mid-gray in HSL is not 0.5 relative luminance — HSL L must not be used as a proxy.
+        let mid_gray = Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.5,
+            a: 1.0,
+        };
+        let mid_l = relative_luminance(mid_gray);
+        assert!(
+            (mid_l - 0.5).abs() > 0.05,
+            "HSL L=0.5 must not equal relative luminance (got {mid_l})"
+        );
+        assert!(
+            (contrast_ratio(black, white) - 21.0).abs() < 0.05,
+            "black on white must be ~21:1"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn visible_scrollbars_survive_theme_changes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install_visible_scrollbars(cx);
+            assert_eq!(Theme::global(cx).scrollbar_mode, ScrollbarMode::Always);
+            Theme::change(ThemeMode::Dark, None, cx);
+            install_visible_scrollbars(cx);
+            assert_eq!(Theme::global(cx).scrollbar_mode, ScrollbarMode::Always);
+            Theme::change(ThemeMode::Light, None, cx);
+            install_visible_scrollbars(cx);
+            assert_eq!(Theme::global(cx).scrollbar_mode, ScrollbarMode::Always);
+            sync_system_appearance(None, cx);
+            assert_eq!(Theme::global(cx).scrollbar_mode, ScrollbarMode::Always);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn resolve_reads_active_theme_tokens(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            for mode in [ThemeMode::Light, ThemeMode::Dark] {
+                Theme::change(mode, None, cx);
+                let tokens = super::WorkspaceTokens::resolve(cx);
+                assert_eq!(tokens.ground, cx.theme().background);
+                assert_eq!(tokens.ink, cx.theme().foreground);
+                assert_eq!(tokens.live, cx.theme().danger);
+                assert_eq!(tokens.accent_wash, cx.theme().accent);
+                assert_eq!(tokens.live_wash, cx.theme().accent);
+                assert_eq!(tokens.ink_on_wash, cx.theme().accent_foreground);
+                assert_eq!(tokens.muted_on_wash, cx.theme().accent_foreground);
+                assert_eq!(tokens.warn_wash, cx.theme().background);
+                assert_eq!(tokens.warn_line, cx.theme().warning);
+                assert_eq!(tokens.line_soft, cx.theme().border);
+                // Fills must not be reused as body text on ground.
+                assert_ne!(
+                    tokens.accent_ink,
+                    cx.theme().accent,
+                    "{mode:?}: accent_ink must not be the accent fill"
+                );
+                // WCAG normal-text floor (4.5:1), including small highlight metadata.
+                assert!(
+                    contrast_ratio(tokens.accent_ink, tokens.ground) >= 4.5,
+                    "{mode:?}: accent_ink on ground contrast too low ({:.2})",
+                    contrast_ratio(tokens.accent_ink, tokens.ground)
+                );
+                assert!(
+                    contrast_ratio(tokens.live_ink, tokens.live_wash) >= 4.5,
+                    "{mode:?}: live_ink on live_wash contrast too low ({:.2})",
+                    contrast_ratio(tokens.live_ink, tokens.live_wash)
+                );
+                assert!(
+                    contrast_ratio(tokens.warn, tokens.warn_wash) >= 4.5,
+                    "{mode:?}: warn on warn_wash contrast too low ({:.2})",
+                    contrast_ratio(tokens.warn, tokens.warn_wash)
+                );
+                assert!(
+                    contrast_ratio(tokens.ink_on_wash, tokens.live_wash) >= 4.5,
+                    "{mode:?}: ink_on_wash on live_wash contrast too low ({:.2})",
+                    contrast_ratio(tokens.ink_on_wash, tokens.live_wash)
+                );
+                assert!(
+                    contrast_ratio(tokens.ink_on_wash, tokens.accent_wash) >= 4.5,
+                    "{mode:?}: ink_on_wash on accent_wash contrast too low ({:.2})",
+                    contrast_ratio(tokens.ink_on_wash, tokens.accent_wash)
+                );
+                assert!(
+                    contrast_ratio(tokens.muted_on_wash, tokens.accent_wash) >= 4.5,
+                    "{mode:?}: muted_on_wash on accent_wash contrast too low ({:.2})",
+                    contrast_ratio(tokens.muted_on_wash, tokens.accent_wash)
+                );
+                assert_ne!(
+                    tokens.surface, tokens.surface_2,
+                    "{mode:?}: row hover must differ from the surrounding surface"
+                );
+            }
+        });
     }
 }

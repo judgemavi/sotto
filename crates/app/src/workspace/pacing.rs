@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use gpui::{Context, ListOffset, Timer, px};
+use gpui_kit::{Context, ListOffset, px};
 use sotto_core::EventId;
 
 use super::{MeetingWorkspace, transcript, transcript::TranscriptRow};
@@ -128,10 +128,12 @@ impl MeetingWorkspace {
     /// Starts the presentation clock. Timeline ingestion remains append-only;
     /// this loop controls only when committed words become visible.
     pub(super) fn poll_transcript_pacing(&mut self, cx: &mut Context<Self>) {
-        let workspace = cx.entity();
+        let workspace = cx.weak_entity();
         cx.spawn(async move |_, cx| {
             loop {
-                Timer::after(Duration::from_millis(WORD_CADENCE_MS)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(WORD_CADENCE_MS))
+                    .await;
                 if workspace
                     .update(cx, |workspace, cx| {
                         if !workspace.transcript_live {
