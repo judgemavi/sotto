@@ -24,11 +24,15 @@ use std::{
     time::Duration,
 };
 
-use gpui_kit::component::Sizable as _;
 use gpui_kit::component::Size;
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::collapsible::Collapsible;
+use gpui_kit::component::empty::{Empty, EmptyDescription, EmptyHeader, EmptyTitle};
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::text::TextViewStyle;
+use gpui_kit::component::{
+    Disableable as _, Selectable as _, Sizable as _, button::ButtonVariants as _,
+};
 use gpui_kit::{App, Context, ElementId, Entity, WeakEntity, Window, div, prelude::*, px};
 use insight::{
     NotesBlockProvenance, NotesOverlayOperation, OverlayTarget, PresentedNotesBlock,
@@ -160,7 +164,7 @@ pub(crate) fn render_with_citation_times(
                         )
                         .child(
                             ControlRole::Essential,
-                            Button::new("append-note", tokens)
+                            Button::new("append-note")
                                 .label("Add")
                                 .with_size(Size::Small)
                                 .disabled(
@@ -217,16 +221,13 @@ fn render_completed_annotations(
                     color: tokens.ink_2,
                 })
                 .child(
-                    Button::new(
-                        ("completed-user-note-anchor", annotation.event_id.get()),
-                        tokens,
-                    )
-                    .label(moment_label(anchor, citation_times))
-                    .ghost()
-                    .xsmall()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_citation(anchor, cx);
-                    })),
+                    Button::new(("completed-user-note-anchor", annotation.event_id.get()))
+                        .label(moment_label(anchor, citation_times))
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_citation(anchor, cx);
+                        })),
                 )
                 .child(div().text_xs().text_color(tokens.faint).child("Your words"))
         }))
@@ -288,7 +289,7 @@ fn render_head(
         let selected_openai = selected.as_deref() == Some(OPENAI_RESPONSES_BACKEND_ID);
         row = row.child(
             ControlRole::Essential,
-            Button::new("notes-provider-openai", tokens)
+            Button::new("notes-provider-openai")
                 .label("OpenAI")
                 .with_size(Size::Small)
                 .selected(selected_openai)
@@ -306,7 +307,7 @@ fn render_head(
         let selected_codex = selected.as_deref() == Some(CODEX_CLI_BACKEND_ID);
         row = row.child(
             ControlRole::Essential,
-            Button::new("notes-provider-codex", tokens)
+            Button::new("notes-provider-codex")
                 .label("Codex")
                 .with_size(Size::Small)
                 .selected(selected_codex)
@@ -318,7 +319,7 @@ fn render_head(
     }
     row = row.child(
         ControlRole::Essential,
-        Button::new("summarize", tokens)
+        Button::new("summarize")
             .label(if summary.sections.is_empty() {
                 "Write notes"
             } else {
@@ -333,7 +334,7 @@ fn render_head(
         row = row
             .child(
                 ControlRole::Essential,
-                Button::new("notes-document-save", tokens)
+                Button::new("notes-document-save")
                     .label("Save")
                     .with_size(Size::Small)
                     .debug_selector(|| "notes-document-save".into())
@@ -343,7 +344,7 @@ fn render_head(
             )
             .child(
                 ControlRole::Essential,
-                Button::new("notes-document-cancel", tokens)
+                Button::new("notes-document-cancel")
                     .label("Cancel")
                     .ghost()
                     .with_size(Size::Small)
@@ -355,7 +356,7 @@ fn render_head(
     } else if !live && !summary.sections.is_empty() {
         row = row.child(
             ControlRole::Essential,
-            Button::new("notes-document-edit", tokens)
+            Button::new("notes-document-edit")
                 .label("Edit")
                 .ghost()
                 .with_size(Size::Small)
@@ -582,7 +583,7 @@ fn render_your_notes(
                         )
                         .child(
                             ControlRole::Essential,
-                            Button::new(("edit-typed-note", event_id.get()), tokens)
+                            Button::new(("edit-typed-note", event_id.get()))
                                 .label("Edit")
                                 .ghost()
                                 .xsmall()
@@ -592,7 +593,7 @@ fn render_your_notes(
                         )
                         .child(
                             ControlRole::Essential,
-                            Button::new(("typed-note-anchor", event_id.get()), tokens)
+                            Button::new(("typed-note-anchor", event_id.get()))
                                 .label("Show")
                                 .ghost()
                                 .xsmall()
@@ -1063,7 +1064,7 @@ fn render_source_context(
                         )
                         .child(
                             ControlRole::Essential,
-                            Button::new(("query-disclosure", server_index), tokens)
+                            Button::new(("query-disclosure", server_index))
                                 .label(if disclosed { "Disclosure: on" } else { "Disclosure: off" })
                                 .ghost()
                                 .xsmall()
@@ -1092,7 +1093,7 @@ fn render_source_context(
                             Button::new((
                                 "source-resource",
                                 server_index.saturating_mul(10_000).saturating_add(resource_index),
-                            ), tokens)
+                            ))
                             .label(if chosen { "Selected" } else { "Use" })
                             .ghost()
                             .xsmall()
@@ -1651,21 +1652,24 @@ impl RenderOnce for SummaryBody {
                     .map(|line| div().mb_1().text_sm().text_color(tokens.faint).child(line)),
             )
             .children(summary.pending.map(|pending| {
+                // A missing or in-flight summary is a kit empty state, rather than a
+                // Sotto-painted muted card. Sotto still owns the specific explanation.
                 div()
                     .mt_2()
-                    .p_3()
-                    .rounded_lg()
-                    .text_sm()
-                    .text_color(tokens.muted)
                     .debug_selector(|| "summary-pending".into())
-                    .child(pending)
-                    .when(writing, |view| {
-                        view.child(
-                            div()
-                                .mt_3()
-                                .child(motion::writing_progress("notes-writing", tokens)),
-                        )
-                    })
+                    .child(
+                        Empty::new()
+                            .header(
+                                EmptyHeader::new()
+                                    .title(EmptyTitle::new().child("Notes"))
+                                    .description(EmptyDescription::new().child(pending)),
+                            )
+                            .children(writing.then(|| {
+                                div()
+                                    .mt_1()
+                                    .child(motion::writing_progress("notes-writing", tokens))
+                            })),
+                    )
             }))
             .children((!screen_consultations.is_empty()).then(|| {
                 render_screen_receipt(
@@ -1698,30 +1702,32 @@ fn render_screen_receipt(
         .mt_2()
         .debug_selector(|| "summary-screen-receipt".into())
         .child(
-            Button::new("summary-screen-receipt-toggle", tokens)
-                .label(if revealed {
-                    "Hide screen consultation receipt".to_owned()
-                } else {
-                    format!("Screen requests: {count} · Show receipt")
-                })
-                .ghost()
-                .with_size(Size::Small)
-                .on_click(move |_, _, cx| {
-                    disclosure.update(cx, |state, cx| {
-                        state.toggle_screen(summary);
-                        cx.notify();
-                    });
-                }),
+            Collapsible::new()
+                .open(revealed)
+                .child(
+                    Button::new("summary-screen-receipt-toggle")
+                        .label(if revealed {
+                            "Hide screen consultation receipt".to_owned()
+                        } else {
+                            format!("Screen requests: {count} · Show receipt")
+                        })
+                        .ghost()
+                        .with_size(Size::Small)
+                        .on_click(move |_, _, cx| {
+                            disclosure.update(cx, |state, cx| {
+                                state.toggle_screen(summary);
+                                cx.notify();
+                            });
+                        }),
+                )
+                .content(div().children(consultations.iter().map(|entry| {
+                    div()
+                        .mt_1()
+                        .text_sm()
+                        .text_color(tokens.faint)
+                        .child(entry.describe())
+                }))),
         )
-        .children(revealed.then(|| {
-            div().children(consultations.iter().map(|entry| {
-                div()
-                    .mt_1()
-                    .text_sm()
-                    .text_color(tokens.faint)
-                    .child(entry.describe())
-            }))
-        }))
         .into_any_element()
 }
 
@@ -1929,7 +1935,7 @@ pub(super) fn evidence_control(
     selector: String,
     label: String,
     tooltip: &'static str,
-    tokens: WorkspaceTokens,
+    _tokens: WorkspaceTokens,
     activate: impl Fn(&mut App) + 'static,
 ) -> gpui_kit::AnyElement {
     let activate = std::rc::Rc::new(activate);
@@ -1943,7 +1949,7 @@ pub(super) fn evidence_control(
             }
         })
         .child(
-            Button::new(id, tokens)
+            Button::new(id)
                 .label(label)
                 .ghost()
                 .xsmall()
@@ -1977,13 +1983,10 @@ fn render_citations(
         .child(div().flex().flex_wrap().gap_1().min_w_0().children(
             meeting.into_iter().enumerate().map(|(index, event_id)| {
                 let workspace = context.workspace.clone();
-                Button::new(
-                    (
-                        "summary-citation",
-                        ordinal.saturating_mul(1_000).saturating_add(index),
-                    ),
-                    tokens,
-                )
+                Button::new((
+                    "summary-citation",
+                    ordinal.saturating_mul(1_000).saturating_add(index),
+                ))
                 .label(moment_label(event_id, citation_times))
                 .outline()
                 .xsmall()

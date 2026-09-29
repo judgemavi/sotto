@@ -24,7 +24,7 @@ use std::{
 
 use gpui_kit::component::button::{Button as KitButton, ButtonVariants as _};
 use gpui_kit::component::input::{EditorState, InputEvent, InputState};
-use gpui_kit::component::{Root, ThemeMode, WindowExt as _, h_flex};
+use gpui_kit::component::{Root, Sizable as _, ThemeMode, WindowExt as _, h_flex};
 use gpui_kit::{
     App, Context, ElementId, Entity, KeyBinding, ListAlignment, ListState, Menu, MenuItem,
     SharedString, Subscription, Window, WindowHandle, div, prelude::*, px,
@@ -70,23 +70,13 @@ pub fn install_visible_scrollbars(cx: &mut App) {
     tokens::install_visible_scrollbars(cx);
 }
 
-/// Where the traffic lights sit inside the title strip, and how tall that strip is.
-///
-/// The window titlebar is transparent so the shell's own ground colour reaches the very top of the
-/// window. macOS draws its own titlebar in the *system* appearance, and gpui-pre exposes no
-/// way to set a window's `NSAppearance` — so with `View ▸ Appearance` set to Dark against a light
-/// system, the strip stayed light above a dark window. Painting it ourselves is the only way the
-/// appearance choice reaches the whole window.
-///
-/// The cost is that the traffic lights now sit over the shell's own content, so the top of the
-/// stage reserves this much room for them.
-pub const TRAFFIC_LIGHT_INSET: gpui_kit::Pixels = gpui_kit::px(13.0);
-pub(crate) const TITLE_STRIP_HEIGHT: gpui_kit::Pixels = gpui_kit::px(38.0);
+/// Stock gpui-kit title-bar height, retained only for layout assertions.
+#[cfg(test)]
+pub(crate) const TITLE_STRIP_HEIGHT: gpui_kit::Pixels = gpui_kit::component::TITLE_BAR_HEIGHT;
 
 /// An icon control: a picture the app owns, with its words in the tooltip.
 ///
-/// Built on [`focus::Button`] rather than stock kit `IconButton`, so tests can attach a
-/// `debug_selector` and chrome can use the kit Lucide catalog (ADR-0025).
+/// Built from a stock kit button and the kit Lucide catalog.
 ///
 /// Every icon button in the shell is built here so no call site can ship a picture with nothing
 /// behind it. `label` is that control's accessible name and reaches a person through the tooltip.
@@ -103,9 +93,9 @@ pub(crate) fn icon_button(
     id: impl Into<ElementId>,
     icon: IconName,
     label: impl Into<SharedString>,
-    tokens: tokens::WorkspaceTokens,
-) -> Button {
-    Button::new(id, tokens)
+    _tokens: tokens::WorkspaceTokens,
+) -> KitButton {
+    Button::new(id)
         .icon(icon)
         .tooltip(label)
         .ghost()
@@ -119,9 +109,9 @@ pub(crate) fn icon_button(
 pub(crate) fn delete_icon_button(
     id: impl Into<ElementId>,
     target: &str,
-    tokens: tokens::WorkspaceTokens,
-) -> Button {
-    Button::new(id, tokens)
+    _tokens: tokens::WorkspaceTokens,
+) -> KitButton {
+    Button::new(id)
         .icon(IconName::Delete)
         .tooltip(format!("Delete {target}…"))
         .danger()

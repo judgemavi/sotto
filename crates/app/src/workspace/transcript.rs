@@ -890,12 +890,11 @@ fn render_column_head(
 }
 
 fn copy_control(cx: &mut Context<MeetingWorkspace>) -> AnyElement {
-    let tokens = WorkspaceTokens::resolve(cx);
     div()
         .pl(Space::SM)
         .debug_selector(|| "transcript-copy-control".into())
         .child(
-            Button::new("copy-transcript", tokens)
+            Button::new("copy-transcript")
                 .label("Copy")
                 .on_click(cx.listener(|this, _, _, cx| this.copy_transcript(cx))),
         )
@@ -903,12 +902,11 @@ fn copy_control(cx: &mut Context<MeetingWorkspace>) -> AnyElement {
 }
 
 fn follow_control(following: bool, cx: &mut Context<MeetingWorkspace>) -> AnyElement {
-    let tokens = WorkspaceTokens::resolve(cx);
     div()
         .pl(Space::SM)
         .debug_selector(|| "transcript-follow-control".into())
         .child(
-            Button::new("follow-transcript", tokens)
+            Button::new("follow-transcript")
                 .label(if following {
                     "Following live"
                 } else {

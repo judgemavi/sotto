@@ -3,10 +3,8 @@
 #![deny(warnings)]
 
 use app::{devwindow, mcp, reasoning, session, workspace};
-use gpui_kit::component::Root;
-use gpui_kit::{
-    App, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, prelude::*, px, size,
-};
+use gpui_kit::component::{Root, TitleBar};
+use gpui_kit::{App, Bounds, WindowBounds, WindowOptions, prelude::*, px, size};
 use workspace::{KeyboardRoot, MeetingWorkspace};
 
 fn main() {
@@ -45,17 +43,10 @@ fn main() {
             let Ok(workspace_window) = cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(workspace_bounds)),
-                    // Transparent so *Sotto* paints the title strip, not macOS. The title is still
-                    // supplied — the window manager uses it in Mission Control and the window list.
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Sotto".into()),
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(
-                            workspace::TRAFFIC_LIGHT_INSET,
-                            workspace::TRAFFIC_LIGHT_INSET,
-                        )),
-                    }),
-                    ..Default::default()
+                    // The kit owns the title bar, including its theme-resolved background,
+                    // dragging behaviour, and macOS traffic-light placement. Sotto supplies
+                    // only product actions as children of that stock component.
+                    ..TitleBar::window_options()
                 },
                 move |window, cx| {
                     window.on_window_should_close(cx, move |_, cx| {

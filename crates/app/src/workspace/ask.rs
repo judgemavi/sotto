@@ -19,10 +19,22 @@
 
 use std::{collections::BTreeSet, sync::mpsc};
 
-use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::{
+    Disableable as _, Selectable as _, Sizable as _,
+    button::ButtonVariants as _,
+    input::{InputEvent, InputState},
+};
+use gpui_kit::component::{
+    bubble::{Bubble, BubbleVariant},
+    group_box::{GroupBox, GroupBoxVariants as _},
+    message::{
+        Message, MessageAlignment, MessageContent, MessageFooter, MessageGroup, MessageHeader,
+    },
+    message_scroller::{MessageScroller, MessageScrollerState},
+};
 use gpui_kit::{
-    Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, IntoElement, Render, Window,
-    div, prelude::*, px,
+    Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, Render, WeakEntity, Window,
+    div, prelude::*,
 };
 use insight::{AskCitation, AskEngine, AskEvidence, AskReply, AskResult, AskTurn};
 use providers::{CODEX_CLI_BACKEND_ID, OPENAI_RESPONSES_BACKEND_ID, ReasoningSurface};
@@ -80,6 +92,7 @@ pub(super) struct AskPanel {
     running: bool,
     progress: Option<String>,
     turns: Vec<AskTurn>,
+    message_scroller: Entity<MessageScrollerState>,
     message: Option<String>,
     notice: Option<String>,
     revealed_receipts: BTreeSet<usize>,
@@ -114,6 +127,7 @@ impl AskPanel {
             input.set_placeholder("Ask about your recordings", window, cx);
             input
         });
+        let message_scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.emit_submit(cx);
@@ -135,6 +149,7 @@ impl AskPanel {
             running: false,
             progress: None,
             turns: Vec::new(),
+            message_scroller,
             message: None,
             notice: None,
             revealed_receipts: BTreeSet::new(),
@@ -292,6 +307,9 @@ impl AskPanel {
         if !self.revealed_receipts.insert(index) {
             self.revealed_receipts.remove(&index);
         }
+        self.message_scroller.update(cx, |state, cx| {
+            let _ = state.remeasure_items(index..index + 1, cx);
+        });
         cx.notify();
     }
 
@@ -344,7 +362,7 @@ impl Render for AskPanel {
             let selected = self.selected_provider.as_deref() == Some(OPENAI_RESPONSES_BACKEND_ID);
             ask_form = ask_form.child(
                 ControlRole::Essential,
-                Button::new("ask-provider-openai", tokens)
+                Button::new("ask-provider-openai")
                     .label("OpenAI")
                     .small()
                     .selected(selected)
@@ -360,7 +378,7 @@ impl Render for AskPanel {
             let selected = self.selected_provider.as_deref() == Some(CODEX_CLI_BACKEND_ID);
             ask_form = ask_form.child(
                 ControlRole::Essential,
-                Button::new("ask-provider-codex", tokens)
+                Button::new("ask-provider-codex")
                     .label("Codex")
                     .small()
                     .selected(selected)
@@ -379,7 +397,7 @@ impl Render for AskPanel {
             )
             .child(
                 ControlRole::Essential,
-                Button::new("submit-ask", tokens)
+                Button::new("submit-ask")
                     .label("Ask")
                     .small()
                     .disabled(disabled_reason.is_some() || self.running)
@@ -388,43 +406,44 @@ impl Render for AskPanel {
         if self.running {
             ask_form = ask_form.child(
                 ControlRole::Essential,
-                Button::new("cancel-ask", tokens)
+                Button::new("cancel-ask")
                     .label("Cancel")
                     .small()
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(AskPanelEvent::Cancel))),
             );
         }
-        div()
+        if self.message_scroller.read(cx).item_count() != self.turns.len() {
+            self.message_scroller
+                .update(cx, |state, cx| state.reset(self.turns.len(), cx));
+        }
+        let turns = self.turns.clone();
+        let receipts = self.revealed_receipts.clone();
+        let ask_panel = cx.weak_entity();
+
+        // Ask remains an app-level workspace panel, rather than a modal sheet or a dockable
+        // document. gpui-kit's DockArea owns persistent, draggable panel topology, and placing
+        // this per-recording controller in one would make its app-level scope and the workspace's
+        // single selected-session state compete. GroupBox is the kit-native framed panel for this
+        // fixed right-hand region: it supplies the themed surface and title instead of a private
+        // background, border, or title strip.
+        GroupBox::new()
+            .id("ask-panel")
+            .fill()
             .size_full()
             .min_w_0()
+            .min_h_0()
             .flex()
             .flex_col()
-            .bg(tokens.surface)
-            .text_color(tokens.ink)
-            .text_size(TypeScale::control(&tokens))
+            .title("Ask")
             .child(
                 div()
-                    .flex_none()
-                    .px(px(14.0))
-                    .pt(px(14.0))
-                    .pb(px(8.0))
-                    .child(
-                        div()
-                            .text_size(TypeScale::control(&tokens))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Ask"),
-                    ),
-            )
-            .child(
-                div()
-                    .id("ask-panel-scroll")
-                    .flex_1()
                     .min_h_0()
                     .min_w_0()
-                    .id("ask-scroll-1")
-                    .overflow_y_scroll()
-                    .px(px(14.0))
-                    .pb(px(14.0))
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
                     .text_size(TypeScale::control(&tokens))
                     // Two peers, not a toggle that renames itself. A control labelled "Use all recordings"
                     // never says which scope is *current* — you have to infer it from the label of the
@@ -434,7 +453,7 @@ impl Render for AskPanel {
                         ControlRow::new()
                             .child(
                                 ControlRole::Essential,
-                                Button::new("ask-scope-all", tokens)
+                                Button::new("ask-scope-all")
                                     .label("All recordings")
                                     .small()
                                     .selected(effective == AskScope::AllRecordings)
@@ -450,7 +469,7 @@ impl Render for AskPanel {
                                 div()
                                     .debug_selector(|| "ask-scope-entry-control".into())
                                     .child(
-                                        Button::new("ask-scope-open", tokens)
+                                        Button::new("ask-scope-open")
                                             .label(if self.live {
                                                 "This entry (live)"
                                             } else {
@@ -474,7 +493,7 @@ impl Render for AskPanel {
                         ControlRow::new()
                             .child(
                                 ControlRole::Essential,
-                                Button::new("ask-scope-selection", tokens)
+                                Button::new("ask-scope-selection")
                                     .label("This selection")
                                     .small()
                                     .selected(effective == AskScope::Selection)
@@ -492,7 +511,7 @@ impl Render for AskPanel {
                             )
                             .child(
                                 ControlRole::Essential,
-                                Button::new("ask-clear-selection", tokens)
+                                Button::new("ask-clear-selection")
                                     .label("Clear")
                                     .ghost()
                                     .small()
@@ -526,9 +545,22 @@ impl Render for AskPanel {
                                 .child(reason),
                         )
                     })
-                    .children(self.turns.iter().enumerate().map(|(turn_ix, turn)| {
-                        render_turn(turn_ix, turn, self.revealed_receipts.contains(&turn_ix), cx)
-                    }))
+                    .child(
+                        MessageScroller::new(
+                            "ask-message-scroller",
+                            self.message_scroller.clone(),
+                            move |turn_ix, _, _| {
+                                render_turn(
+                                    turn_ix,
+                                    &turns[turn_ix],
+                                    receipts.contains(&turn_ix),
+                                    ask_panel.clone(),
+                                )
+                            },
+                        )
+                        .flex_1()
+                        .min_h_0(),
+                    )
                     .when_some(self.progress.clone(), |view, progress| {
                         view.child(
                             div().mt_3().child(progress).child(
@@ -604,53 +636,55 @@ fn render_turn(
     index: usize,
     turn: &AskTurn,
     receipt_revealed: bool,
-    cx: &mut Context<AskPanel>,
+    ask_panel: WeakEntity<AskPanel>,
 ) -> gpui_kit::AnyElement {
-    let tokens = WorkspaceTokens::resolve(cx);
-    let answer = match &turn.reply {
-        AskReply::Refusal { reason, covered } => div()
-            .child(format!("I can't answer that from this record: {reason}"))
-            .when(!covered.is_empty(), |view| {
-                view.child(format!(" Covered: {}", covered.join(", ")))
-            }),
-        AskReply::Answer { claims } => {
-            div().children(claims.iter().enumerate().map(|(claim_ix, claim)| {
-                div().mt_2().child(claim.text.clone()).children(
-                    claim
-                        .citations
-                        .iter()
-                        .enumerate()
-                        .map(|(citation_ix, citation)| {
-                            let citation = citation.clone();
-                            Button::new(
-                                (
-                                    "ask-citation",
-                                    index * 10_000 + claim_ix * 100 + citation_ix,
-                                ),
-                                tokens,
-                            )
-                            .label("Open transcript evidence")
-                            .on_click(cx.listener(
-                                move |_, _, _, cx| {
-                                    cx.emit(AskPanelEvent::Citation(citation.clone()))
-                                },
-                            ))
-                        }),
-                )
-            }))
-        }
-    };
-    div()
-        .mt_4()
-        .child(div().text_color(tokens.muted).child(turn.question.clone()))
-        .child(answer)
-        .children((!turn.screen_consultations.is_empty()).then(|| {
-            let count = turn.screen_consultations.len();
+    let (answer, citations) = match &turn.reply {
+        AskReply::Refusal { reason, covered } => (
             div()
-                .mt_1()
+                .child(format!("I can't answer that from this record: {reason}"))
+                .when(!covered.is_empty(), |view| {
+                    view.child(format!(" Covered: {}", covered.join(", ")))
+                })
+                .into_any_element(),
+            Vec::new(),
+        ),
+        AskReply::Answer { claims } => (
+            div()
+                .children(
+                    claims
+                        .iter()
+                        .map(|claim| div().mt_2().child(claim.text.clone())),
+                )
+                .into_any_element(),
+            claims
+                .iter()
+                .flat_map(|claim| claim.citations.iter().cloned())
+                .collect::<Vec<_>>(),
+        ),
+    };
+    let mut footer = MessageFooter::new().children(citations.into_iter().enumerate().map(
+        |(citation_ix, citation)| {
+            let ask_panel = ask_panel.clone();
+            Button::new(("ask-citation", index * 10_000 + citation_ix))
+                .label("Open transcript evidence")
+                .ghost()
+                .xsmall()
+                .on_click(move |_, _, cx| {
+                    let _ = ask_panel.update(cx, |panel, cx| {
+                        let _ = panel;
+                        cx.emit(AskPanelEvent::Citation(citation.clone()));
+                    });
+                })
+        },
+    ));
+    if !turn.screen_consultations.is_empty() {
+        let count = turn.screen_consultations.len();
+        let toggle_panel = ask_panel.clone();
+        footer = footer.child(
+            div()
                 .debug_selector(|| "ask-screen-receipt".into())
                 .child(
-                    Button::new(("ask-screen-receipt-toggle", index), tokens)
+                    Button::new(("ask-screen-receipt-toggle", index))
                         .label(if receipt_revealed {
                             "Hide screen consultation receipt".to_owned()
                         } else {
@@ -658,20 +692,47 @@ fn render_turn(
                         })
                         .ghost()
                         .xsmall()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_receipt(index, cx);
-                        })),
+                        .on_click(move |_, _, cx| {
+                            let _ = toggle_panel.update(cx, |panel, cx| {
+                                panel.toggle_receipt(index, cx);
+                            });
+                        }),
                 )
                 .children(receipt_revealed.then(|| {
-                    div().children(turn.screen_consultations.iter().map(|entry| {
-                        div()
-                            .mt_1()
-                            .text_size(TypeScale::control(&tokens))
-                            .text_color(tokens.faint)
-                            .child(entry.describe())
-                    }))
-                }))
-        }))
+                    div().children(
+                        turn.screen_consultations
+                            .iter()
+                            .map(|entry| div().mt_1().text_xs().child(entry.describe())),
+                    )
+                })),
+        );
+    }
+
+    MessageGroup::new()
+        .child(
+            Message::new()
+                .alignment(MessageAlignment::End)
+                .header(MessageHeader::new().child("You"))
+                .content(
+                    MessageContent::new().bubble(
+                        Bubble::new()
+                            .with_variant(BubbleVariant::Filled)
+                            .child(turn.question.clone()),
+                    ),
+                ),
+        )
+        .child(
+            Message::new()
+                .header(MessageHeader::new().child("Sotto"))
+                .content(
+                    MessageContent::new().bubble(
+                        Bubble::new()
+                            .with_variant(BubbleVariant::Secondary)
+                            .child(answer),
+                    ),
+                )
+                .footer(footer),
+        )
         .into_any_element()
 }
 

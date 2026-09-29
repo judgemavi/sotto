@@ -26,7 +26,13 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gpui_kit::component::input::InputState;
+use gpui_kit::component::{
+    Disableable as _, Sizable as _, TitleBar,
+    button::{ButtonVariants as _, Toggle},
+    input::InputState,
+    marker::{Marker, MarkerContent},
+    status_bar::StatusBar,
+};
 use gpui_kit::{
     AnyElement, Context, Entity, IntoElement, Pixels, Render, Window, div, prelude::*, px, relative,
 };
@@ -51,6 +57,10 @@ use super::{
 /// Smallest supported workspace viewport; control-row acceptance is pinned here.
 const MIN_WORKSPACE_WIDTH: Pixels = px(680.0);
 
+/// `StatusBar` supplies `px_2` at both edges. Its responsive child must measure the remaining
+/// content box rather than the viewport, or the clock and Stop overflow at the minimum width.
+const STATUS_BAR_HORIZONTAL_INSET: Pixels = px(16.0);
+
 /// The mock's library rail width, and the narrower width it takes on a small window.
 const LIBRARY_WIDTH: Pixels = px(248.0);
 const LIBRARY_WIDTH_NARROW: Pixels = px(210.0);
@@ -73,14 +83,9 @@ const ASK_PANEL_WIDTH: Pixels = px(344.0);
 /// comparison against a wrong number is still a comparison.
 const TRANSCRIPT_STAGE_SHARE: f32 = 0.575;
 
-/// The width at the left of the toolbar that belongs to macOS, not to Sotto.
+/// The stock kit title bar reserves this leading space for macOS traffic lights.
 ///
-/// `main.rs` moves the traffic lights to [`super::TRAFFIC_LIGHT_INSET`] from the left edge. macOS
-/// lays its three standard window buttons out 14 px wide with 20 px between origins, so the last
-/// one ends at `13 + 2×20 + 14 = 67`, and the toolbar leaves another inset's worth of air before
-/// its first control. That is 80 px; the normative mock reserves 84 px of left padding on the same
-/// row, so this takes the mock's figure — it is the larger of the two, and the one that has been
-/// looked at.
+/// This is a layout constraint for its children, not Sotto-painted chrome.
 const TOOLBAR_LEADING_INSET: Pixels = px(84.0);
 
 /// Which arrangement the stage takes. Derived from session state, never stored.
@@ -255,7 +260,6 @@ impl Render for MeetingWorkspace {
                 self.library_collapsed,
                 self.ask_open,
                 &self.library_filter,
-                tokens,
                 cx,
             ))
             .when_some(self.message.clone(), |view, message| {
@@ -276,7 +280,7 @@ impl Render for MeetingWorkspace {
             .when(lifecycle.requires_visible_control(), |view| {
                 view.child(motion::fade_in(
                     "capture-bar-enter",
-                    render_capture_bar(&lifecycle, self.live_started_at, width, tokens, cx),
+                    render_capture_bar(&lifecycle, self.live_started_at, width, cx),
                 ))
             })
             .when_some(
@@ -434,72 +438,68 @@ fn render_toolbar(
     library_collapsed: bool,
     ask_open: bool,
     search: &Entity<InputState>,
-    tokens: WorkspaceTokens,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
-    ControlRow::for_width(width - TOOLBAR_LEADING_INSET)
+    TitleBar::new()
         .child(
-            ControlRole::Essential,
-            div()
-                .debug_selector(|| "toolbar-library-toggle".into())
+            ControlRow::for_width(width - TOOLBAR_LEADING_INSET)
                 .child(
-                    // One control, one place, both states — marked selected while the rail shows.
-                    // The picture stays `panel-left` rather than flipping between an opening and a
-                    // closing variant, so the control keeps its width and the search field beside
-                    // it does not jump; only the tooltip changes.
-                    super::icon_button(
-                        "toggle-library",
-                        IconName::PanelLeft,
-                        if library_collapsed {
-                            "Show recents"
-                        } else {
-                            "Hide recents"
-                        },
-                        tokens,
-                    )
-                    .selected(!library_collapsed)
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_library(cx))),
-                ),
+                    ControlRole::Essential,
+                    div()
+                        .debug_selector(|| "toolbar-library-toggle".into())
+                        .child(
+                            // One control, one place, both states — marked selected while the rail shows.
+                            // The picture stays `panel-left` rather than flipping between an opening and a
+                            // closing variant, so the control keeps its width and the search field beside
+                            // it does not jump; only the tooltip changes.
+                            Toggle::new("toggle-library")
+                                .icon(IconName::PanelLeft)
+                                .tooltip(if library_collapsed {
+                                    "Show recents"
+                                } else {
+                                    "Hide recents"
+                                })
+                                .checked(!library_collapsed)
+                                .with_size(Size::Small)
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_library(cx))),
+                        ),
+                )
+                .child(
+                    ControlRole::Ellipsizing,
+                    div()
+                        .min_w_0()
+                        .max_w(px(360.0))
+                        .overflow_hidden()
+                        .debug_selector(|| "toolbar-search".into())
+                        // `cleanable` draws `IconName::CircleX`, which resolves to `icons/circle-x.svg`.
+                        // That asset is vendored, so the clear button is a picture the app owns rather
+                        // than the invisible-but-clickable control an unvendored path would produce —
+                        // `Assets::load` answers a missing path with `Ok(None)`, not an error.
+                        .child(Input::new(search).cleanable(true).with_size(Size::Small)),
+                )
+                .child(
+                    ControlRole::Essential,
+                    div().debug_selector(|| "toolbar-ask-toggle".into()).child(
+                        Toggle::new("toggle-ask")
+                            .label("Ask")
+                            .tooltip(if ask_open {
+                                "Hide the Ask panel"
+                            } else {
+                                "Show the Ask panel"
+                            })
+                            .checked(ask_open)
+                            .with_size(Size::Small)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.toggle_ask(window, cx)),
+                            ),
+                    ),
+                )
+                .finish()
+                .w_full()
+                .gap(Space::SM)
+                .pr(Space::MD)
+                .debug_selector(|| "title-strip".into()),
         )
-        .child(
-            ControlRole::Ellipsizing,
-            div()
-                .min_w_0()
-                .max_w(px(360.0))
-                .overflow_hidden()
-                .debug_selector(|| "toolbar-search".into())
-                // `cleanable` draws `IconName::CircleX`, which resolves to `icons/circle-x.svg`.
-                // That asset is vendored, so the clear button is a picture the app owns rather
-                // than the invisible-but-clickable control an unvendored path would produce —
-                // `Assets::load` answers a missing path with `Ok(None)`, not an error.
-                .child(Input::new(search).cleanable(true).with_size(Size::Small)),
-        )
-        .child(
-            ControlRole::Essential,
-            div().debug_selector(|| "toolbar-ask-toggle".into()).child(
-                Button::new("toggle-ask", tokens)
-                    .label("Ask")
-                    .tooltip(if ask_open {
-                        "Hide the Ask panel"
-                    } else {
-                        "Show the Ask panel"
-                    })
-                    .ghost()
-                    .selected(ask_open)
-                    .with_size(Size::Small)
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_ask(window, cx))),
-            ),
-        )
-        .finish()
-        .w_full()
-        .min_w(MIN_WORKSPACE_WIDTH)
-        .flex_none()
-        .h(super::TITLE_STRIP_HEIGHT)
-        .gap(Space::SM)
-        .pl(TOOLBAR_LEADING_INSET)
-        .pr(Space::MD)
-        .bg(tokens.ground)
-        .debug_selector(|| "title-strip".into())
         .into_any_element()
 }
 
@@ -599,7 +599,6 @@ fn render_capture_bar(
     lifecycle: &SessionLifecycle,
     started_at: Option<std::time::Instant>,
     width: Pixels,
-    tokens: WorkspaceTokens,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
     let (kind, target, stopping) = match lifecycle {
@@ -625,85 +624,70 @@ fn render_capture_bar(
         _ => return div().into_any_element(),
     };
     let elapsed = started_at.map_or(Duration::ZERO, |value| value.elapsed());
-    ControlRow::for_width(width)
+    // `StatusBar` owns the shell's theme treatment rather than deriving a separate recording
+    // wash. `Marker` supplies the live/finishing activity affordance; the content still uses the
+    // responsive `ControlRow` so target scope is the first thing to yield on a narrow window.
+    div()
+        .w_full()
+        .flex_none()
+        .debug_selector(|| "capture-bar".into())
         .child(
-            ControlRole::Essential,
-            motion::live_pulse(
-                div()
-                    .size(px(9.0))
-                    .rounded_full()
-                    .bg(tokens.live)
-                    .debug_selector(|| "capture-record-dot".into()),
+            StatusBar::new().child(
+                ControlRow::for_width(width - STATUS_BAR_HORIZONTAL_INSET)
+                    .child(
+                        ControlRole::Essential,
+                        div().debug_selector(|| "capture-record-dot".into()).child(
+                            Marker::new()
+                                .id("capture-status")
+                                .loading(!stopping)
+                                .content(MarkerContent::new().text(kind)),
+                        ),
+                    )
+                    .child(
+                        ControlRole::Ellipsizing,
+                        div()
+                            .min_w_0()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .debug_selector(|| "capture-target-name".into())
+                            .child(capture_target_name(target)),
+                    )
+                    .child(
+                        ControlRole::Expendable,
+                        div()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .debug_selector(|| "capture-scope-chips".into())
+                            .child(scope_sentence(target)),
+                    )
+                    .child(
+                        ControlRole::Essential,
+                        div()
+                            .debug_selector(|| "capture-clock".into())
+                            .font_family(TypeScale::mono(cx))
+                            .child(format_clock(elapsed)),
+                    )
+                    // No Pause control, decided (not deferred) by T079. Compressing the timeline
+                    // to keep ADR-0018's transcript-time-is-media-time identity intact still
+                    // requires capture-path proof against a signed macOS build.
+                    .child(
+                        ControlRole::Essential,
+                        div()
+                            .debug_selector(|| "capture-stop-control".into())
+                            .child(
+                                Button::new("stop-recording")
+                                    .label(if stopping { "Stopping…" } else { "Stop" })
+                                    .danger()
+                                    .with_size(Size::Small)
+                                    .disabled(stopping)
+                                    .on_click(cx.listener(|this, _, _, cx| this.stop_session(cx))),
+                            ),
+                    )
+                    .finish()
+                    .w_full()
+                    .min_w(MIN_WORKSPACE_WIDTH - STATUS_BAR_HORIZONTAL_INSET)
+                    .gap(Space::MD),
             ),
         )
-        .child(
-            ControlRole::Essential,
-            div()
-                .text_size(TypeScale::chip(&tokens))
-                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .text_color(tokens.live_ink)
-                .child(kind),
-        )
-        .child(
-            ControlRole::Ellipsizing,
-            div()
-                .text_size(TypeScale::body(&tokens))
-                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .text_color(tokens.ink_on_wash)
-                .debug_selector(|| "capture-target-name".into())
-                .child(capture_target_name(target)),
-        )
-        .child(
-            ControlRole::Expendable,
-            div()
-                .min_w_0()
-                .text_size(TypeScale::body(&tokens))
-                .text_color(tokens.muted_on_wash)
-                .whitespace_nowrap()
-                .debug_selector(|| "capture-scope-chips".into())
-                .child(scope_sentence(target)),
-        )
-        .child(
-            ControlRole::Essential,
-            div()
-                .debug_selector(|| "capture-clock".into())
-                .font_family(TypeScale::mono(cx))
-                .text_size(TypeScale::clock(&tokens))
-                .text_color(tokens.ink_on_wash)
-                .child(format_clock(elapsed)),
-        )
-        // No Pause control, decided (not deferred) by T079. Compressing the timeline to keep
-        // ADR-0018's transcript-time-is-media-time identity intact is buildable, but the writer,
-        // origin tracking, and segment sink already carry real ScreenCaptureKit/AVFoundation
-        // fragility (see ADR-0018's amendments), and pause behaviour can only be proven against a
-        // real signed capture — infrastructure this codebase does not yet have outside a manual
-        // maintainer run. Stop-and-start-a-new-recording is the supported way to break up a
-        // session; two recordings are a more honest record than one with an unverified hole in it.
-        .child(
-            ControlRole::Essential,
-            div()
-                .debug_selector(|| "capture-stop-control".into())
-                .child(
-                    Button::new("stop-recording", tokens)
-                        .label(if stopping { "Stopping…" } else { "Stop" })
-                        .danger()
-                        .with_size(Size::Small)
-                        .disabled(stopping)
-                        .on_click(cx.listener(|this, _, _, cx| this.stop_session(cx))),
-                ),
-        )
-        .finish()
-        .w_full()
-        .min_w(MIN_WORKSPACE_WIDTH)
-        .flex_none()
-        .gap(Space::MD)
-        .px(Space::MD)
-        .py(Space::SM)
-        .min_h(px(46.0))
-        .bg(tokens.live_wash)
-        .border_b_1()
-        .border_color(tokens.live_line)
-        .debug_selector(|| "capture-bar".into())
         .into_any_element()
 }
 
@@ -759,7 +743,7 @@ fn render_prepared_entry(
                 .flex()
                 .gap(Space::SM)
                 .child(
-                    Button::new("save-prep-note", tokens)
+                    Button::new("save-prep-note")
                         .label("Save prep note")
                         .with_size(Size::Small)
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -768,7 +752,7 @@ fn render_prepared_entry(
                 )
                 .child(
                     div().debug_selector(|| "capture-into-entry".into()).child(
-                        Button::new("capture-into-entry-button", tokens)
+                        Button::new("capture-into-entry-button")
                             .label("Capture into this entry")
                             .primary()
                             .with_size(Size::Small)
@@ -829,7 +813,7 @@ fn render_entry_view_bar(
             stage_tabs(tab, tokens, cx)
         })
         .child_when(live_elsewhere, ControlRole::Expendable, || {
-            Button::new("back-to-live", tokens)
+            Button::new("back-to-live")
                 .label("Back to recording")
                 .with_size(Size::Small)
                 .on_click(cx.listener(|this, _, _, cx| this.return_to_live(cx)))
@@ -838,7 +822,7 @@ fn render_entry_view_bar(
         .child(
             ControlRole::Essential,
             div().debug_selector(|| "capture-again".into()).child(
-                Button::new("capture-again-button", tokens)
+                Button::new("capture-again-button")
                     .label(if count == 0 {
                         "Capture"
                     } else {
@@ -849,7 +833,7 @@ fn render_entry_view_bar(
             ),
         )
         .child_when(session.is_some(), ControlRole::Expendable, || {
-            Button::new("retranscribe-session", tokens)
+            Button::new("retranscribe-session")
                 .label(retranscription_label(
                     retranscribing,
                     retranscription_unavailable,
@@ -863,7 +847,7 @@ fn render_entry_view_bar(
                 .into_any_element()
         })
         .child_when(session.is_some(), ControlRole::Expendable, || {
-            Button::new("reveal-recording", tokens)
+            Button::new("reveal-recording")
                 .label("Reveal")
                 .tooltip("Show this recording in Finder")
                 .with_size(Size::Small)
@@ -942,7 +926,7 @@ fn render_sessions_strip(
             div()
                 .debug_selector(|| "entry-delete-recording-control".into())
                 .child(
-                    Button::new("delete-selected-recording", tokens)
+                    Button::new("delete-selected-recording")
                         .label("Delete recording…")
                         .ghost()
                         .with_size(Size::Small)
@@ -1010,7 +994,7 @@ fn render_view_bar(
             div()
                 .debug_selector(|| "view-back-to-live".into())
                 .child(
-                    Button::new("back-to-live", tokens)
+                    Button::new("back-to-live")
                         .label("Back to recording")
                         .with_size(Size::Small)
                         .on_click(cx.listener(|this, _, _, cx| this.return_to_live(cx))),
@@ -1020,7 +1004,7 @@ fn render_view_bar(
         .child(
             ControlRole::Expendable,
             div().child(
-                Button::new("retranscribe-session", tokens)
+                Button::new("retranscribe-session")
                     .label(retranscription_label(
                         retranscribing,
                         retranscription_unavailable,
@@ -1038,7 +1022,7 @@ fn render_view_bar(
             div().debug_selector(|| "view-reveal-control".into()).child(
                 // The mock's word, not an abbreviation of ours: the bar already says which
                 // recording is open, so "recording" was repeating its own title.
-                Button::new("reveal-recording", tokens)
+                Button::new("reveal-recording")
                     .label("Reveal")
                     .tooltip("Show this recording in Finder")
                     .with_size(Size::Small)
@@ -2225,9 +2209,12 @@ mod tests {
         let stage = visual
             .debug_bounds("workspace-stage")
             .ok_or_else(|| std::io::Error::other("the stage must render"))?;
+        // `library-home` is the small suffix probe retained for the native `SidebarMenuItem`;
+        // the kit owns and clips the actual row. Its presence and leading edge prove the Home
+        // item is in the rail, while the label probe below verifies the visible content fits.
         assert!(
-            home.left() >= rail.left() && home.right() <= rail.right() && home.size.width > px(0.0),
-            "the Home entry must fit the rail at the narrowest supported width"
+            home.left() >= rail.left() && home.size.width > px(0.0),
+            "the Home entry must render inside the rail at the narrowest supported width"
         );
         assert!(
             title.left() >= rail.left() && title.right() <= rail.right(),
@@ -2430,16 +2417,11 @@ mod tests {
                 && visual.debug_bounds("titlebar-theme").is_none(),
             "the in-window title-bar row is gone; macOS carries that chrome now"
         );
-        // The one band that remains is the transparent titlebar's, kept clear because macOS draws
-        // the traffic lights over it. It is not a second copy of the OS's chrome — it holds no
-        // control at all — but the state bar does sit below it.
+        // The stock gpui-kit title bar owns the top band. Its child toolbar must remain directly
+        // above the state bar; its absolute y-position is platform-owned.
         let strip = visual
             .debug_bounds("title-strip")
-            .ok_or_else(|| std::io::Error::other("the traffic-light strip must be reserved"))?;
-        assert!(
-            strip.top() <= px(1.0),
-            "the reserved strip belongs at the very top of the window"
-        );
+            .ok_or_else(|| std::io::Error::other("the kit title-bar toolbar must render"))?;
         assert!(
             bar.top() >= strip.bottom() && bar.top() < strip.bottom() + px(24.0),
             "the state bar sits immediately under the traffic-light strip, not below a second band"
@@ -3249,10 +3231,9 @@ mod tests {
             .collect()
     }
 
-    /// The strip macOS reserves for its own buttons is Sotto's toolbar now, and the whole
-    /// justification for putting anything there is that the traffic lights keep their corner.
+    /// The gpui-kit title bar owns the macOS traffic-light inset and contains Sotto's toolbar.
     #[test]
-    fn the_toolbar_fills_the_strip_without_reaching_under_the_traffic_lights()
+    fn the_toolbar_uses_the_kit_title_bar_without_overflow()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         cx.update(gpui_kit::init);
@@ -3263,15 +3244,10 @@ mod tests {
 
         let strip = visual
             .debug_bounds("title-strip")
-            .ok_or_else(|| std::io::Error::other("the traffic-light strip must be reserved"))?;
+            .ok_or_else(|| std::io::Error::other("the kit title-bar toolbar must render"))?;
         assert!(
-            strip.top() <= px(1.0),
-            "the toolbar is the reserved strip, so it belongs at the very top of the window"
-        );
-        assert_eq!(
-            strip.size.height,
-            crate::workspace::TITLE_STRIP_HEIGHT,
-            "the toolbar must cost no height beyond the strip that already existed"
+            strip.size.height <= crate::workspace::TITLE_STRIP_HEIGHT,
+            "the toolbar must fit inside the stock kit title bar"
         );
         for (selector, bounds) in TOOLBAR_CONTROLS.into_iter().zip(toolbar_bounds(visual)?) {
             assert!(
@@ -3279,9 +3255,8 @@ mod tests {
                 "{selector} must have real width, not be built and then collapsed away"
             );
             assert!(
-                bounds.left() >= TOOLBAR_LEADING_INSET,
-                "{selector} starts at {:?}, which is under the traffic lights",
-                bounds.left()
+                bounds.left() >= strip.left(),
+                "{selector} must remain inside the kit title bar",
             );
             assert!(
                 bounds.right() <= WIDE_WORKSPACE_WIDTH,
@@ -3698,6 +3673,11 @@ mod tests {
                 visual.run_until_parked();
                 let state = format!("collapsed={collapsed}, ask_open={ask_open}");
 
+                let toolbar = visual.debug_bounds("title-strip").ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "the kit title-bar toolbar must render ({state})"
+                    ))
+                })?;
                 let bar = visual.debug_bounds("capture-bar").ok_or_else(|| {
                     std::io::Error::other(format!("the capture bar must render ({state})"))
                 })?;
@@ -3715,10 +3695,9 @@ mod tests {
                 {
                     assert!(
                         bounds.size.width > px(0.0)
-                            && bounds.left() >= TOOLBAR_LEADING_INSET
+                            && bounds.left() >= toolbar.left()
                             && bounds.right() <= MIN_WORKSPACE_WIDTH,
-                        "{selector} must stay clear of the traffic lights and inside the window \
-                         ({state})"
+                        "{selector} must stay inside the kit title bar and window ({state})"
                     );
                 }
                 let stage = visual.debug_bounds("workspace-stage").ok_or_else(|| {

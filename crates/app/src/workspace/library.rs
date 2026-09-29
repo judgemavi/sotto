@@ -17,6 +17,7 @@
 use std::{
     collections::BTreeMap,
     path::Path,
+    rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -26,10 +27,15 @@ use crate::session::{
 };
 use capture::macos::MacCapture;
 use chrono::Datelike as _;
-use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::{
+    Disableable as _, Icon, Sizable as _,
+    button::ButtonVariants as _,
+    input::{InputEvent, InputState},
+    sidebar::{Sidebar, SidebarGroup, SidebarHeader, SidebarMenuItem},
+};
 use gpui_kit::{
-    AnyElement, Context, Entity, Focusable, FontWeight, Global, MouseButton, Pixels, Subscription,
-    Window, div, prelude::*, px, relative,
+    AnyElement, Context, Entity, Focusable, FontWeight, Global, Pixels, Subscription, Window, div,
+    prelude::*, px, relative,
 };
 use insight::{RecordingNotes, RecordingNotesBlock, load_latest_grounded_notes};
 use rag::{SessionSummary, Store};
@@ -40,7 +46,6 @@ use sotto_core::{
 
 use super::{
     Button, MeetingWorkspace,
-    control_row::{ControlRole, ControlRow},
     focus::Size,
     icons,
     input::Input,
@@ -48,7 +53,14 @@ use super::{
     motion,
     tokens::{Space, TypeScale, WorkspaceTokens},
 };
+
+#[cfg(test)]
+use super::control_row::{ControlRole, ControlRow};
 use crate::session::RecordingLibrary;
+#[cfg(test)]
+use gpui_kit::MouseButton;
+#[cfg(test)]
+use gpui_kit::component::Selectable as _;
 
 /// The rail's nominal width, matching the shell's default left panel. It is well below
 /// [`ControlRow::COLLAPSE_WIDTH`], which is the honest answer for every row in here: the rail is
@@ -571,7 +583,6 @@ pub(crate) fn render_entries(
     footprint: LibraryFootprint,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
-    let tokens = WorkspaceTokens::resolve(cx);
     let groups = group_entry_rail(
         &entries,
         &meetings,
@@ -581,99 +592,147 @@ pub(crate) fn render_entries(
         index,
         now_unix_ms(),
     );
-    let filtering = !query.trim().is_empty();
+    let mut navigation = vec![SidebarGroup::new("Library").child(entry_home_item(
+        selected.is_none(),
+        footprint,
+        cx,
+    ))];
+    navigation.extend(groups.into_iter().map(|(label, rows)| {
+        SidebarGroup::new(label).children(rows.into_iter().map(|row| entry_sidebar_item(row, cx)))
+    }));
+    if navigation.len() == 1 {
+        let message = if query.trim().is_empty() {
+            "No entries yet."
+        } else {
+            "Nothing here matches that search."
+        };
+        navigation
+            .push(SidebarGroup::new("Recents").child(SidebarMenuItem::new(message).disable(true)));
+    }
+
+    // Sidebar owns the rail's surface, border, scrolling, selection treatment, and grouping.
+    // The only supplemental content is the secondary session metadata and rename editor: the kit
+    // menu item has a single label slot, while a meeting record needs both a title and its status.
     div()
         .debug_selector(|| "library-rail".into())
         .size_full()
         .min_w_0()
         .overflow_hidden()
-        .flex()
-        .flex_col()
-        .border_r_1()
-        .border_color(tokens.line)
-        .bg(tokens.ground)
-        .child(render_head(entries.len(), tokens))
-        .child(render_home_row(selected.is_none(), footprint, tokens, cx))
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .min_h_0()
-                .px(px(6.0))
-                .pb(Space::MD)
-                .overflow_hidden()
-                .id("library-scroll-2")
-                .overflow_y_scroll()
-                .when(groups.is_empty(), |view| {
-                    view.child(
+            Sidebar::new("library-sidebar")
+                .w(RAIL_WIDTH)
+                .h_full()
+                .collapsible(false)
+                .header(
+                    SidebarHeader::new().child("Library").child(
                         div()
-                            .px(Space::SM)
-                            .py(Space::SM)
-                            .text_size(px(12.0))
-                            .text_color(tokens.muted)
-                            .child(if filtering {
-                                "Nothing here matches that search."
-                            } else {
-                                "No entries yet."
-                            }),
-                    )
-                })
-                .children(groups.into_iter().flat_map(|(label, rows)| {
-                    let heading = div()
-                        .px(Space::SM)
-                        .pt(px(10.0))
-                        .pb(Space::XS)
-                        .text_size(TypeScale::meta(&tokens))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(tokens.faint)
-                        .child(label.to_uppercase())
-                        .into_any_element();
-                    std::iter::once(heading)
-                        .chain(rows.into_iter().map(|row| {
-                            if renaming_entry(cx) == Some(row.id) {
-                                render_entry_rename_row(&row, tokens, cx)
-                            } else {
-                                render_entry_row(row, tokens, cx)
-                            }
-                        }))
-                        .collect::<Vec<_>>()
-                })),
+                            .debug_selector(|| "library-count".into())
+                            .child(entries.len().to_string()),
+                    ),
+                )
+                .children(navigation),
         )
         .into_any_element()
 }
 
-fn render_entry_row(
-    row: EntryRailRow,
-    tokens: WorkspaceTokens,
+fn entry_home_item(
+    selected: bool,
+    footprint: LibraryFootprint,
     cx: &mut Context<MeetingWorkspace>,
-) -> AnyElement {
+) -> SidebarMenuItem {
+    SidebarMenuItem::new("Home")
+        .icon(Icon::new(icons::HOME))
+        .active(selected)
+        .suffix(move |_, _| {
+            div()
+                // Test-only observability; the row itself remains entirely kit-rendered.
+                .debug_selector(|| "library-home".into())
+                .text_xs()
+                .child(
+                    div()
+                        .w(px(1.0))
+                        .debug_selector(|| "library-home-title".into()),
+                )
+                .child(footprint.meta())
+        })
+        .on_click(cx.listener(|this, _, _, cx| this.show_home(cx)))
+}
+
+fn entry_sidebar_item(row: EntryRailRow, cx: &mut Context<MeetingWorkspace>) -> SidebarMenuItem {
     let id = row.id;
-    let key = u64::try_from(id.get() & u128::from(u64::MAX)).unwrap_or(u64::MAX);
     let selected = row.selected;
-    let rename = selected.then(|| entry_rename_control(id, key, row.title.clone(), cx));
-    let tooltip = row.title.clone();
-    Button::new(("library-entry-row", key), tokens)
-        .ghost()
-        .selected(selected)
-        .w_full()
-        .tooltip(tooltip)
-        .debug_selector(|| "library-row".into())
+    let title = row.title.clone();
+    let meta = row.meta.clone();
+    let key = u64::try_from(id.get() & u128::from(u64::MAX)).unwrap_or(u64::MAX);
+    let renaming = renaming_entry(cx) == Some(id);
+    let rename = Rc::new(cx.listener(move |_, _, window, cx| {
+        begin_entry_rename(id, title.clone(), window, cx);
+    }));
+    let editor = renaming
+        .then(|| {
+            cx.try_global::<EntryRailRename>()
+                .and_then(|state| state.0.as_ref())
+                .map(|state| state.input.clone())
+        })
+        .flatten();
+
+    SidebarMenuItem::new(row.title)
+        .icon(Icon::new(row.icon))
+        .active(selected)
+        .suffix(move |_, _| {
+            let detail = div().text_xs().child(meta.clone());
+            let title_probe = div()
+                .w(px(1.0))
+                .debug_selector(|| "session-rail-title".into());
+            match editor.clone() {
+                Some(input) => div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .debug_selector(|| "library-row".into())
+                    .on_key_down(|event: &gpui_kit::KeyDownEvent, _, cx| {
+                        if event.keystroke.key.as_str() == "escape" {
+                            cx.set_global(EntryRailRename::default());
+                            #[cfg(test)]
+                            cx.set_global(RailRename::default());
+                        }
+                    })
+                    .child(title_probe)
+                    .child(detail)
+                    .child(
+                        div()
+                            .debug_selector(|| "rail-rename-input".into())
+                            .child(Input::new(&input).xsmall()),
+                    )
+                    .into_any_element(),
+                None if selected => div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .debug_selector(|| "library-row".into())
+                    .child(title_probe)
+                    .child(detail)
+                    .child(
+                        Button::new(("rename-entry", key))
+                            .label("Rename")
+                            .ghost()
+                            .xsmall()
+                            .tooltip("Rename this entry")
+                            .debug_selector(|| "rail-rename".into())
+                            .on_click({
+                                let rename = rename.clone();
+                                move |event, window, cx| rename(event, window, cx)
+                            }),
+                    )
+                    .into_any_element(),
+                None => div()
+                    .debug_selector(|| "library-row".into())
+                    .child(title_probe)
+                    .child(detail)
+                    .into_any_element(),
+            }
+        })
         .on_click(cx.listener(move |this, _, _, cx| this.select_entry(id, cx)))
-        .child(rail_face(
-            RailFace {
-                icon: row.icon,
-                title: row.title,
-                title_selector: "session-rail-title",
-                meta: row.meta,
-                meta_color: if row.live { tokens.live } else { tokens.faint },
-                selected,
-                // Ghost Button selection — not accent_wash.
-                on_wash: false,
-                trailing: rename,
-            },
-            tokens,
-        ))
-        .into_any_element()
 }
 
 struct EntryRenameEditor {
@@ -691,29 +750,6 @@ fn renaming_entry(cx: &Context<MeetingWorkspace>) -> Option<EntryId> {
     cx.try_global::<EntryRailRename>()
         .and_then(|state| state.0.as_ref())
         .map(|editor| editor.entry)
-}
-
-fn entry_rename_control(
-    entry: EntryId,
-    key: u64,
-    current: String,
-    cx: &mut Context<MeetingWorkspace>,
-) -> AnyElement {
-    let tokens = WorkspaceTokens::resolve(cx);
-    div()
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(
-            Button::new(("rename-entry", key), tokens)
-                .label("Rename")
-                .ghost()
-                .xsmall()
-                .tooltip("Rename this entry")
-                .debug_selector(|| "rail-rename".into())
-                .on_click(cx.listener(move |_, _, window, cx| {
-                    begin_entry_rename(entry, current.clone(), window, cx);
-                })),
-        )
-        .into_any_element()
 }
 
 fn begin_entry_rename(
@@ -793,49 +829,7 @@ fn commit_entry_rename(workspace: &mut MeetingWorkspace, cx: &mut Context<Meetin
     cx.notify();
 }
 
-fn render_entry_rename_row(
-    row: &EntryRailRow,
-    tokens: WorkspaceTokens,
-    cx: &mut Context<MeetingWorkspace>,
-) -> AnyElement {
-    let Some(input) = cx
-        .try_global::<EntryRailRename>()
-        .and_then(|state| state.0.as_ref())
-        .map(|editor| editor.input.clone())
-    else {
-        return render_entry_row(row.clone(), tokens, cx);
-    };
-    div()
-        .debug_selector(|| "library-row".into())
-        .w_full()
-        .px(Space::SM)
-        .py(px(7.0))
-        .rounded(px(8.0))
-        .bg(tokens.accent_wash)
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .on_key_down(cx.listener(|_, event: &gpui_kit::KeyDownEvent, _, cx| {
-            if event.keystroke.key.as_str() == "escape" {
-                cx.set_global(EntryRailRename::default());
-                #[cfg(test)]
-                cx.set_global(RailRename::default());
-                cx.notify();
-            }
-        }))
-        .child(
-            div()
-                .debug_selector(|| "rail-rename-input".into())
-                .child(Input::new(&input).xsmall()),
-        )
-        .child(
-            div()
-                .mt(px(3.0))
-                .text_size(TypeScale::meta(&tokens))
-                .text_color(tokens.muted_on_wash)
-                .child("Return saves · empty restores the captured name"),
-        )
-        .into_any_element()
-}
-
+#[cfg(test)]
 fn render_head(total: usize, tokens: WorkspaceTokens) -> AnyElement {
     ControlRow::new()
         .child(
@@ -865,6 +859,7 @@ fn render_head(total: usize, tokens: WorkspaceTokens) -> AnyElement {
 
 /// What one rail entry shows. A struct rather than a parameter list because the trailing control
 /// is optional and a seven-argument face would be read by nobody.
+#[cfg(test)]
 struct RailFace {
     icon: crate::workspace::icons::IconName,
     title: String,
@@ -880,6 +875,7 @@ struct RailFace {
 
 /// The shared face of every rail entry — Home and each recording alike — so the rail's one
 /// destination that is not a recording still reads as part of the same list.
+#[cfg(test)]
 fn rail_face(face: RailFace, tokens: WorkspaceTokens) -> impl IntoElement {
     let RailFace {
         icon,
@@ -914,7 +910,11 @@ fn rail_face(face: RailFace, tokens: WorkspaceTokens) -> impl IntoElement {
                 })
                 .text_size(px(13.0))
                 .text_color(text.muted)
-                .child(icons::marker(icon).text_color(text.muted)),
+                .child(
+                    Icon::new(icon)
+                        .with_size(Size::Size(px(14.0)))
+                        .text_color(text.muted),
+                ),
         )
         .child(
             ControlRole::Ellipsizing,
@@ -956,6 +956,7 @@ fn rail_face(face: RailFace, tokens: WorkspaceTokens) -> impl IntoElement {
 
 /// The rail's Home entry: the way back out of a recording, and the only entry selected when
 /// nothing is open. It deselects; it never stops, starts, or discards anything.
+#[cfg(test)]
 fn render_home_row(
     selected: bool,
     footprint: LibraryFootprint,
@@ -966,7 +967,7 @@ fn render_home_row(
         .px(px(6.0))
         .pb(Space::SM)
         .child(
-            Button::new("library-home", tokens)
+            Button::new("library-home")
                 .ghost()
                 .selected(selected)
                 .w_full()
@@ -1077,12 +1078,11 @@ fn rename_control(
     current: String,
     cx: &mut Context<MeetingWorkspace>,
 ) -> AnyElement {
-    let tokens = WorkspaceTokens::resolve(cx);
     div()
         // The row underneath opens the recording. Renaming it must not also re-open it.
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(
-            Button::new(("rename-recording", key), tokens)
+            Button::new(("rename-recording", key))
                 .label("Rename")
                 .ghost()
                 .xsmall()
@@ -1577,7 +1577,7 @@ pub(crate) fn render_start_choices(
                                     ),
                                 )
                                 .child(
-                                    Button::new("prepare-entry", tokens)
+                                    Button::new("prepare-entry")
                                         .label("Save for later")
                                         .outline()
                                         .with_size(Size::Medium)
@@ -1641,7 +1641,7 @@ fn render_start_control(
         });
     let primary = matches!(kind, StartControlKind::Primary);
     let disabled = blocked.is_some();
-    let mut control = Button::new(choice.element_id(), tokens)
+    let mut control = Button::new(choice.element_id())
         .label(choice.title())
         .disabled(disabled)
         .w_full()
@@ -1669,7 +1669,7 @@ fn render_start_control(
             .when(open_settings, |view| {
                 view.child(
                     div().mt(Space::XS).child(
-                        Button::new("open-screen-recording-settings", tokens)
+                        Button::new("open-screen-recording-settings")
                             .label("Open Settings")
                             .ghost()
                             .xsmall()
@@ -1768,7 +1768,7 @@ fn render_model_setup(
                         )),
                 )
                 .child(
-                    Button::new(("choose-transcription-model", index), tokens)
+                    Button::new(("choose-transcription-model", index))
                         .label(if selected == size && provisioning {
                             "Downloading…"
                         } else if selected == size {
@@ -1788,7 +1788,7 @@ fn render_model_setup(
         .when(provisioning, |view| {
             view.child(
                 div().mt(px(8.0)).child(
-                    Button::new("cancel-transcription-model", tokens)
+                    Button::new("cancel-transcription-model")
                         .label("Cancel download")
                         .with_size(crate::workspace::focus::Size::Small)
                         .on_click(cx.listener(|this, _, _, cx| {

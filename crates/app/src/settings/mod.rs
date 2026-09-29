@@ -30,7 +30,11 @@ use std::{
     time::Duration,
 };
 
-use gpui_kit::component::input::InputState;
+use gpui_kit::component::{Disableable as _, input::InputState};
+use gpui_kit::component::{
+    group_box::{GroupBox, GroupBoxVariants as _},
+    setting::{SelectIndex, SettingGroup, SettingItem, SettingPage, Settings},
+};
 use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, Context, Entity, EventEmitter, FocusHandle,
     IntoElement, KeyDownEvent, Pixels, Render, Subscription, Window, div, ease_out_quint,
@@ -69,14 +73,6 @@ const SHEET_MAX_WIDTH: Pixels = px(760.0);
 const SHEET_MAX_HEIGHT: Pixels = px(600.0);
 const SHEET_INSET_X: Pixels = px(24.0);
 const SHEET_INSET_Y: Pixels = px(32.0);
-const NAV_WIDTH: Pixels = px(168.0);
-
-/// Below this width the left nav stacks above the pane instead of eating it.
-///
-/// A 168px rail out of a 372px sheet leaves a pane too narrow for the action rows the Codex and
-/// OpenAI cards carry, and a clipped button is exactly the defect this redesign is meant to remove.
-const NAV_STACKS_BELOW: Pixels = px(640.0);
-
 fn input_state(
     placeholder: impl Into<gpui_kit::SharedString>,
     content: impl Into<String>,
@@ -127,6 +123,16 @@ pub struct SettingsView {
     /// Which of the four panes is showing. Not persisted: the sheet always opens on the pane the
     /// product wants read first.
     pane: SettingsPane,
+    /// Stable page bodies for the kit's virtualized settings list.
+    ///
+    /// `Settings` retains the page/item render closures between frames. Recreating an entity from
+    /// inside this parent's render left those closures pointing at a body that had already been
+    /// replaced by the next parent render, which made mounted pages appear blank. The bodies are
+    /// therefore created once after this view is an entity and updated explicitly when their
+    /// snapshot input changes.
+    pane_contents: Vec<Entity<SettingsPaneContent>>,
+    /// Reopening starts the kit's keyed selection state over at the product default.
+    settings_generation: u64,
     /// Focused on open so Escape reaches the sheet rather than the bare window root.
     focus_handle: FocusHandle,
 }
@@ -181,15 +187,6 @@ impl SettingsPane {
         }
     }
 
-    fn nav_selector(self) -> &'static str {
-        match self {
-            Self::StorageAndPrivacy => "settings-nav-storage",
-            Self::Recording => "settings-nav-recording",
-            Self::Transcription => "settings-nav-transcription",
-            Self::SummariesAndAsk => "settings-nav-summaries",
-        }
-    }
-
     fn pane_selector(self) -> &'static str {
         match self {
             Self::StorageAndPrivacy => "settings-pane-storage",
@@ -197,6 +194,53 @@ impl SettingsPane {
             Self::Transcription => "settings-pane-transcription",
             Self::SummariesAndAsk => "settings-pane-summaries",
         }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::StorageAndPrivacy => 0,
+            Self::Recording => 1,
+            Self::Transcription => 2,
+            Self::SummariesAndAsk => 3,
+        }
+    }
+}
+
+/// A kit settings page can host an ordinary GPUI view as one field. Keeping the dynamic panes in
+/// this child entity means the kit retains ownership of page selection and navigation while the
+/// existing controller remains the single owner of provider, MCP, and recording mutations.
+struct SettingsPaneContent {
+    pane: SettingsPane,
+    settings: gpui_kit::WeakEntity<SettingsView>,
+    reasoning: Entity<ReasoningController>,
+    key_input: Entity<InputState>,
+    model_input: Entity<InputState>,
+    codex_model_input: Entity<InputState>,
+    mcp: Entity<McpController>,
+    mcp_id_input: Entity<InputState>,
+    mcp_name_input: Entity<InputState>,
+    mcp_endpoint_input: Entity<InputState>,
+    mcp_token_input: Entity<InputState>,
+    recording_library: RecordingLibrary,
+    recording_snapshot: Option<RecordingLibrarySnapshot>,
+    recording_budget_input: Entity<InputState>,
+}
+
+impl Render for SettingsPaneContent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let pane = self.pane;
+        let tokens = WorkspaceTokens::resolve(cx);
+        let content = match pane {
+            SettingsPane::StorageAndPrivacy => self.storage_pane(tokens, cx),
+            SettingsPane::Recording => recording_pane(tokens),
+            SettingsPane::Transcription => transcription_pane(tokens),
+            SettingsPane::SummariesAndAsk => self.summaries_pane(tokens, cx),
+        };
+        div()
+            .w_full()
+            .min_w_0()
+            .debug_selector(move || pane.pane_selector().into())
+            .child(content)
     }
 }
 
@@ -282,16 +326,13 @@ impl SettingsView {
             action_message,
             validation_lease: ValidationLease::default(),
             pane: SettingsPane::default(),
+            pane_contents: Vec::new(),
+            settings_generation: 0,
             focus_handle,
         };
         view.poll_codex(cx);
         view.poll_mcp(cx);
         view
-    }
-
-    fn select_pane(&mut self, pane: SettingsPane, cx: &mut Context<Self>) {
-        self.pane = pane;
-        cx.notify();
     }
 
     /// Re-opens an already-built sheet.
@@ -303,8 +344,9 @@ impl SettingsView {
     /// reaches the sheet rather than the window root.
     pub fn reopen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.pane = SettingsPane::default();
+        self.settings_generation = self.settings_generation.wrapping_add(1);
         self.action_message = None;
-        self.refresh_recordings();
+        self.refresh_recordings(cx);
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -539,13 +581,20 @@ impl SettingsView {
         cx.notify();
     }
 
-    fn refresh_recordings(&mut self) {
+    fn refresh_recordings(&mut self, cx: &mut Context<Self>) {
         match self.recording_library.snapshot() {
             Ok(snapshot) => self.recording_snapshot = Some(snapshot),
             Err(error) => {
                 self.action_message =
                     Some(format!("Could not refresh the recording library: {error}"));
             }
+        }
+        let snapshot = self.recording_snapshot.clone();
+        for content in &self.pane_contents {
+            content.update(cx, |content, cx| {
+                content.recording_snapshot = snapshot.clone();
+                cx.notify();
+            });
         }
     }
 
@@ -568,7 +617,7 @@ impl SettingsView {
             )),
             Err(error) => Some(error),
         };
-        self.refresh_recordings();
+        self.refresh_recordings(cx);
         cx.notify();
     }
 
@@ -610,7 +659,7 @@ impl SettingsView {
             Ok(false) => Some("That meeting no longer has local media.".to_owned()),
             Err(error) => Some(format!("Could not delete the recording: {error}")),
         };
-        self.refresh_recordings();
+        self.refresh_recordings(cx);
         cx.notify();
     }
 }
@@ -677,14 +726,6 @@ const DELETE_OPENAI_KEY_SELECTOR: &str = "settings-delete-openai-key";
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = WorkspaceTokens::resolve(cx);
-        let stacked_nav = window.viewport_size().width < NAV_STACKS_BELOW;
-        let pane = self.pane;
-        let body = match pane {
-            SettingsPane::StorageAndPrivacy => self.storage_pane(tokens, cx),
-            SettingsPane::Recording => recording_pane(tokens),
-            SettingsPane::Transcription => transcription_pane(tokens),
-            SettingsPane::SummariesAndAsk => self.summaries_pane(tokens, cx),
-        };
         let mcp_message = self.mcp.read(cx).status_message().map(ToOwned::to_owned);
         let controller_message = self
             .reasoning
@@ -693,79 +734,70 @@ impl Render for SettingsView {
             .map(ToOwned::to_owned);
         let action_message = self.action_message.clone();
 
-        let nav = SettingsPane::ALL
-            .into_iter()
-            .map(|item| nav_item(item, pane, stacked_nav, tokens, cx))
-            .collect::<Vec<_>>();
-
-        let split = div()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .flex()
-            .when(stacked_nav, |view| view.flex_col())
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .gap(px(2.0))
-                    .p(Space::SM)
-                    .bg(tokens.ground)
-                    .debug_selector(|| "settings-nav".into())
-                    .when(stacked_nav, |view| {
-                        view.w_full()
-                            .flex_wrap()
-                            .border_b_1()
-                            .border_color(tokens.line_soft)
+        // This is the kit's settings composition, not a Sidebar assembled by Sotto. It owns the
+        // searchable settings navigation, selected-page highlight, responsive field layout,
+        // scrolling and native group surfaces. Pane bodies remain separate views because their
+        // controls dispatch into this controller, rather than becoming a second settings state.
+        if self.pane_contents.is_empty() {
+            let settings = cx.entity().downgrade();
+            self.pane_contents = SettingsPane::ALL
+                .into_iter()
+                .map(|pane| {
+                    cx.new(|_| SettingsPaneContent {
+                        pane,
+                        settings: settings.clone(),
+                        reasoning: self.reasoning.clone(),
+                        key_input: self.key_input.clone(),
+                        model_input: self.model_input.clone(),
+                        codex_model_input: self.codex_model_input.clone(),
+                        mcp: self.mcp.clone(),
+                        mcp_id_input: self.mcp_id_input.clone(),
+                        mcp_name_input: self.mcp_name_input.clone(),
+                        mcp_endpoint_input: self.mcp_endpoint_input.clone(),
+                        mcp_token_input: self.mcp_token_input.clone(),
+                        recording_library: self.recording_library.clone(),
+                        recording_snapshot: self.recording_snapshot.clone(),
+                        recording_budget_input: self.recording_budget_input.clone(),
                     })
-                    .when(!stacked_nav, |view| {
-                        view.w(NAV_WIDTH)
-                            .h_full()
-                            .flex_col()
-                            .border_r_1()
-                            .border_color(tokens.line_soft)
-                    })
-                    .children(nav),
-            )
-            // The scrolling wrapper deliberately carries no layout of its own: `Scrollable` lifts
-            // its element's style onto an outer div and clears it, so a column declared here would
-            // lose its direction, gap and padding and the pane would lay out as a row.
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(Space::MD)
-                            .px(px(20.0))
-                            .py(px(18.0))
-                            .debug_selector(move || pane.pane_selector().into())
-                            .child(
-                                div()
-                                    .child(
-                                        div()
-                                            .text_size(px(15.0))
-                                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                            .child(pane.title()),
-                                    )
-                                    .child(
-                                        div()
-                                            .mt(Space::XS)
-                                            .text_size(TypeScale::control(&tokens))
-                                            .text_color(tokens.muted)
-                                            .child(pane.lede()),
-                                    ),
+                })
+                .collect();
+        }
+        let pane_contents = self.pane_contents.clone();
+        // Keep the Settings identity stable while its native sidebar changes pages. A generation
+        // is only introduced for a controller-driven page selection, where the kit must seed a
+        // fresh selected index.
+        let settings = Settings::new(format!("sotto-settings-{}", self.settings_generation))
+            .sidebar_width(px(200.0))
+            .default_selected_index(SelectIndex {
+                page_ix: self.pane.index(),
+                group_ix: None,
+            })
+            .pages(
+                SettingsPane::ALL
+                    .into_iter()
+                    .zip(pane_contents)
+                    .map(|(pane, content)| {
+                        SettingPage::new(pane.title())
+                            .description(pane.lede())
+                            .resettable(false)
+                            .group(
+                                SettingGroup::new().item(
+                                    SettingItem::render(move |_, _, _| {
+                                        // An Entity is the GPUI mounting boundary. Returning it lets
+                                        // the settings list mount and drive this view's Render impl;
+                                        // calling `render` directly only builds an unmounted element
+                                        // during the list's layout pass, so its page body never paints.
+                                        content.clone()
+                                    })
+                                    // `SettingItem::render` has no title of its own; make each
+                                    // controller-backed page discoverable through kit search.
+                                    .keywords([pane.title(), pane.lede()]),
+                                ),
                             )
-                            .child(body),
-                    )
-                    .id("settings-scroll-1")
-                    .overflow_y_scroll(),
-            );
+                    }),
+            )
+            .render(window, cx)
+            .into_any_element();
 
         div()
             .track_focus(&self.focus_handle)
@@ -834,7 +866,14 @@ impl Render for SettingsView {
                                     ),
                             ),
                     )
-                    .child(split)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .debug_selector(|| "settings-native".into())
+                            .child(settings),
+                    )
                     .when_some(mcp_message, |view, message| {
                         view.child(notice(message, tokens))
                     })
@@ -853,7 +892,122 @@ impl Render for SettingsView {
     }
 }
 
-impl SettingsView {
+impl SettingsPaneContent {
+    fn apply_to_all(&mut self, backend: Option<&str>, cx: &mut Context<Self>) {
+        let _ = self
+            .settings
+            .update(cx, |settings, cx| settings.apply_to_all(backend, cx));
+    }
+
+    fn save_model(&mut self, cx: &mut Context<Self>) {
+        let _ = self.settings.update(cx, SettingsView::save_model);
+    }
+
+    fn save_codex_model(&mut self, cx: &mut Context<Self>) {
+        let _ = self.settings.update(cx, SettingsView::save_codex_model);
+    }
+
+    fn enable_codex(&mut self, cx: &mut Context<Self>) {
+        let _ = self.settings.update(cx, SettingsView::enable_codex);
+    }
+
+    fn disable_codex(&mut self, cx: &mut Context<Self>) {
+        let _ = self.settings.update(cx, SettingsView::disable_codex);
+    }
+
+    fn check_codex(&mut self, cx: &mut Context<Self>) {
+        let _ = self.settings.update(cx, SettingsView::check_codex);
+    }
+
+    fn save_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self
+            .settings
+            .update(cx, |settings, cx| settings.save_key(window, cx));
+    }
+
+    fn delete_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self
+            .settings
+            .update(cx, |settings, cx| settings.delete_key(window, cx));
+    }
+
+    fn validate_key(&mut self, cx: &mut Context<Self>) {
+        let _ = self.settings.update(cx, SettingsView::validate_key);
+    }
+
+    fn configure_mcp(&mut self, cx: &mut Context<Self>) {
+        let _ = self.settings.update(cx, SettingsView::configure_mcp);
+    }
+
+    fn discover_mcp(&mut self, server_id: mcp::ServerId, cx: &mut Context<Self>) {
+        let _ = self.settings.update(cx, |settings, cx| {
+            settings.action_message = settings
+                .mcp
+                .update(cx, |controller, cx| {
+                    controller.begin_discovery(server_id, cx)
+                })
+                .err()
+                .map(|error| error.to_string());
+            cx.notify();
+        });
+    }
+
+    fn delete_mcp_token(&mut self, server_id: mcp::ServerId, cx: &mut Context<Self>) {
+        let _ = self.settings.update(cx, |settings, cx| {
+            settings.action_message = settings
+                .mcp
+                .update(cx, |controller, cx| {
+                    controller.delete_bearer(&server_id, cx)
+                })
+                .err()
+                .map(|error| error.to_string());
+            cx.notify();
+        });
+    }
+
+    fn remove_mcp(&mut self, server_id: mcp::ServerId, cx: &mut Context<Self>) {
+        let _ = self.settings.update(cx, |settings, cx| {
+            settings.action_message = settings
+                .mcp
+                .update(cx, |controller, cx| {
+                    controller.remove_source(&server_id, cx)
+                })
+                .err()
+                .map(|error| error.to_string());
+            cx.notify();
+        });
+    }
+
+    fn save_mcp_token(
+        &mut self,
+        server_id: mcp::ServerId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.settings.update(cx, |settings, cx| {
+            settings.save_mcp_token(server_id, window, cx);
+        });
+    }
+
+    fn save_recording_budget(&mut self, cx: &mut Context<Self>) {
+        let _ = self
+            .settings
+            .update(cx, SettingsView::save_recording_budget);
+    }
+
+    fn delete_recording(
+        &mut self,
+        session_id: SessionId,
+        prompt: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = prompt.to_owned();
+        let _ = self.settings.update(cx, |settings, cx| {
+            settings.delete_recording(session_id, &prompt, window, cx);
+        });
+    }
+
     /// Leads, and is the default pane: what is kept, what it costs, and the one egress case.
     fn storage_pane(&self, tokens: WorkspaceTokens, cx: &mut Context<Self>) -> AnyElement {
         let recordings = self.recording_snapshot.clone();
@@ -898,7 +1052,7 @@ impl SettingsView {
                     .child(Input::new(&self.recording_budget_input))
                     .child(
                         action_row().child(
-                            Button::new("save-recording-budget", tokens)
+                            Button::new("save-recording-budget")
                                 .label("Save budget")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.save_recording_budget(cx);
@@ -1051,21 +1205,21 @@ impl SettingsView {
                 .child(
                     action_row()
                         .child(
-                            Button::new("all-no-reasoning", tokens)
+                            Button::new("all-no-reasoning")
                                 .label("Use no reasoning")
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.apply_to_all(None, cx)),
                                 ),
                         )
                         .child(
-                            Button::new("all-openai", tokens)
+                            Button::new("all-openai")
                                 .label("Use OpenAI for all")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.apply_to_all(Some(OPENAI_RESPONSES_BACKEND_ID), cx);
                                 })),
                         )
                         .child(
-                            Button::new("all-codex", tokens)
+                            Button::new("all-codex")
                                 .label("Use Codex for all")
                                 .disabled(!codex_enabled || !codex_ready)
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -1085,14 +1239,14 @@ impl SettingsView {
                     .child(
                         action_row()
                             .child(
-                                Button::new("save-codex-model", tokens)
+                                Button::new("save-codex-model")
                                     .label("Save model id")
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.save_codex_model(cx)),
                                     ),
                             )
                             .child(
-                                Button::new("check-codex", tokens)
+                                Button::new("check-codex")
                                     .label("Check login")
                                     .disabled(codex_checking)
                                     .on_click(cx.listener(|this, _, _, cx| this.check_codex(cx))),
@@ -1101,11 +1255,11 @@ impl SettingsView {
                             // or Ask until this button has been pressed with the disclosure
                             // above it on screen.
                             .child(if codex_enabled {
-                                Button::new("disable-codex", tokens)
+                                Button::new("disable-codex")
                                     .label("Disable Codex")
                                     .on_click(cx.listener(|this, _, _, cx| this.disable_codex(cx)))
                             } else {
-                                Button::new("enable-codex", tokens)
+                                Button::new("enable-codex")
                                     .label("Enable Codex — I understand")
                                     .disabled(!codex_ready)
                                     .on_click(cx.listener(|this, _, _, cx| this.enable_codex(cx)))
@@ -1126,7 +1280,7 @@ impl SettingsView {
                 .child(Input::new(&self.model_input))
                 .child(
                     action_row().child(
-                        Button::new("save-openai-model", tokens)
+                        Button::new("save-openai-model")
                             .label("Save model id")
                             .on_click(cx.listener(|this, _, _, cx| this.save_model(cx))),
                     ),
@@ -1135,7 +1289,7 @@ impl SettingsView {
                 .child(
                     action_row()
                         .child(
-                            Button::new("save-openai-key", tokens)
+                            Button::new("save-openai-key")
                                 .label("Save key")
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.save_key(window, cx)),
@@ -1145,7 +1299,7 @@ impl SettingsView {
                             div()
                                 .debug_selector(|| DELETE_OPENAI_KEY_SELECTOR.into())
                                 .child(
-                                    Button::new("delete-openai-key", tokens)
+                                    Button::new("delete-openai-key")
                                         .label("Delete key…")
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.delete_key(window, cx);
@@ -1153,7 +1307,7 @@ impl SettingsView {
                                 ),
                         )
                         .child(
-                            Button::new("validate-openai-key", tokens)
+                            Button::new("validate-openai-key")
                                 .label("Validate with OpenAI")
                                 .disabled(openai_validating)
                                 .on_click(cx.listener(|this, _, _, cx| this.validate_key(cx))),
@@ -1183,7 +1337,7 @@ impl SettingsView {
                 .child(Input::new(&self.mcp_endpoint_input))
                 .child(
                     action_row().child(
-                        Button::new("configure-mcp-http", tokens)
+                        Button::new("configure-mcp-http")
                             .label("Add HTTPS source")
                             .on_click(cx.listener(|this, _, _, cx| this.configure_mcp(cx))),
                     ),
@@ -1218,52 +1372,31 @@ impl SettingsView {
                 .child(
                     action_row()
                         .child(
-                            Button::new(("mcp-check", index), tokens)
+                            Button::new(("mcp-check", index))
                                 .label("Check and discover resources")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.action_message = this
-                                        .mcp
-                                        .update(cx, |controller, cx| {
-                                            controller.begin_discovery(discover_id.clone(), cx)
-                                        })
-                                        .err()
-                                        .map(|error| error.to_string());
-                                    cx.notify();
+                                    this.discover_mcp(discover_id.clone(), cx);
                                 })),
                         )
                         .child(
-                            Button::new(("mcp-token", index), tokens)
+                            Button::new(("mcp-token", index))
                                 .label("Store pasted token")
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.save_mcp_token(save_id.clone(), window, cx);
                                 })),
                         )
                         .child(
-                            Button::new(("mcp-token-delete", index), tokens)
+                            Button::new(("mcp-token-delete", index))
                                 .label("Delete token")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.action_message = this
-                                        .mcp
-                                        .update(cx, |controller, cx| {
-                                            controller.delete_bearer(&delete_id, cx)
-                                        })
-                                        .err()
-                                        .map(|error| error.to_string());
-                                    cx.notify();
+                                    this.delete_mcp_token(delete_id.clone(), cx);
                                 })),
                         )
                         .child(
-                            Button::new(("mcp-remove", index), tokens)
+                            Button::new(("mcp-remove", index))
                                 .label("Remove source")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.action_message = this
-                                        .mcp
-                                        .update(cx, |controller, cx| {
-                                            controller.remove_source(&remove_id, cx)
-                                        })
-                                        .err()
-                                        .map(|error| error.to_string());
-                                    cx.notify();
+                                    this.remove_mcp(remove_id.clone(), cx);
                                 })),
                         ),
                 )
@@ -1386,33 +1519,6 @@ fn transcription_pane(tokens: WorkspaceTokens) -> AnyElement {
         .into_any_element()
 }
 
-/// One settings section switch.
-///
-/// Stock `Sidebar` is a docked panel with collapse/overlay behaviour, not a pane list.
-/// Stock `List` is a fixed-height `uniform_list` and cannot wrap into the stacked horizontal
-/// strip used under `STACKED_NAV_BELOW`. Stock vertical `ToggleGroup` cannot carry
-/// `settings-nav-*` selectors. Ghost + selected [`Button`] keeps those selectors, keyboard
-/// focus, and the dual-axis layout.
-fn nav_item(
-    pane: SettingsPane,
-    selected: SettingsPane,
-    stacked: bool,
-    tokens: WorkspaceTokens,
-    cx: &mut Context<SettingsView>,
-) -> AnyElement {
-    let button = Button::new(pane.nav_selector(), tokens)
-        .label(pane.title())
-        .ghost()
-        .selected(pane == selected)
-        .debug_selector(move || pane.nav_selector().into())
-        .on_click(cx.listener(move |this, _, _, cx| this.select_pane(pane, cx)));
-    div()
-        .flex_none()
-        .when(!stacked, |view| view.w_full())
-        .child(button)
-        .into_any_element()
-}
-
 fn pane_column() -> gpui_kit::Div {
     div().w_full().min_w_0().flex().flex_col().gap(Space::MD)
 }
@@ -1464,11 +1570,11 @@ fn claim(
 
 /// A labelled statement with no control, for a fact the user cannot change — including the mock
 /// controls Sotto has not built.
-fn statement(title: &str, detail: &str, tokens: WorkspaceTokens, unbuilt: bool) -> gpui_kit::Div {
+fn statement(title: &str, detail: &str, tokens: WorkspaceTokens, unbuilt: bool) -> GroupBox {
     settings_card_with_tone(title, detail, tokens, unbuilt)
 }
 
-fn settings_card(title: &str, state: &str, tokens: WorkspaceTokens) -> gpui_kit::Div {
+fn settings_card(title: &str, state: &str, tokens: WorkspaceTokens) -> GroupBox {
     settings_card_with_tone(title, state, tokens, false)
 }
 
@@ -1476,38 +1582,19 @@ fn settings_card_with_tone(
     title: &str,
     state: &str,
     tokens: WorkspaceTokens,
-    warning: bool,
-) -> gpui_kit::Div {
-    div()
-        .w_full()
-        .min_w_0()
-        .flex()
-        .flex_col()
-        .gap(Space::MD)
-        .p(Space::LG)
-        .rounded_lg()
-        .border_1()
-        .border_color(if warning {
-            tokens.warn_line
-        } else {
-            tokens.line
-        })
-        .bg(if warning {
-            tokens.warn_wash
-        } else {
-            tokens.surface
-        })
-        .debug_selector(|| "settings-card".into())
-        .child(
-            div()
-                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .child(title.to_owned()),
-        )
+    _warning: bool,
+) -> GroupBox {
+    // gpui-kit owns this grouping surface, including its radius, border, padding, foreground,
+    // and theme response. A missing capability is communicated in copy, never a private colour.
+    GroupBox::new()
+        .id("settings-card")
+        .title(title.to_owned())
+        .outline()
         .when(!state.is_empty(), |view| {
             view.child(
                 div()
                     .text_size(TypeScale::control(&tokens))
-                    .text_color(if warning { tokens.warn } else { tokens.muted })
+                    .text_color(tokens.muted)
                     .child(state.to_owned()),
             )
         })
@@ -1535,19 +1622,15 @@ fn action_row() -> gpui_kit::Div {
         .debug_selector(|| "settings-action-row".into())
 }
 
-fn notice(message: String, tokens: WorkspaceTokens) -> gpui_kit::Div {
+fn notice(message: String, _tokens: WorkspaceTokens) -> impl IntoElement {
+    use gpui_kit::component::alert::Alert;
+
     div()
         .flex_none()
         .w_full()
         .min_w_0()
-        .p(Space::MD)
-        .border_t_1()
-        .border_color(tokens.line_soft)
-        .bg(tokens.warn_wash)
-        .text_size(TypeScale::control(&tokens))
-        .text_color(tokens.warn)
         .debug_selector(|| "settings-notice".into())
-        .child(message)
+        .child(Alert::info("settings-notice-alert", message).banner())
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1769,6 +1852,9 @@ mod tests {
         visual.simulate_resize(size(width, px(720.0)));
         visual.refresh()?;
         visual.run_until_parked();
+        // `Settings` contains a virtualized page list. Mirror gpui-kit's own Settings harness and
+        // force its settling draw before querying mounted controls.
+        visual.update(|window, cx| window.draw(cx).clear(cx));
         Ok(MountedSheet {
             settings,
             visual,
@@ -1820,6 +1906,25 @@ mod tests {
         Err(Box::new(std::io::Error::other(format!(
             "{selector} never came into view"
         ))))
+    }
+
+    fn select_native_pane(
+        visual: &mut VisualTestContext,
+        pane: SettingsPane,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // The kit owns the SidebarMenu items, so they deliberately have no Sotto selectors.
+        // Click their documented label area: the search header and four page rows.
+        let settings = visual
+            .debug_bounds("settings-native")
+            .ok_or_else(|| std::io::Error::other("the native Settings control must render"))?;
+        let nav = gpui_kit::point(
+            settings.left() + px(50.0),
+            settings.top() + px(80.0 + 36.0 * pane.index() as f32),
+        );
+        visual.simulate_click(nav, Modifiers::none());
+        visual.refresh()?;
+        visual.run_until_parked();
+        Ok(())
     }
 
     /// Writes a settled recording with real bytes on disk so a delete has something to remove.
@@ -1942,7 +2047,7 @@ mod tests {
     #[test]
     fn every_pinned_disclosure_still_renders_on_a_pane() -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
-        let sheet = mount(&mut cx, px(900.0))?;
+        let mut sheet = mount(&mut cx, px(900.0))?;
 
         for selector in [
             RECORDINGS_DISCLOSURE_SELECTOR,
@@ -1954,14 +2059,7 @@ mod tests {
             );
         }
 
-        let settings = sheet.settings.clone();
-        sheet.visual.update(|_, cx| {
-            settings.update(cx, |this, cx| {
-                this.select_pane(SettingsPane::SummariesAndAsk, cx);
-            });
-        });
-        sheet.visual.refresh()?;
-        sheet.visual.run_until_parked();
+        select_native_pane(&mut sheet.visual, SettingsPane::SummariesAndAsk)?;
         for selector in [
             CODEX_DISCLOSURE_SELECTOR,
             OPENAI_DISCLOSURE_SELECTOR,
@@ -2007,12 +2105,10 @@ mod tests {
                 "only the selected pane may render"
             );
         }
-        for pane in SettingsPane::ALL {
-            assert!(
-                sheet.visual.debug_bounds(pane.nav_selector()).is_some(),
-                "every pane must be reachable from the nav"
-            );
-        }
+        assert!(
+            sheet.visual.debug_bounds("settings-native").is_some(),
+            "the kit-owned Settings navigation must render"
+        );
 
         Ok(())
     }
@@ -2032,13 +2128,8 @@ mod tests {
             SettingsPane::SummariesAndAsk,
         ] {
             let mut cx = TestAppContext::single();
-            let sheet = mount(&mut cx, px(900.0))?;
-            let settings = sheet.settings.clone();
-            sheet.visual.update(|_, cx| {
-                settings.update(cx, |this, cx| this.select_pane(pane, cx));
-            });
-            sheet.visual.refresh()?;
-            sheet.visual.run_until_parked();
+            let mut sheet = mount(&mut cx, px(900.0))?;
+            select_native_pane(&mut sheet.visual, pane)?;
 
             assert!(
                 sheet.visual.debug_bounds(pane.pane_selector()).is_some(),
@@ -2087,7 +2178,7 @@ mod tests {
         Ok(())
     }
 
-    /// The two pointer paths a person actually uses: click a nav entry, click the close glyph.
+    /// The two pointer paths a person actually uses: select a native settings page, then close.
     #[test]
     fn the_nav_switches_panes_and_close_dismisses_the_sheet()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2099,12 +2190,7 @@ mod tests {
         } = mount(&mut cx, px(900.0))?;
         let dismissals = watch_dismissals(visual, &settings);
 
-        let nav = visual
-            .debug_bounds(SettingsPane::Transcription.nav_selector())
-            .ok_or_else(|| std::io::Error::other("the Transcription nav entry must render"))?;
-        visual.simulate_click(nav.center(), Modifiers::none());
-        visual.refresh()?;
-        visual.run_until_parked();
+        select_native_pane(visual, SettingsPane::Transcription)?;
         assert!(
             visual
                 .debug_bounds(SettingsPane::Transcription.pane_selector())
@@ -2153,7 +2239,7 @@ mod tests {
         let media =
             seed_settled_recording(&sheet.database(), &sheet.recordings(), session_id).await?;
         let visual = sheet.visual;
-        visual.update(|_, cx| settings.update(cx, |this, _| this.refresh_recordings()));
+        visual.update(|_, cx| settings.update(cx, |this, cx| this.refresh_recordings(cx)));
         visual.refresh()?;
         visual.run_until_parked();
 
@@ -2223,7 +2309,7 @@ mod tests {
         let media =
             seed_settled_recording(&sheet.database(), &sheet.recordings(), session_id).await?;
         let visual = sheet.visual;
-        visual.update(|_, cx| settings.update(cx, |this, _| this.refresh_recordings()));
+        visual.update(|_, cx| settings.update(cx, |this, cx| this.refresh_recordings(cx)));
         visual.refresh()?;
         visual.run_until_parked();
 
@@ -2273,13 +2359,7 @@ mod tests {
         let sheet = mount(&mut cx, px(900.0))?;
         let settings = sheet.settings.clone();
         let visual = sheet.visual;
-        visual.update(|_, cx| {
-            settings.update(cx, |this, cx| {
-                this.select_pane(SettingsPane::SummariesAndAsk, cx);
-            });
-        });
-        visual.refresh()?;
-        visual.run_until_parked();
+        select_native_pane(visual, SettingsPane::SummariesAndAsk)?;
 
         let dismissals = watch_dismissals(visual, &settings);
         let delete = scroll_into_view(
@@ -2329,39 +2409,27 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let mut cx = TestAppContext::single();
         let minimum_width = px(420.0);
-        let sheet = mount(&mut cx, minimum_width)?;
+        let mut sheet = mount(&mut cx, minimum_width)?;
 
         let page = sheet
             .visual
             .debug_bounds("settings-page")
             .ok_or_else(|| std::io::Error::other("the settings sheet must render"))?;
-        let nav = sheet
+        let native_settings = sheet
             .visual
-            .debug_bounds("settings-nav")
-            .ok_or_else(|| std::io::Error::other("the pane nav must render"))?;
-        let card = sheet
-            .visual
-            .debug_bounds("settings-card")
-            .ok_or_else(|| std::io::Error::other("settings card must render"))?;
+            .debug_bounds("settings-native")
+            .ok_or_else(|| std::io::Error::other("the native settings control must render"))?;
         let actions = sheet
             .visual
             .debug_bounds("settings-action-row")
             .ok_or_else(|| std::io::Error::other("settings actions must render"))?;
         assert!(page.right() <= minimum_width);
-        assert!(nav.left() >= page.left() && nav.right() <= page.right());
-        assert!(card.left() >= page.left() && card.right() <= page.right());
-        assert!(actions.left() >= card.left() && actions.right() <= card.right());
+        assert!(native_settings.left() >= page.left() && native_settings.right() <= page.right());
+        assert!(actions.left() >= page.left() && actions.right() <= page.right());
 
         // Each pane must survive the same width; a pane that clips is a pane nobody can use.
-        let settings = sheet.settings.clone();
         for pane in SettingsPane::ALL {
-            let target = pane;
-            let handle = settings.clone();
-            sheet.visual.update(|_, cx| {
-                handle.update(cx, |this, cx| this.select_pane(target, cx));
-            });
-            sheet.visual.refresh()?;
-            sheet.visual.run_until_parked();
+            select_native_pane(&mut sheet.visual, pane)?;
             let body = sheet
                 .visual
                 .debug_bounds(pane.pane_selector())
@@ -2369,22 +2437,6 @@ mod tests {
             assert!(
                 body.left() >= page.left() && body.right() <= page.right(),
                 "{} must stay inside the sheet at the stated minimum width",
-                pane.title()
-            );
-            // Cards stack down the pane. If the pane ever laid out as a row — the failure mode
-            // `Scrollable`'s style-lifting invites — each card would take a fraction of the width.
-            let card = sheet
-                .visual
-                .debug_bounds("settings-card")
-                .ok_or_else(|| std::io::Error::other("every pane must render at least one row"))?;
-            assert!(
-                card.size.width >= body.size.width * 0.6,
-                "{} must stack its rows in a column, not compete for one line",
-                pane.title()
-            );
-            assert!(
-                card.left() >= body.left() && card.right() <= body.right(),
-                "{} must keep its rows inside the pane",
                 pane.title()
             );
         }

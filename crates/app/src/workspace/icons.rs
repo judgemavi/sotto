@@ -4,9 +4,6 @@
 //! `Mic`, `FileInput`) are embedded via [`crate::assets::AppAssets`] — default `Assets` alone
 //! does not include them.
 
-use gpui_kit::component::{Icon, Sizable as _, Size};
-use gpui_kit::px;
-
 /// Re-export the kit's Lucide catalog for chrome and markers.
 pub(crate) use gpui_kit::assets::IconName;
 
@@ -22,11 +19,6 @@ pub(crate) const HOME: IconName = IconName::House;
 /// Standard chrome icons used throughout the shell (aliases onto the kit catalog).
 #[expect(dead_code, reason = "alias retained for chrome call sites")]
 pub(crate) type ChromeIcon = IconName;
-
-/// A content marker drawn from the kit catalog, inheriting ambient text colour.
-pub(crate) fn marker(name: IconName) -> Icon {
-    Icon::new(name).with_size(Size::Size(px(14.0)))
-}
 
 #[cfg(test)]
 mod tests {

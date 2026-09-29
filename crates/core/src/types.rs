@@ -219,7 +219,7 @@ impl SessionRecording {
 ///
 /// This is deliberately **not** part of [`crate::CaptureTarget`]. The capture target is a captured
 /// fact — which application or window the OS content filter was built from, and whether audio was
-/// scoped to it — and ADR-0006 plus the timeline's append-only rule make that fact unrewritable.
+/// scoped to it — and ADR-0009 plus the timeline's append-only rule make that fact unrewritable.
 /// A title is a label laid over the recording, so it is a separate value with a separate lifetime:
 /// it can be chosen, changed, and cleared without any claim about what was recorded changing.
 ///

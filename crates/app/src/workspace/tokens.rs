@@ -199,10 +199,6 @@ impl TypeScale {
         tokens.text_meta
     }
 
-    pub(crate) fn chip(tokens: &WorkspaceTokens) -> Pixels {
-        tokens.text_chip
-    }
-
     pub(crate) fn control(tokens: &WorkspaceTokens) -> Pixels {
         tokens.text_control
     }
@@ -217,10 +213,6 @@ impl TypeScale {
 
     pub(crate) fn title(tokens: &WorkspaceTokens) -> Pixels {
         tokens.text_title
-    }
-
-    pub(crate) fn clock(tokens: &WorkspaceTokens) -> Pixels {
-        tokens.text_clock
     }
 
     pub(crate) fn display(tokens: &WorkspaceTokens) -> Pixels {

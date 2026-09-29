@@ -15,13 +15,12 @@ use std::time::Duration;
 use gpui_kit::component::progress::Progress;
 use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, Div, ElementId, IntoElement, ParentElement as _,
-    Styled as _, div, ease_out_quint, pulsating_between, px,
+    Styled as _, div, ease_out_quint, px,
 };
 
 use super::tokens::WorkspaceTokens;
 
 const ENTER: Duration = Duration::from_millis(240);
-const PULSE: Duration = Duration::from_millis(1600);
 #[cfg(test)]
 const SWEEP: Duration = Duration::from_millis(1400);
 
@@ -58,6 +57,13 @@ pub(crate) fn fade_in_fill(id: impl Into<ElementId>, child: Div) -> impl IntoEle
 /// Fade plus a short rise, for sheets that appear over a scrim.
 pub(crate) fn rise_in(id: impl Into<ElementId>, child: impl IntoElement) -> AnyElement {
     div()
+        // The animated wrapper is the layout parent of sheets. It must establish a definite
+        // rectangle so a child using `h_full().max_h(...)` resolves against the scrim rather than
+        // shrink-wrapping to its title bar.
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
         .child(child)
         .with_animation(
             id,
@@ -65,17 +71,6 @@ pub(crate) fn rise_in(id: impl Into<ElementId>, child: impl IntoElement) -> AnyE
             |this, delta| this.opacity(delta).mt(px(18.0 * (1.0 - delta))),
         )
         .into_any_element()
-}
-
-/// Opacity on the recording dot so it breathes without a second colour.
-pub(crate) fn live_pulse(dot: Div) -> impl IntoElement {
-    dot.with_animation(
-        "live-pulse",
-        Animation::new(PULSE)
-            .repeat()
-            .with_easing(pulsating_between(0.38, 1.0)),
-        |this, delta| this.opacity(delta),
-    )
 }
 
 /// Determinate bar for a known fraction, 0..=1. Kit [`Progress`] owns the paint (ADR-0025).
@@ -93,12 +88,11 @@ pub(crate) fn writing_progress(id: impl Into<ElementId>, _tokens: WorkspaceToken
 
 #[cfg(test)]
 mod tests {
-    use super::{ENTER, PULSE, SWEEP};
+    use super::{ENTER, SWEEP};
 
     #[test]
     fn motion_stays_quiet() {
         assert!(ENTER.as_millis() < 400, "enter must not linger");
-        assert!(PULSE.as_millis() > ENTER.as_millis());
         assert!(SWEEP.as_millis() < 2_000);
     }
 }
